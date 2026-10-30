@@ -155,6 +155,7 @@ void FixedStepsScheduler::handle_prefill_requests(
     remaining_seq_budget -= allocated_seqs;
     prefill_queue_->pop_top();
     request->record_first_batched_time();
+    request->mark_first_scheduled(scheduled_timestamp_);
     running_requests_.emplace_back(request);
     running_sequences_.insert(running_sequences_.end(),
                               prefill_sequences.begin(),
@@ -181,6 +182,7 @@ void FixedStepsScheduler::handle_prefill_requests(
 }
 
 std::vector<Batch> FixedStepsScheduler::prepare_batch() {
+  const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
@@ -210,7 +212,9 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
 
   std::shared_ptr<Request> request;
   // read from request queue then push to waiting priority queue
-  while (request_queue_.read(request)) {
+  for (size_t index = 0;
+       index < ingress_request_count && request_queue_.read(request);
+       ++index) {
     propagate_request(request);
   }
 
@@ -376,7 +380,25 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
                      batches = std::move(result.batches),
                      requests = std::move(result.requests),
                      sequences = std::move(result.sequences)]() mutable {
+      // Surface each internal RecEngine output batch, including non-stream
+      // requests. The frontend records receipt before any final output task.
+      const auto observed_requests =
+          std::make_shared<const std::vector<std::shared_ptr<Request>>>(
+              requests);
+      for (auto& batch : batches) {
+        // A retained/copied Batch must not reference this task's local vector.
+        batch.set_output_observer([observed_requests] {
+          const RequestTiming::TimePoint observed_at =
+              RequestTiming::Clock::now();
+          for (const auto& request : *observed_requests) {
+            request->record_server_first_token(observed_at);
+          }
+        });
+      }
       engine_->step(batches);
+      for (auto& batch : batches) {
+        batch.set_output_observer({});
+      }
 
       // After step completes, check and process finished/cancelled requests
       std::vector<std::shared_ptr<Request>> finished_requests;

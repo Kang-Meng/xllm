@@ -131,7 +131,8 @@ class DisaggPDScheduler : public ContinuousScheduler {
       int32_t src_dp_size,
       int32_t src_dp_rank,
       torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
-      int32_t num_cached_tokens = 0);
+      int32_t num_cached_tokens = 0,
+      const proto::RequestPhaseTiming* phase_timing = nullptr);
 
   // Only consumes a matching waiting reservation, never a running request.
   bool release_reservation(const std::string& req_id,

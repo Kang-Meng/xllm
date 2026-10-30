@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+
 #include <cstdint>
 #include <functional>
 
@@ -79,6 +80,11 @@ class AsyncResponseProcessor final {
                                 bool terminal,
                                 ThreadPool* generation_threadpool,
                                 RequestOutput* output);
+
+  // Schedule on the request's pinned response thread, assigning the thread on
+  // first use so later tasks for the same request stay ordered behind it.
+  void schedule_on_response_thread(Request& request,
+                                   ThreadPool::Runnable runnable);
 
   // the threadpool to handle responses
   ThreadPool response_threadpool_;

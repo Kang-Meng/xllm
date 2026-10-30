@@ -671,6 +671,7 @@ std::shared_ptr<Request> RecRequestFactory::build_request_common(
                          nullptr,
                          sp.decode_address);
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
+  req_state.timing = sp.timing;
   req_state.rec_type = rec_type_;
   req_state.bos_token_id = model_args_->bos_token_id();
   rate_limit_guard.dismiss();

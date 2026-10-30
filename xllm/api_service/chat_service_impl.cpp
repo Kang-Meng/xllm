@@ -528,6 +528,8 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  request_params.timing = call->request_timing();
+  request_params.timing->record_arrival();
 
   // Build messages from rpc request (inline code, not extracted to helper)
   std::vector<Message> messages;
@@ -616,6 +618,7 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
 // chat_async for brpc with xllm_serice
 void ChatServiceImpl::process_async_rpc_impl(
     const proto::ChatRequest* request) {
+  const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
   auto callback = [master = master_](const RequestOutput& req_output) -> bool {
@@ -636,6 +639,8 @@ void ChatServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
+  request_params.timing = std::make_shared<RequestTiming>();
+  request_params.timing->record_arrival(arrival_time);
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -692,6 +697,8 @@ void ChatServiceImpl::process_async_rpc_impl(
 
 // chat_async for brpc
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
+  // Include API message preparation, not only Master/worker preprocessing.
+  call->request_timing()->record_arrival();
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
 
@@ -722,6 +729,7 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  request_params.timing = call->request_timing();
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -850,6 +858,8 @@ MMChatServiceImpl::MMChatServiceImpl(VLMMaster* master,
 }
 
 void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
+  // Include build_messages() and its multimodal input preparation.
+  call->request_timing()->record_arrival();
   const auto& rpc_request = call->request();
   const auto& req_messages = rpc_request.messages();
   const auto& model = rpc_request.model();
@@ -873,6 +883,7 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  request_params.timing = call->request_timing();
 
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {

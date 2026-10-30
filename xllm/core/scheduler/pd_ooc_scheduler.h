@@ -78,7 +78,8 @@ class PDOOCScheduler : public DisaggPDScheduler {
       std::vector<std::string> src_addrs,
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
-      int32_t src_dp_rank);
+      int32_t src_dp_rank,
+      const proto::RequestPhaseTiming* phase_timing = nullptr);
 
   void prefill_step(const absl::Duration& timeout);
 

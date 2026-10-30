@@ -1,6 +1,18 @@
 include(cc_library)
 include(cc_binary)
 
+# Keep the timing domain independently testable without Torch or a device.
+cc_library(
+  NAME
+    request_timing
+  HDRS
+    request_timing.h
+  SRCS
+    request_timing.cpp
+  DEPS
+    Threads::Threads
+)
+
 cc_library(
   NAME 
     request
@@ -15,6 +27,8 @@ cc_library(
     incremental_decoder.h
     request_base.h
     request.h
+    request_timing.h
+    request_timing_proto.h
     llm_request_factory.h
     vlm_request_factory.h
     rec_request_factory.h
@@ -60,6 +74,7 @@ cc_library(
     priority_comparator.cpp
   DEPS
     :config
+    :request_timing
     :kv_cache
     :block_hasher
     :encoder_cache

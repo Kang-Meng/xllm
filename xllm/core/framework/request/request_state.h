@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/request/request_timing.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "rec_type.h"
@@ -207,6 +208,7 @@ class RequestState final {
   bool handle_last_token_done = false;
 
   std::optional<Call*> call_;
+  std::shared_ptr<RequestTiming> timing;
 
   std::vector<SampleSlot> sample_slots;
 

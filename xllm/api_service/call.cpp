@@ -26,6 +26,7 @@ limitations under the License.
 
 namespace xllm {
 void Call::record_error(Status status) {
+  request_timing_->update_from_finished_request(/*generation_complete=*/false);
   response_complete_ = false;
   error_status_ = std::move(status);
   // RateLimiter counts admission rejections; rendering the error must not
@@ -35,6 +36,13 @@ void Call::record_error(Status status) {
 void Call::record_result(bool connected,
                          bool stream_disconnected,
                          bool controller_released) const {
+  // Only the shared RequestTiming is updated; Call's members remain unchanged.
+  // API validation failures and disconnects may never reach a Request. A
+  // successful PD-prefill response, however, is not generation completion.
+  if (!response_complete_ || !connected || stream_disconnected) {
+    request_timing_->update_from_finished_request(
+        /*generation_complete=*/false);
+  }
   if (response_complete_ && connected) {
     COUNTER_INC(server_request_total_ok);
   } else {

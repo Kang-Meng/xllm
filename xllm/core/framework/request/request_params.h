@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -103,6 +104,7 @@ struct RequestParams {
   std::string source_xservice_addr = "";
   std::string x_request_id;
   std::string x_request_time;
+  std::shared_ptr<RequestTiming> timing;
 
   bool streaming = false;
 

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/block/block.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/request/request_timing_proto.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
@@ -183,6 +184,7 @@ void PDOOCScheduler::handle_abnormal_request(
     if (!request->check_beam_search()) {
       running_queue->pop_top();
       running_requests_.emplace_back(request);
+      request->mark_first_scheduled(scheduled_timestamp_);
       running_sequences_.insert(running_sequences_.end(),
                                 candidate_sequences.begin(),
                                 candidate_sequences.end());
@@ -366,6 +368,7 @@ void PDOOCScheduler::prefill_step(const absl::Duration& timeout) {
 }
 
 std::vector<Batch> PDOOCScheduler::prepare_batch() {
+  const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
@@ -373,7 +376,9 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
   // read from request queue then push to waiting priority queue
 
   std::vector<std::shared_ptr<xllm::Request>> deferred_reqs;
-  while (request_queue_.read(request)) {
+  for (size_t index = 0;
+       index < ingress_request_count && request_queue_.read(request);
+       ++index) {
     CHECK(request);
 
     // In disagg PD, expansion of best_of_n sequences is always handled
@@ -806,6 +811,7 @@ void PDOOCScheduler::handle_prefill_requests_impl(
     request->record_first_batched_time();
     running_requests_.emplace_back(request);
     request->record_num_prefix_cache_tokens();
+    request->mark_first_scheduled(scheduled_timestamp_);
     running_sequences_.insert(running_sequences_.end(),
                               prefill_sequences.begin(),
                               prefill_sequences.end());
@@ -1039,6 +1045,7 @@ void PDOOCScheduler::handle_decode_requests_impl(
       running_queue->pop_top();
       // add the request to the batch
       running_requests_.emplace_back(request);
+      request->mark_first_scheduled(scheduled_timestamp_);
       running_sequences_.insert(running_sequences_.end(),
                                 candidate_sequences.begin(),
                                 candidate_sequences.end());
@@ -1256,6 +1263,7 @@ void PDOOCScheduler::handle_decode_requests(
       running_queue->pop_top();
       // add the request to the batch
       running_requests_.emplace_back(request);
+      request->mark_first_scheduled(scheduled_timestamp_);
       running_sequences_.insert(running_sequences_.end(),
                                 candidate_sequences.begin(),
                                 candidate_sequences.end());
@@ -1725,6 +1733,8 @@ void PDOOCScheduler::prefill_send_first_generation() {
       proto::Status resp;
       brpc::Controller cntl;
       gen->set_upstream_elapsed_seconds(request->end_to_end_latency_seconds());
+      request_timing_to_proto(request->state().timing->snapshot(),
+                              gen->mutable_phase_timing());
       stub->FirstGeneration(&cntl, &gens, &resp, nullptr);
 
       if (cntl.Failed() || !resp.ok()) {
@@ -1799,7 +1809,8 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     std::vector<std::string> src_addrs,
     std::vector<KVTransferMapping> source_mappings,
     int32_t src_dp_size,
-    int32_t src_dp_rank) {
+    int32_t src_dp_rank,
+    const proto::RequestPhaseTiming* phase_timing) {
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
   {
@@ -1814,6 +1825,7 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     reservation_waiting_requests_.store(received_request_map_.size(),
                                         std::memory_order_relaxed);
   }
+  request->state().timing->restore_pd(request_timing_from_proto(phase_timing));
   kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
   ScopeGuard prepare_guard([this] {
     kv_preparing_requests_.fetch_sub(1, std::memory_order_relaxed);
@@ -1862,6 +1874,10 @@ bool PDOOCScheduler::decode_recv_multi_generations(
       request->sequences()[0]->append_token(token);
     }
   }
+  // Start a fresh local segment and exclude every received/previous token
+  // from its TPOT denominator, including a return to the same physical node.
+  request->state().timing->record_pd_decode_start(
+      request->sequences()[0]->num_committed_generated_tokens());
 
   // pull kv cache (only needed once for the entire request)
   if (kv_cache_transfer_mode == "PULL") {
@@ -1917,6 +1933,7 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     }
   }
 
+  request->state().timing->record_queued();
   request_queue_.write(request);
   return true;
 }
@@ -2312,6 +2329,8 @@ void PDOOCScheduler::prefill_send_multi_generations() {
       brpc::Controller cntl;
       multi_req->set_upstream_elapsed_seconds(
           request->end_to_end_latency_seconds());
+      request_timing_to_proto(request->state().timing->snapshot(),
+                              multi_req->mutable_phase_timing());
       stub->MultiGenerations(&cntl, &multi_reqs, &resp, nullptr);
       if (cntl.Failed() || !resp.ok()) {
         LOG(ERROR) << "Failed to send multi generations, " << cntl.ErrorText()

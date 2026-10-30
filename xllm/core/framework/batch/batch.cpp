@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/util/rec_model_utils.h"
+#include "core/util/scope_guard.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
@@ -47,6 +48,7 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+
 namespace {
 
 uint32_t get_sample_source_position(const SampleSlot& sample_slot) {
@@ -621,6 +623,7 @@ void Batch::refresh_onerec_prefill_output_targets() {
 void Batch::process_sample_output(const RawForwardOutput& raw_output,
                                   bool replace_fake_token,
                                   OptionalModelArgsRef model_args) {
+  ScopeGuard output_guard([this] { record_core_output(); });
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
       collect_failed_request_ids(sequences, raw_output);
@@ -781,6 +784,7 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
 void Batch::process_sample_output(const SampleOutput& sample_output,
                                   bool replace_fake_token,
                                   bool force_requested_beam_result_size) {
+  ScopeGuard output_guard([this] { record_core_output(); });
   const bool has_next_tokens = sample_output.next_tokens.defined() &&
                                sample_output.next_tokens.numel() > 0;
   const bool next_tokens_are_spec_width =
@@ -829,7 +833,8 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   // if sample_output.next_tokens not defined,
   // sample_output.next_tokens.size(0) value is 0,
   // this means all sequences are in prefill stage status.
-  const int64_t num_outputs = sample_output.next_tokens.size(0);
+  const int64_t num_outputs =
+      has_next_tokens ? sample_output.next_tokens.size(0) : 0;
   for (size_t pos = 0;
        pos < sample_output.mm_dict_vec.size() && pos < sequences_.size();
        ++pos) {
@@ -993,6 +998,7 @@ void Batch::process_beam_search(bool force_requested_result_size) {
 
 void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
                                        bool replace_fake_token) {
+  ScopeGuard output_guard([this] { record_core_output(); });
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
       collect_failed_request_ids(sequences, raw_output);
@@ -1102,6 +1108,31 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
        sequence_group_id < sequence_groups_.size();
        sequence_group_id++) {
     update_for_sequence_group(sequence_group_id);
+  }
+}
+
+void Batch::record_core_output(RequestTiming::TimePoint now) {
+  bool has_output = false;
+  const auto record = [&has_output, now](const Sequence* sequence) {
+    const auto& timing = sequence->request_timing();
+    if (timing && timing->record_core_output(now)) {
+      has_output = true;
+    }
+  };
+  // Beam search can replace sequences; use the group's current members.
+  if (sequence_groups_.empty()) {
+    for (const Sequence* sequence : sequences_) {
+      record(sequence);
+    }
+  } else {
+    for (SequencesGroup* group : sequence_groups_) {
+      for (const auto& sequence : group->sequences()) {
+        record(sequence.get());
+      }
+    }
+  }
+  if (has_output && output_observer_) {
+    output_observer_();
   }
 }
 

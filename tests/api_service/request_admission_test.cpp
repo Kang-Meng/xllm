@@ -20,6 +20,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -143,6 +144,7 @@ TEST(ApiTerminalMetricsTest, SuccessfulHandoffCountsOnceAfterGuardDestruction) {
   proto::CompletionRequest request;
   proto::CompletionResponse response;
   CountingClosure done;
+  std::shared_ptr<RequestTiming> timing;
   const double successes = COUNTER_VALUE(server_request_total_ok);
   const double failures = COUNTER_VALUE(server_request_total_fail);
   const double terminal_successes =
@@ -160,6 +162,9 @@ TEST(ApiTerminalMetricsTest, SuccessfulHandoffCountsOnceAfterGuardDestruction) {
           &response,
           /*use_arena=*/true,
           /*is_http_request=*/true);
+      timing = call.request_timing();
+      timing->mark_pd_local();
+      timing->update_from_output();
       ASSERT_TRUE(call.write_and_finish(response));
       EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
                 terminal_successes);
@@ -167,6 +172,7 @@ TEST(ApiTerminalMetricsTest, SuccessfulHandoffCountsOnceAfterGuardDestruction) {
     EXPECT_EQ(done.count(), 1);
   }
   EXPECT_EQ(done.count(), 1);
+  EXPECT_FALSE(timing->snapshot().terminal);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes + 1);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures);
   EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
@@ -284,9 +290,15 @@ TEST(ApiTerminalMetricsTest, UnclassifiedResourceExhaustionIsInternalError) {
         &response,
         /*use_arena=*/true,
         /*is_http_request=*/true);
+    call.request_timing()->record_arrival();
     EXPECT_TRUE(call.finish_with_error(
         Status(StatusCode::RESOURCE_EXHAUSTED, "capacity exhausted")));
     EXPECT_EQ(controller.http_response().status_code(), 500);
+    const auto sample = call.request_timing()->snapshot();
+    EXPECT_TRUE(sample.terminal);
+    EXPECT_FALSE(sample.server_ttft.valid);
+    EXPECT_TRUE(sample.server_ttft.partial);
+    EXPECT_FALSE(sample.queued_time.milliseconds.has_value());
   }
   EXPECT_EQ(done.count(), 1);
   EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "internal_error"),
@@ -304,6 +316,7 @@ TEST(ApiTerminalMetricsTest, NonStreamCancellationWinsOverBrpcFailure) {
   proto::CompletionRequest request;
   proto::CompletionResponse response;
   CountingClosure done;
+  std::shared_ptr<RequestTiming> timing;
   {
     NonStreamCall<proto::CompletionRequest, proto::CompletionResponse> call(
         &controller,
@@ -312,7 +325,12 @@ TEST(ApiTerminalMetricsTest, NonStreamCancellationWinsOverBrpcFailure) {
         &response,
         /*use_arena=*/true,
         /*is_http_request=*/true);
+    timing = call.request_timing();
+    timing->record_queued();
   }
+  EXPECT_TRUE(timing->snapshot().terminal);
+  EXPECT_TRUE(timing->snapshot().queued_time.partial);
+  EXPECT_FALSE(timing->snapshot().decode_time.milliseconds.has_value());
   EXPECT_EQ(done.count(), 1);
   EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "cancelled"),
             before + 1);
@@ -329,6 +347,7 @@ TEST(ApiTerminalMetricsTest, StreamExitDoesNotReadReleasedController) {
     request.set_stream(true);
     proto::CompletionResponse response;
     CountingClosure done;
+    std::shared_ptr<RequestTiming> timing;
     {
       ReleasedStreamCall call(&controller,
                               &done,
@@ -336,9 +355,16 @@ TEST(ApiTerminalMetricsTest, StreamExitDoesNotReadReleasedController) {
                               &response,
                               /*use_arena=*/true,
                               /*is_http_request=*/true);
+      timing = call.request_timing();
+      timing->update_from_output();
+      if (!disconnected) {
+        timing->update_from_finished_request(/*generation_complete=*/true);
+      }
       done.Run();  // Opening SSE hands the RPC controller back to brpc.
       call.simulate_handoff_and_finish(disconnected);
     }
+    EXPECT_TRUE(timing->snapshot().terminal);
+    EXPECT_EQ(timing->snapshot().decode_time.valid, !disconnected);
     EXPECT_EQ(done.count(), 1);
     EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
               before + 1);

@@ -221,28 +221,30 @@ void RecMaster::handle_request(
     return;
   }
 
-  Timer timer;
-
-  std::optional<std::string> prompt;
-  prompt = chat_template_->apply(messages, sp.tools, sp.chat_template_kwargs);
-
-  if (!prompt.has_value()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Failed to construct prompt from messages");
-    LOG(ERROR) << "Failed to construct prompt from messages";
-    return;
-  }
-
-  COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
-
   schedule_request(std::move(sp),
                    std::move(callback),
                    [this,
-                    prompt = std::move(prompt.value()),
+                    messages = std::move(messages),
                     prompt_tokens = std::move(prompt_tokens),
                     input_tensors = std::move(input_tensors)](
-                       const RequestParams& params, OutputCallback cb) mutable {
-                     return request_factory_->create(std::move(prompt),
+                       const RequestParams& params,
+                       OutputCallback cb) mutable -> std::shared_ptr<Request> {
+                     // The worker records input_start before template work,
+                     // matching the LLM/VLM preprocessing boundary.
+                     Timer timer;
+                     auto prompt = chat_template_->apply(
+                         messages, params.tools, params.chat_template_kwargs);
+                     if (!prompt.has_value()) {
+                       params.timing->update_from_finished_request(
+                           /*generation_complete=*/false);
+                       cb(Status(StatusCode::INVALID_ARGUMENT,
+                                 "Failed to construct prompt from messages"));
+                       LOG(ERROR) << "Failed to construct prompt from messages";
+                       return nullptr;
+                     }
+                     COUNTER_ADD(chat_template_latency_seconds,
+                                 timer.elapsed_seconds());
+                     return request_factory_->create(std::move(*prompt),
                                                      std::move(prompt_tokens),
                                                      std::move(input_tensors),
                                                      params,
@@ -276,6 +278,7 @@ void RecMaster::handle_request(const std::vector<int>& prompt_tokens,
 void RecMaster::schedule_request(RequestParams sp,
                                  OutputCallback callback,
                                  RequestBuilder build_request) {
+  sp.timing = RequestTiming::start_ingress(std::move(sp.timing));
   scheduler_->incr_pending_requests(1);
   auto cb = [callback = std::move(callback),
              scheduler = scheduler_.get()](const RequestOutput& output) {
@@ -287,6 +290,9 @@ void RecMaster::schedule_request(RequestParams sp,
                          callback = std::move(cb),
                          build_request = std::move(build_request)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
+    ScopeGuard timing_guard([timing = sp.timing] {
+      timing->update_from_finished_request(/*generation_complete=*/false);
+    });
 
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
 
@@ -302,9 +308,14 @@ void RecMaster::schedule_request(RequestParams sp,
     }
 
     if (!scheduler_->add_request(request)) {
-      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
-                      "No available resources to schedule request",
-                      FailureReason::TEMPORARY_OVERLOAD));
+      // Freeze before the callback; the guard's repeated update is idempotent.
+      Status status(StatusCode::RESOURCE_EXHAUSTED,
+                    "No available resources to schedule request",
+                    FailureReason::TEMPORARY_OVERLOAD);
+      request->record_timing_failure(status);
+      callback(std::move(status));
+    } else {
+      timing_guard.dismiss();
     }
   });
 }

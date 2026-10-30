@@ -18,11 +18,13 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <butil/iobuf.h>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 
 #include "core/common/types.h"
+#include "core/framework/request/request_timing.h"
 
 namespace xllm {
 
@@ -48,6 +50,9 @@ class Call {
 
   const std::string& get_x_request_id() const { return x_request_id_; }
   const std::string& get_x_request_time() const { return x_request_time_; }
+  const std::shared_ptr<RequestTiming>& request_timing() const {
+    return request_timing_;
+  }
   const Status& request_payload_status() const {
     return request_payload_status_;
   }
@@ -85,6 +90,8 @@ class Call {
   butil::IOBuf request_payload_;
   Status request_payload_status_;
   std::optional<Status> error_status_;
+  std::shared_ptr<RequestTiming> request_timing_ =
+      std::make_shared<RequestTiming>();
 };
 
 }  // namespace xllm

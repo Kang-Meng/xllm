@@ -238,6 +238,7 @@ void VLMMaster::handle_request(std::string prompt,
                                MMData mm_data,
                                RequestParams sp,
                                OutputCallback callback) {
+  sp.timing = RequestTiming::start_ingress(std::move(sp.timing));
   scheduler_->incr_pending_requests(1);
   auto cb = [callback = std::move(callback),
              scheduler = scheduler_.get()](const RequestOutput& output) {
@@ -251,6 +252,9 @@ void VLMMaster::handle_request(std::string prompt,
                          sp = std::move(sp),
                          callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
+    ScopeGuard timing_guard([timing = sp.timing] {
+      timing->update_from_finished_request(/*generation_complete=*/false);
+    });
 
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
@@ -280,9 +284,15 @@ void VLMMaster::handle_request(std::string prompt,
     }
 
     if (!scheduler_->add_request(request)) {
-      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
-                      "No available resources to schedule request",
-                      FailureReason::TEMPORARY_OVERLOAD));
+      // Set the terminal outcome before the callback. The scope guard repeats
+      // this idempotent update on exit intentionally.
+      Status status(StatusCode::RESOURCE_EXHAUSTED,
+                    "No available resources to schedule request",
+                    FailureReason::TEMPORARY_OVERLOAD);
+      request->record_timing_failure(status);
+      callback(std::move(status));
+    } else {
+      timing_guard.dismiss();
     }
   });
 }
@@ -298,6 +308,7 @@ void VLMMaster::handle_request(std::vector<Message> messages,
     throw_prompt_as_is_error(messages);
   }
 
+  sp.timing = RequestTiming::start_ingress(std::move(sp.timing));
   scheduler_->incr_pending_requests(1);
   auto cb = [callback = std::move(callback),
              scheduler = scheduler_.get()](const RequestOutput& output) {
@@ -312,6 +323,9 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                          use_prompt_as_is,
                          callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
+    ScopeGuard timing_guard([timing = sp.timing] {
+      timing->update_from_finished_request(/*generation_complete=*/false);
+    });
 
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
@@ -343,9 +357,15 @@ void VLMMaster::handle_request(std::vector<Message> messages,
     }
 
     if (!scheduler_->add_request(request)) {
-      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
-                      "No available resources to schedule request",
-                      FailureReason::TEMPORARY_OVERLOAD));
+      // Set the terminal outcome before the callback. The scope guard repeats
+      // this idempotent update on exit intentionally.
+      Status status(StatusCode::RESOURCE_EXHAUSTED,
+                    "No available resources to schedule request",
+                    FailureReason::TEMPORARY_OVERLOAD);
+      request->record_timing_failure(status);
+      callback(std::move(status));
+    } else {
+      timing_guard.dismiss();
     }
   });
 }

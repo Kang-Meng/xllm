@@ -21,10 +21,12 @@ limitations under the License.
 
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "common.pb.h"
+#include "core/framework/request/request_timing.h"
 #include "core/framework/request/request_token_accounting.h"
 #include "request_base.h"
 #include "request_state.h"
@@ -113,6 +115,12 @@ class Request : public RequestBase {
 
   double end_to_end_latency_seconds() const;
 
+  // Record first-token output readiness after scheduler metrics, before local
+  // detokenization, or after successful PD handoff. Repeated calls are
+  // idempotent.
+  bool record_server_first_token(
+      RequestTiming::TimePoint now = RequestTiming::Clock::now());
+
   absl::Time created_time() const { return created_time_; }
 
   int32_t get_deadline_ms() const { return deadline_ms_; }
@@ -186,6 +194,21 @@ class Request : public RequestBase {
 
   RequestState& state() { return state_; }
   const RequestState& state() const { return state_; }
+  // Called after actual completion, before response-threadpool enqueueing.
+  void update_timing_after_execution(bool generation_terminal);
+  // Failed admission may have no Sequence terminal or core output callback.
+  void record_timing_failure(const Status& status);
+  void mark_first_scheduled(RequestTiming::TimePoint scheduled_at) {
+    if (!state_.timing->has_scheduled() ||
+        state_.timing->needs_pd_scheduling()) {
+      state_.timing->record_scheduled(scheduled_at);
+    }
+  }
+  // First compatibility cohort: one output, one candidate, generation only.
+  // Multi-Sequence Request aggregates remain diagnostic, not vLLM child
+  // samples.
+  bool supports_single_output_timing() const;
+
   size_t best_of() const { return state_.best_of; }
   void update_connection_status();
 
@@ -219,6 +242,8 @@ class Request : public RequestBase {
   }
 
  private:
+  // Caller holds timing_metrics_mutex_; each phase records or skips once.
+  void observe_terminal_timing_locked(const char* exclusion);
   RequestTokenAccounting request_tokens_;
   // Reuse capacity across the serialized response deltas of this request.
   std::vector<OutputTokenProgress> token_progress_buf_;
@@ -237,6 +262,11 @@ class Request : public RequestBase {
   std::atomic<RequestTerminalOutcome> terminal_outcome_{
       RequestTerminalOutcome::NONE};
   std::atomic<bool> prefill_statistic_logged_{false};
+  // Serialize first/terminal sampling.
+  // Ordinary decode rounds retain the existing atomic fast path.
+  std::mutex timing_metrics_mutex_;
+  bool phase_metrics_observed_ = false;
+  std::atomic<bool> pd_prefill_metrics_observed_{false};
 
   int32_t elapsed_time_ms_ = 0;
 

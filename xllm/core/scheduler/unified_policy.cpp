@@ -36,7 +36,9 @@ void UnifiedPolicy::drain_request_queue(
     SchedulerState& state,
     folly::MPMCQueue<std::shared_ptr<Request>>& request_queue) {
   std::shared_ptr<Request> request;
-  while (request_queue.read(request)) {
+  for (size_t index = 0;
+       index < state.ingress_request_count && request_queue.read(request);
+       ++index) {
     CHECK(request);
     if (state.reject_queued_request && state.reject_queued_request(request)) {
       continue;
@@ -284,6 +286,9 @@ void UnifiedPolicy::schedule_from_unified_queue(
       unified.pop_front();
       request->record_first_batched_time();
       request->record_num_prefix_cache_tokens();
+      if (!candidate_sequences.empty()) {
+        request->mark_first_scheduled(state.scheduled_timestamp);
+      }
       state.running_requests.emplace_back(request);
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),

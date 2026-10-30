@@ -59,6 +59,18 @@ AsyncResponseProcessor::AsyncResponseProcessor(
 
 AsyncResponseProcessor::~AsyncResponseProcessor() { wait_completion(); }
 
+void AsyncResponseProcessor::schedule_on_response_thread(
+    Request& request,
+    ThreadPool::Runnable runnable) {
+  if (request.state().response_thread_id < 0) {
+    request.state().response_thread_id =
+        response_threadpool_.schedule(std::move(runnable));
+  } else {
+    response_threadpool_.schedule_with_tid(std::move(runnable),
+                                           request.state().response_thread_id);
+  }
+}
+
 bool AsyncResponseProcessor::claim_and_log_terminal(
     Request& request,
     const std::optional<Status>& status,
@@ -99,6 +111,7 @@ void AsyncResponseProcessor::process_failed_request(
     std::shared_ptr<Request> request,
     Status status,
     bool send_response) {
+  request->record_timing_failure(status);
   // schedule the response handling
   auto runnable = [this, request, status = std::move(status), send_response]() {
     if (!claim_and_log_terminal(
@@ -115,18 +128,17 @@ void AsyncResponseProcessor::process_failed_request(
     output.status = status;
     request->state().output_func(output);
   };
-  if (request->state().response_thread_id < 0) {
-    request->state().response_thread_id =
-        response_threadpool_.schedule(runnable);
-  } else {
-    response_threadpool_.schedule_with_tid(runnable,
-                                           request->state().response_thread_id);
-  }
+  schedule_on_response_thread(*request, std::move(runnable));
 }
 
 void AsyncResponseProcessor::process_completed_request(
     std::shared_ptr<Request> request,
     bool terminal) {
+  if (terminal) {
+    // PD admission marks timing pd_local, so snapshot keeps Decode partial
+    // even if a handed-off PREFILL request reaches this completion path.
+    request->update_timing_after_execution(/*generation_terminal=*/true);
+  }
   // schedule the response handling
 
   // NOTE: Maybe refactor later.
@@ -155,13 +167,7 @@ void AsyncResponseProcessor::process_completed_request(
     const bool submitted = request->state().output_func(req_output);
     request->record_token_output(req_output, submitted);
   };
-  if (request->state().response_thread_id < 0) {
-    request->state().response_thread_id =
-        response_threadpool_.schedule(runnable);
-  } else {
-    response_threadpool_.schedule_with_tid(runnable,
-                                           request->state().response_thread_id);
-  }
+  schedule_on_response_thread(*request, std::move(runnable));
 }
 
 void AsyncResponseProcessor::batch_process_completed_requests(
@@ -174,6 +180,10 @@ void AsyncResponseProcessor::batch_process_completed_requests(
   std::vector<uint8_t> valid_outputs(requests_size, 0);
   for (size_t i = 0; i < requests_size; ++i) {
     auto& request = requests[i];
+    if (terminal) {
+      // As above, PD admission's pd_local marker prevents a complete Decode.
+      request->update_timing_after_execution(/*generation_terminal=*/true);
+    }
     auto runnable = [counter,
                      this,
                      request = request,
@@ -189,13 +199,7 @@ void AsyncResponseProcessor::batch_process_completed_requests(
       }
       counter->decrement_count();
     };
-    if (request->state().response_thread_id < 0) {
-      request->state().response_thread_id =
-          response_threadpool_.schedule(runnable);
-    } else {
-      response_threadpool_.schedule_with_tid(
-          runnable, request->state().response_thread_id);
-    }
+    schedule_on_response_thread(*request, std::move(runnable));
   }
 
   rpc_threadpool_.schedule(
@@ -311,13 +315,7 @@ void AsyncResponseProcessor::process_stream_request(
         cancel_request(request);
       }
     };
-    if (request->state().response_thread_id < 0) {
-      request->state().response_thread_id =
-          response_threadpool_.schedule(runnable);
-    } else {
-      response_threadpool_.schedule_with_tid(
-          runnable, request->state().response_thread_id);
-    }
+    schedule_on_response_thread(*request, std::move(runnable));
   }
 }
 
@@ -391,13 +389,7 @@ void AsyncResponseProcessor::batch_process_stream_requests(
       }
       counter->decrement_count();
     };
-    if (request->state().response_thread_id < 0) {
-      request->state().response_thread_id =
-          response_threadpool_.schedule(runnable);
-    } else {
-      response_threadpool_.schedule_with_tid(
-          runnable, request->state().response_thread_id);
-    }
+    schedule_on_response_thread(*request, std::move(runnable));
   }
 
   rpc_threadpool_.schedule([cancel_request = cancel_request_,

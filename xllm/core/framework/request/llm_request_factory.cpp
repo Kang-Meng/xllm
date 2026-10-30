@@ -435,6 +435,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   req_state.sample_slots = sp.sample_slots;
+  req_state.timing = sp.timing;
 
   rate_limit_guard.dismiss();
   // add one sequence, rest will be added by scheduler

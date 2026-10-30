@@ -22,6 +22,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,7 @@ limitations under the License.
 #include "core/common/instance_name.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/request/request_output.h"
+#include "core/framework/request/request_timing.h"
 #include "core/util/utils.h"
 
 #ifdef likely
@@ -214,6 +216,7 @@ LLMMaster* CompletionServiceImpl::get_model_master(
 // complete_async for brpc from xllm_service
 void CompletionServiceImpl::process_async_rpc_impl(
     const proto::CompletionRequest* request) {
+  const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
   auto callback = [master = master_](const RequestOutput& req_output) -> bool {
@@ -233,6 +236,8 @@ void CompletionServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
+  request_params.timing = std::make_shared<RequestTiming>();
+  request_params.timing->record_arrival(arrival_time);
 
   std::optional<std::vector<int>> prompt_tokens = std::nullopt;
   if (rpc_request.token_ids_size() > 0) {
@@ -254,6 +259,8 @@ void CompletionServiceImpl::process_async_rpc_impl(
 // complete_async for brpc
 void CompletionServiceImpl::process_async_impl(
     std::shared_ptr<CompletionCall> call) {
+  // Route input preparation starts here, after transport/JSON parsing.
+  call->request_timing()->record_arrival();
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
   LLMMaster* master = get_model_master(model);
@@ -272,6 +279,7 @@ void CompletionServiceImpl::process_async_impl(
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  request_params.timing = call->request_timing();
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {
     include_usage = rpc_request.stream_options().include_usage();

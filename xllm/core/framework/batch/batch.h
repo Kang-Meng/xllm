@@ -20,8 +20,10 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <torch/torch.h>
 
+#include <functional>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "core/framework/multimodal/mm_data.h"
@@ -124,6 +126,14 @@ class Batch {
   // mark all sequences as finished (used by rec model multi-round decoding)
   void finish();
 
+  // Finalize confirmed tokens using the core output batch event, after all
+  // sequence mutations. Explicit timestamps support deterministic tests.
+  void record_core_output(
+      RequestTiming::TimePoint now = RequestTiming::Clock::now());
+  void set_output_observer(std::function<void()> observer) {
+    output_observer_ = std::move(observer);
+  }
+
   // Refresh sequences_ from sequence_groups_ after beam search processing.
   // This is needed for RecEngine because SequencesGroup::process_beam_search()
   // replaces its internal sequences_, invalidating pointers in
@@ -171,6 +181,8 @@ class Batch {
 
   std::vector<Sequence*> sequences_;
   std::vector<Block> inflight_blocks_;
+  // FixedSteps exposes each internal result batch to the frontend observer.
+  std::function<void()> output_observer_;
   std::vector<SequencesGroup*> sequence_groups_;
   std::vector<BlockTransferInfo> swap_block_transfer_infos_;
 

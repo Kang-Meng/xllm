@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <vector>
@@ -78,6 +79,10 @@ struct SchedulerState {
       {};
   // PD decode admission gate; nullptr when host restore is not available.
   DecodeAdmission* decode_admission = nullptr;
+  RequestTiming::TimePoint scheduled_timestamp;
+  // Freeze ingress before reading the round clock. Later arrivals must not
+  // acquire a SCHEDULED timestamp earlier than their QUEUED event.
+  size_t ingress_request_count = std::numeric_limits<size_t>::max();
 };
 
 // ScheduleBudget tracks the remaining resources for the current scheduling

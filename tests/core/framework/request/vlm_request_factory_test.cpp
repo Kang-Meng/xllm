@@ -313,6 +313,7 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
   auto factory = make_factory();
   CallbackCapture capture;
   RequestParams sp;
+  sp.timing = std::make_shared<RequestTiming>();
   sp.request_id = "req-chat";
   sp.max_tokens = 16;
   // MMInputTransfer requires MMContentVec content; a text part is enough.
@@ -327,6 +328,8 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().timing, sp.timing);
+  EXPECT_EQ(request->sequences().front()->request_timing(), sp.timing);
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
 }

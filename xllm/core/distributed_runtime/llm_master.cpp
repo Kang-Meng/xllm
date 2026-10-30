@@ -203,6 +203,10 @@ void LLMMaster::handle_request(std::string prompt,
                                RequestParams sp,
                                std::optional<Call*> call,
                                OutputCallback callback) {
+  if (!sp.timing && call.has_value() && *call != nullptr) {
+    sp.timing = (*call)->request_timing();
+  }
+  sp.timing = RequestTiming::start_ingress(std::move(sp.timing));
   scheduler_->incr_pending_requests(1);
   // add into the queue
   threadpool_->schedule([this,
@@ -212,6 +216,11 @@ void LLMMaster::handle_request(std::string prompt,
                          callback = std::move(callback),
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
+    // Cover validation/factory failures and unwinding before scheduler
+    // ownership transfers; only successful admission dismisses this guard.
+    ScopeGuard timing_guard([timing = sp.timing] {
+      timing->update_from_finished_request(/*generation_complete=*/false);
+    });
 
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
@@ -236,11 +245,16 @@ void LLMMaster::handle_request(std::string prompt,
     }
 
     if (!scheduler_->add_request(request)) {
-      callback({Status(StatusCode::RESOURCE_EXHAUSTED,
-                       "No available resources to schedule request",
-                       FailureReason::TEMPORARY_OVERLOAD),
-                sp.service_request_id,
-                sp.source_xservice_addr});
+      // Set the terminal outcome before the callback. The scope guard repeats
+      // this idempotent update on exit intentionally.
+      Status status(StatusCode::RESOURCE_EXHAUSTED,
+                    "No available resources to schedule request",
+                    FailureReason::TEMPORARY_OVERLOAD);
+      request->record_timing_failure(status);
+      callback(
+          {std::move(status), sp.service_request_id, sp.source_xservice_addr});
+    } else {
+      timing_guard.dismiss();
     }
   });
 }
@@ -250,6 +264,10 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                                RequestParams sp,
                                std::optional<Call*> call,
                                OutputCallback callback) {
+  if (!sp.timing && call.has_value() && *call != nullptr) {
+    sp.timing = (*call)->request_timing();
+  }
+  sp.timing = RequestTiming::start_ingress(std::move(sp.timing));
   scheduler_->incr_pending_requests(1);
   // add into the queue
   threadpool_->schedule([this,
@@ -259,6 +277,11 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                          callback = std::move(callback),
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
+    // Cover validation/factory failures and unwinding before scheduler
+    // ownership transfers; only successful admission dismisses this guard.
+    ScopeGuard timing_guard([timing = sp.timing] {
+      timing->update_from_finished_request(/*generation_complete=*/false);
+    });
 
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
@@ -280,11 +303,16 @@ void LLMMaster::handle_request(std::vector<Message> messages,
     }
 
     if (!scheduler_->add_request(request)) {
-      callback({Status(StatusCode::RESOURCE_EXHAUSTED,
-                       "No available resources to schedule request",
-                       FailureReason::TEMPORARY_OVERLOAD),
-                sp.service_request_id,
-                sp.source_xservice_addr});
+      // Set the terminal outcome before the callback. The scope guard repeats
+      // this idempotent update on exit intentionally.
+      Status status(StatusCode::RESOURCE_EXHAUSTED,
+                    "No available resources to schedule request",
+                    FailureReason::TEMPORARY_OVERLOAD);
+      request->record_timing_failure(status);
+      callback(
+          {std::move(status), sp.service_request_id, sp.source_xservice_addr});
+    } else {
+      timing_guard.dismiss();
     }
   });
 }

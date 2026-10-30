@@ -26,6 +26,18 @@ target_link_options(sequence_inflight_blocks_test
 
 cc_test(
   NAME
+    request_timing_test
+  CPU_ONLY
+  SRCS
+    request_timing_test.cpp
+  DEPS
+    :request_timing
+    proto::xllm_proto
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     vlm_request_factory_test
   CPU_ONLY
   SRCS

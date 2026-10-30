@@ -109,7 +109,9 @@ class UsageTokenizer final : public Tokenizer {
   }
 };
 
-std::unique_ptr<Request> make_usage_request(size_t max_tokens, bool overlap) {
+std::unique_ptr<Request> make_usage_request(size_t max_tokens,
+                                            bool overlap,
+                                            size_t best_of = 1) {
   RequestSamplingParam sampling_param;
   StoppingChecker stopping_checker;
   stopping_checker.set_max_generated_tokens(max_tokens);
@@ -121,8 +123,8 @@ std::unique_ptr<Request> make_usage_request(size_t max_tokens, bool overlap) {
       SchedulerParam{},
       stopping_checker,
       /*seq_capacity=*/max_tokens + 8,
-      /*n=*/1,
-      /*best_of=*/1,
+      /*n=*/best_of,
+      /*best_of=*/best_of,
       /*logprobs=*/false,
       /*stream=*/false,
       /*echo=*/false,
@@ -192,6 +194,8 @@ TEST(RequestCommittedUsageTest, CancelledPlaceholdersDoNotCountAsOutput) {
   request->sequences().front()->append_token(Token(-1));
   request->sequences().front()->append_token(Token(-1));
   request->set_cancel();
+  EXPECT_TRUE(request->state().timing->snapshot().terminal);
+  EXPECT_FALSE(request->state().timing->has_generated_token());
   UsageTokenizer tokenizer;
   const RequestOutput output = request->generate_output(tokenizer);
   ASSERT_TRUE(output.usage.has_value());
@@ -205,6 +209,44 @@ TEST(RequestCommittedUsageTest, NonOverlapCountsEveryRealToken) {
   const RequestOutput output = request->generate_output(tokenizer);
   ASSERT_TRUE(output.usage.has_value());
   EXPECT_EQ(output.usage->num_generated_tokens, 1);
+}
+
+TEST(RequestTimingIntegrationTest, MultiSequenceEndsAfterLastSequence) {
+  auto request = make_usage_request(/*max_tokens=*/1,
+                                    /*overlap=*/false,
+                                    /*best_of=*/2);
+  ASSERT_TRUE(request->expand_sequences());
+  Sequence& first = *request->sequences()[0];
+  Sequence& second = *request->sequences()[1];
+  EXPECT_EQ(first.request_timing(), second.request_timing());
+  second.kv_state().set_kv_cache_tokens_num(second.num_prompt_tokens());
+  first.append_token(Token(65));
+  request->state().timing->record_core_output(RequestTiming::Clock::now());
+  request->update_timing_after_execution(/*generation_terminal=*/true);
+  EXPECT_FALSE(request->state().timing->snapshot().terminal);
+  second.append_token(Token(65));
+  request->state().timing->record_core_output(RequestTiming::Clock::now());
+  request->update_timing_after_execution(/*generation_terminal=*/true);
+  const auto snapshot = request->state().timing->snapshot();
+  EXPECT_TRUE(snapshot.terminal);
+  EXPECT_TRUE(snapshot.decode_time.valid);
+}
+
+TEST(RequestTimingIntegrationTest, CachedBeamRoundsCannotClaimCompleteDecode) {
+  auto request = make_usage_request(/*max_tokens=*/4, /*overlap=*/false);
+  Sequence& sequence = *request->sequences().front();
+  sequence.append_token(Token(65));
+  request->state().timing->record_core_output(RequestTiming::Clock::now());
+  sequence.set_beam_result(/*bw=*/2,
+                           /*total_rounds=*/3,
+                           {{65, 66, 67}, {65, 68, 69}},
+                           {-1.0F, -2.0F});
+  request->state().timing->update_from_finished_request(
+      /*generation_complete=*/true);
+  const auto snapshot = request->state().timing->snapshot();
+  EXPECT_FALSE(snapshot.decode_time.valid);
+  EXPECT_TRUE(snapshot.decode_time.partial);
+  EXPECT_EQ(snapshot.decode_time.reason, RequestTimingReason::UNKNOWN_BOUNDARY);
 }
 
 }  // namespace

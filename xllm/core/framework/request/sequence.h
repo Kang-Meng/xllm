@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/common/types.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/prefix_cache/block_hasher.h"
+#include "core/framework/request/request_timing.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/tokenizer/tokenizer.h"
@@ -127,6 +128,7 @@ struct SequenceParams {
   bool json_reasoning_enabled = false;
   std::shared_ptr<RequestFailureState> request_failure_state;
   std::shared_ptr<SpeculativeTokenStats> speculative_token_stats;
+  std::shared_ptr<RequestTiming> request_timing;
 };
 
 class Sequence final {
@@ -286,6 +288,9 @@ class Sequence final {
   // The request id already lives in sequence_params_; don't keep a second
   // copy per sequence (a heap allocation each for UUID-length ids).
   const std::string& request_id() const { return sequence_params_.request_id; }
+  const std::shared_ptr<RequestTiming>& request_timing() const {
+    return sequence_params_.request_timing;
+  }
   std::string sample_sequence_id() const {
     return sequence_params_.request_id + "#" + std::to_string(index_);
   }
@@ -479,6 +484,11 @@ class Sequence final {
     total_rounds_cached_ = total_rounds;
     beam_seq_group_flat_ = flat;
     beam_last_logprobs_ = last_logprobs;
+    // Device-internal rounds are returned together, without first/last local
+    // generation events. A prior single token cannot prove complete Decode.
+    if (sequence_params_.request_timing) {
+      sequence_params_.request_timing->mark_generation_events_incomplete();
+    }
   }
   bool has_beam_result() const {
     return beam_width_cached_ > 0 && total_rounds_cached_ > 0 &&
@@ -545,6 +555,12 @@ class Sequence final {
 
  private:
   void record_first_token(const Token& token);
+  // Sample-slot results and their positive-id placeholders are not generation.
+  bool counts_as_generated_event(int32_t token_id) const {
+    return token_id >= 0 && !cancelled() && sample_slots().empty() &&
+           !sequence_params_.sampling_param->is_embeddings &&
+           sequence_params_.request_timing;
+  }
   bool try_commit_json_object_token(int32_t token_id, int64_t token_offset);
 
   // Drop cached block hashes that may be stale after the token at

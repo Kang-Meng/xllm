@@ -667,6 +667,8 @@ AnthropicServiceImpl::AnthropicServiceImpl(
 
 void AnthropicServiceImpl::process_async_impl(
     std::shared_ptr<AnthropicCall> call) {
+  // Preserve the route start before parameter/message/parser preparation.
+  call->request_timing()->record_arrival();
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
   // Check if model is supported
@@ -685,6 +687,7 @@ void AnthropicServiceImpl::process_async_impl(
   // Build request parameters
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  request_params.timing = call->request_timing();
 
   if (api_service::should_run_tool_call_parser(request_params.tools,
                                                tool_call_parser_format_)) {

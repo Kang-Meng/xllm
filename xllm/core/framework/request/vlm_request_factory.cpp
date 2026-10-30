@@ -221,6 +221,7 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
                          callback,
                          nullptr);
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
+  req_state.timing = sp.timing;
 
   rate_limit_guard.dismiss();
   // add one sequence, rest will be added by scheduler

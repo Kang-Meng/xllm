@@ -173,6 +173,11 @@ class TestContinuousScheduler final : public ContinuousScheduler {
   TestContinuousScheduler(Engine* engine, const Options& options)
       : ContinuousScheduler(engine, options) {}
 
+  void complete_request(const std::shared_ptr<Request>& request) {
+    response_processor_->process_completed_request(request);
+    response_processor_->wait_completion();
+  }
+
   void reject_stream(const std::shared_ptr<Request>& request) {
     response_processor_->process_stream_request(request);
     response_processor_->wait_completion();
@@ -1731,18 +1736,52 @@ TEST(ContinuousSchedulerTest,
                        std::nullopt,
                        std::nullopt,
                        /*max_context_len=*/30000)[0];
+  std::atomic<int32_t> terminal_outputs{0};
+  request->state().output_func = [&](const RequestOutput& output) {
+    EXPECT_TRUE(output.cancelled);
+    EXPECT_EQ(output.status->code(), StatusCode::CANCELLED);
+    ++terminal_outputs;
+    return true;
+  };
 
   ASSERT_TRUE(scheduler->add_request(request));
   ASSERT_EQ(scheduler->get_waiting_requests_num(), 1u);
   request->set_cancel();
 
+  auto completed = generate_request_with_prompt_tokens({1, 2}, 4, 32, "");
+  std::atomic<int32_t> completed_outputs{0};
+  completed->state().output_func = [&](const RequestOutput& output) {
+    EXPECT_TRUE(output.finished);
+    EXPECT_FALSE(output.cancelled);
+    EXPECT_EQ(output.status->code(), StatusCode::OK);
+    EXPECT_EQ(output.usage->num_generated_tokens, 0);
+    ++completed_outputs;
+    return true;
+  };
+  ASSERT_TRUE(scheduler->add_request(completed));
+  completed->sequences().front()->finish();
+
   std::vector<Batch> batches = scheduler->prepare_batch_test();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
-  EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
+  EXPECT_EQ(scheduler->get_waiting_requests_num(), 2u);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
 
   engine->set_prefetch_ready(true);
+  scheduler->wait_for_responses();
+  EXPECT_EQ(terminal_outputs.load(), 1);
+  EXPECT_EQ(completed_outputs.load(), 1);
+  EXPECT_TRUE(request->has_terminal_outcome());
+  EXPECT_TRUE(completed->has_terminal_outcome());
+  for (const auto& terminal_request : {request, completed}) {
+    const auto timing = terminal_request->state().timing->snapshot();
+    EXPECT_TRUE(timing.terminal);
+    EXPECT_FALSE(timing.server_ttft.valid);
+    EXPECT_FALSE(timing.prefill_time.valid);
+    EXPECT_FALSE(timing.decode_time.milliseconds.has_value());
+  }
+  scheduler->complete_request(completed);
+  EXPECT_EQ(completed_outputs.load(), 1);
   batches = scheduler->prepare_batch_test();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
@@ -1787,6 +1826,41 @@ TEST(ContinuousSchedulerTest, QueueCapacityRejectsBeforePrefetchStarts) {
   engine->set_prefetch_ready(true);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 1u);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
+}
+
+TEST(ContinuousSchedulerTest, RejectedPdAdmissionCannotClaimQueuedOrValidTtft) {
+  ScopedConfigValue<int32_t> request_queue_size(
+      RecConfig::get_instance().request_queue_size(), 1);
+  auto options = create_scheduler_options(64, 4, 0, 64, 1);
+  options.enable_disagg_pd() = true;
+  auto engine = std::make_unique<FakeEngine>(64, 32);
+  TestContinuousScheduler scheduler(engine.get(), options);
+  auto requests = generate_request({8, 8},
+                                   {4, 4},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   /*max_context_len=*/30000);
+  ASSERT_TRUE(scheduler.enqueue_direct(requests[0]));
+  requests[1]->state().timing->record_arrival();
+  requests[1]->state().output_func = [](const RequestOutput&) { return true; };
+  EXPECT_FALSE(scheduler.add_request(requests[1]));
+  EXPECT_EQ(engine->prefetch_calls(), 0u);
+  // The master owns the rejected-admission terminal update.
+  requests[1]->state().timing->update_from_finished_request(
+      /*generation_complete=*/false);
+  scheduler.complete_request(requests[1]);
+  const auto sample = requests[1]->state().timing->snapshot();
+  EXPECT_TRUE(sample.terminal);
+  EXPECT_TRUE(sample.pd_local);
+  EXPECT_FALSE(sample.pd_handoff_accepted);
+  EXPECT_FALSE(sample.queued_time.milliseconds.has_value());
+  EXPECT_FALSE(sample.server_ttft.valid);
+  EXPECT_FALSE(sample.prefill_time.valid);
+  EXPECT_FALSE(sample.decode_time.valid);
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.dequeue_direct(queued));
 }
 
 TEST(ContinuousSchedulerTest,
@@ -2419,6 +2493,47 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   EXPECT_TRUE(scheduler->get_running_requests().empty());
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
+}
+
+TEST(ContinuousSchedulerTest, EmptyOutputDoesNotPublishLegacyOrServerTtft) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(1024, 16, 0, 1024, 1);
+  auto engine = std::make_unique<FakeEngine>(32, 4);
+  TestContinuousScheduler scheduler(engine.get(), options);
+  auto request = generate_request_with_prompt_tokens({1, 2}, 4, 32);
+  request->state().output_func = [](const RequestOutput&) { return true; };
+  request->state().timing->record_arrival(RequestTiming::Clock::now() -
+                                          std::chrono::seconds(3));
+  ASSERT_TRUE(scheduler.add_request(request));
+  ASSERT_FALSE(scheduler.prepare_batch_test()[0].empty());
+  const int64_t count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  const int64_t legacy_count =
+      HISTOGRAM_time_to_first_token_latency_milliseconds.count();
+  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  EXPECT_FALSE(request->state().timing->snapshot().server_ttft.valid);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            count);
+  EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
+            legacy_count);
+  auto& sequence = request->sequences().front();
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  sequence->append_token(Token(65));
+  request->state().timing->record_core_output(RequestTiming::Clock::now());
+  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  const auto sample = request->state().timing->snapshot().server_ttft;
+  ASSERT_TRUE(sample.valid);
+  EXPECT_GE(*sample.milliseconds, 3000.0);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            count + 1);
+  EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
+            legacy_count + 1);
+  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            count + 1);
+  EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
+            legacy_count + 1);
 }
 
 TEST(ContinuousSchedulerTest, FailedStreamReturnsStatusExactlyOnce) {

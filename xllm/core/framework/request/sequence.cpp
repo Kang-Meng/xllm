@@ -506,6 +506,9 @@ void Sequence::append_token(const Token& token) {
   }
 
   // A real token was committed (overlap-fake placeholders returned above).
+  if (counts_as_generated_event(token_id)) {
+    sequence_params_.request_timing->note_generated_token();
+  }
   ++generated_tokens_since_latency_;
   if (need_unique_tokens_) {
     token_to_count_map_[token_id]++;
@@ -555,6 +558,9 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
 
   // A real token is committed here (one per call, including the extra accepted
   // MTP token when token_offset > 0); preempted MTP steps returned above.
+  if (counts_as_generated_event(token_id)) {
+    sequence_params_.request_timing->note_generated_token();
+  }
   ++generated_tokens_since_latency_;
 
   tokens_[cur_generated_token_idx_] = token_id;

@@ -295,6 +295,11 @@ ContinuousScheduler::~ContinuousScheduler() {
 bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
+  if (options_.enable_disagg_pd()) {
+    // Role classification also applies to failed admission. Only record_queued
+    // below signals acceptance; rejected requests cannot emit complete metrics.
+    request->state().timing->mark_pd_local();
+  }
 
   if ((request->check_beam_search() || request->best_of() > 1) &&
       has_linear_attention_layers(engine_->model_args())) {
@@ -318,10 +323,18 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
 
   // Input counts admission, including requests that later fail or cancel.
   request->record_token_admission();
+  // Accepted into the scheduler's waiting domain, before asynchronous KV
+  // prefetch. Rejected admission is not a QUEUED event.
+  request->state().timing->record_queued();
   kv_cache_manager_->prefetch_from_storage(
       request, [this](std::shared_ptr<Request> completed) {
         const bool cancelled = completed->finished() || completed->cancelled();
-        if (!cancelled) {
+        if (cancelled) {
+          // A request can become terminal while storage prefetch is pending.
+          // Complete it through the same idempotent response/logging path;
+          // dropping it here would lose the response and terminal sample.
+          response_processor_->process_completed_request(completed);
+        } else {
           enqueue_ready_request(completed);
         }
         const size_t previous =
@@ -445,9 +458,18 @@ void ContinuousScheduler::drain_decode_restore_waiting(
   }
 }
 
+size_t ContinuousScheduler::begin_schedule_round() {
+  const size_t ingress_request_count =
+      static_cast<size_t>(std::max<ssize_t>(request_queue_.size(), 0));
+  scheduled_timestamp_ = RequestTiming::Clock::now();
+  return ingress_request_count;
+}
+
 std::vector<Batch> ContinuousScheduler::prepare_batch() {
+  const size_t ingress_request_count = begin_schedule_round();
   Timer timer;
   auto state = make_state();
+  state.ingress_request_count = ingress_request_count;
 
   // Common phases (strategy-independent)
   policy_->drain_request_queue(state, request_queue_);
@@ -554,6 +576,7 @@ SchedulerState ContinuousScheduler::make_state() {
             return reject_queued_request(request);
           },
       .decode_admission = decode_admission_.get(),
+      .scheduled_timestamp = scheduled_timestamp_,
   };
 }
 
@@ -744,14 +767,18 @@ void ContinuousScheduler::update_token_latency_metrics(
     }
     // Read the committed-token count before tbt(), which resets it.
     const size_t committed_tokens = sequence->generated_tokens_since_latency();
+    if (committed_tokens == 0) {
+      continue;
+    }
     const int64_t tbt_microseconds = sequence->tbt_microseconds(now);
     const int64_t tbt_milliseconds =
         microseconds_to_milliseconds(tbt_microseconds);
     if (sequence->is_first_token()) {
-      HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
-                        tbt_milliseconds);
+      // Preserve the legacy Sequence TTFT; Request server TTFT is separate.
       sequence->set_time_to_first_token_latency_seconds(
           static_cast<double>(tbt_milliseconds) / 1000);
+      HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
+                        tbt_milliseconds);
     } else {
       int64_t inter_token_latency_us = tbt_microseconds;
       if (speculative_metrics_enabled && committed_tokens > 0) {
@@ -781,9 +808,20 @@ void ContinuousScheduler::process_batch_output(bool enable_schedule_overlap) {
   // update slot usage and activation metrics
   update_memory_metrics(to_be_processed_sequences);
 
+  // Match PR #2588: one result-batch time after scheduler metrics, before
+  // output dispatch/detokenization. Reuse it for every Request in this batch.
+  const RequestTiming::TimePoint output_time = RequestTiming::Clock::now();
   std::vector<std::shared_ptr<Request>> stream_requests;
   // process request output in batch
   for (auto request : to_be_processed_requests) {
+    // PD Prefill observes the accepted handoff on its original local clock.
+    // Decode has no ingress arrival and cannot emit a duplicate server TTFT.
+    if (request->state().decode_address.empty()) {
+      request->record_server_first_token(output_time);
+    }
+    request->update_timing_after_execution(
+        /*generation_terminal=*/!options_.enable_disagg_pd() ||
+        options_.instance_role() == InstanceRole::DECODE);
     if (request->cancelled() || request->error_status().has_value()) {
       release_failed_request(request);
       continue;

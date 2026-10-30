@@ -2,6 +2,27 @@ include(cc_test)
 
 add_subdirectory(profile)
 
+# Exercise response-pool ordering without the scheduler's global device setup.
+cc_test(
+  NAME
+    request_phase_output_test
+  CPU_ONLY
+  SRCS
+    request_phase_output_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/scheduler/async_response_processor.cpp
+  DEPS
+    :config
+    :request
+    :util
+    GTest::gtest_main
+)
+target_link_libraries(request_phase_output_test PUBLIC
+    Python::Python
+    $<$<BOOL:${USE_NPU}>:ascendcl>
+    $<$<BOOL:${USE_NPU}>:hccl>
+    $<$<BOOL:${USE_NPU}>:c_sec>
+    $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 cc_test(
   NAME
     scheduler_test

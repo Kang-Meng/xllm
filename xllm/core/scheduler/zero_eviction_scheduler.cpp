@@ -409,6 +409,7 @@ void ZeroEvictionScheduler::handle_prefill_requests(
     remaining_seq_budget -= allocated_seqs;
     prefill_queue_->pop_top();
     request->record_first_batched_time();
+    request->mark_first_scheduled(scheduled_timestamp_);
     running_requests_.emplace_back(request);
     running_sequences_.insert(running_sequences_.end(),
                               prefill_sequences.begin(),

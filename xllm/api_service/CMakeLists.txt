@@ -67,6 +67,7 @@ cc_library(
     embedding_output_builder.cpp
   DEPS
     :master
+    :request_timing
     :chat_template
     :chat_template_base
     :util

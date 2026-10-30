@@ -472,6 +472,7 @@ TEST_F(LLMRequestFactoryTest,
   auto factory = make_factory();
   CallbackCapture capture;
   RequestParams sp;
+  sp.timing = std::make_shared<RequestTiming>();
   sp.request_id = "req-1";
   sp.max_tokens = 16;
 
@@ -482,6 +483,8 @@ TEST_F(LLMRequestFactoryTest,
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().timing, sp.timing);
+  EXPECT_EQ(request->sequences().front()->request_timing(), sp.timing);
   EXPECT_FALSE(capture.called);
   // On success the slot stays held; it is later released when the request is
   // completed/destroyed by the scheduler, not by the factory.

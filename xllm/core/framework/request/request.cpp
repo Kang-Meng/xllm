@@ -21,6 +21,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
@@ -65,7 +66,156 @@ OptionalLogField optional_field(std::string_view label,
   return OptionalLogField(label, value);
 }
 
+bool complete(const RequestTimingSample& sample) {
+  // Constructed snapshots, including wire imports, can bypass span().
+  // Revalidate complete samples at the recorder boundary.
+  return sample.valid && !sample.partial && sample.milliseconds.has_value() &&
+         std::isfinite(*sample.milliseconds) && *sample.milliseconds >= 0 &&
+         *sample.milliseconds * 1000.0 <
+             static_cast<double>(std::numeric_limits<int64_t>::max()) &&
+         sample.reason == RequestTimingReason::COMPLETE;
+}
+
+const char* skipped_sample_reason(const RequestTimingSample& sample) {
+  return sample.reason == RequestTimingReason::MISSING_START ? "missing_start"
+         : sample.reason == RequestTimingReason::MISSING_END ? "missing_end"
+         : sample.reason == RequestTimingReason::UNKNOWN_BOUNDARY
+             ? "unknown_boundary"
+         : sample.reason == RequestTimingReason::INTERRUPTED ? "interrupted"
+                                                             : "invalid_sample";
+}
+
+const char* segment_exclusion(const RequestTimingSample& sample,
+                              const char* exclusion) {
+  return exclusion != nullptr || complete(sample)
+             ? exclusion
+             : skipped_sample_reason(sample);
+}
+
+void observe(bvar::LatencyRecorder& recorder,
+             const RequestTimingSample& sample,
+             const char* phase = nullptr,
+             const char* exclusion = nullptr) {
+  if (exclusion == nullptr && complete(sample)) {
+    recorder << static_cast<int64_t>(*sample.milliseconds * 1000.0);
+  } else if (phase != nullptr) {
+    const char* reason =
+        exclusion != nullptr ? exclusion : skipped_sample_reason(sample);
+    bvar::Adder<int64_t>* counter =
+        MULTI_COUNTER_xllm_request_phase_skipped_total.get_stats(
+            {phase, reason});
+    if (counter != nullptr) {
+      *counter << 1;
+    }
+  }
+}
+
+void observe(bvar::LatencyRecorder* recorder,
+             const RequestTimingSample& sample,
+             const char* phase,
+             const char* exclusion) {
+  if (recorder != nullptr) {
+    observe(*recorder, sample, phase, exclusion);
+  }
+}
+
 }  // namespace
+
+void observe_request_ttft_metric(const RequestTimingSnapshot& snapshot,
+                                 bool single_output) {
+  if (single_output && !snapshot.pd_local) {
+    observe(HISTOGRAM_xllm_request_ttft_microseconds, snapshot.server_ttft);
+  }
+}
+
+void observe_request_phase_metrics(const RequestTimingSnapshot& snapshot,
+                                   bool single_output,
+                                   uint64_t num_generation_tokens,
+                                   const char* exclusion) {
+  if (!snapshot.terminal) {
+    return;
+  }
+  if (exclusion == nullptr && !single_output) {
+    exclusion = "unsupported_output";
+  }
+  if (snapshot.pd_local) {
+    // An original P request has no local Decode segment to sample or skip.
+    if (!snapshot.pd_imported) {
+      return;
+    }
+    const RequestTimingSample tpot =
+        request_pd_tpot_sample(snapshot, num_generation_tokens);
+    if (exclusion == nullptr) {
+      if (!snapshot.pd_decode_tokens_at_start.has_value()) {
+        exclusion = "missing_start";
+      } else if (num_generation_tokens <= *snapshot.pd_decode_tokens_at_start) {
+        exclusion = "no_local_tokens";
+      }
+    }
+    // No local output means no Decode segment. Validate the raw span before
+    // TPOT division so overflow cannot be hidden by the token denominator.
+    const char* decode_exclusion =
+        segment_exclusion(snapshot.pd_decode_time, exclusion);
+    observe(MULTI_HISTOGRAM_xllm_pd_request_queue_microseconds.get_stats(
+                {"decode"}),
+            snapshot.pd_queued_time,
+            "pd_decode_queue",
+            decode_exclusion);
+    observe(MULTI_HISTOGRAM_xllm_pd_request_decode_microseconds.get_stats(
+                {"decode"}),
+            snapshot.pd_decode_time,
+            "pd_decode",
+            decode_exclusion);
+    observe(
+        MULTI_HISTOGRAM_xllm_pd_request_tpot_microseconds.get_stats({"decode"}),
+        tpot,
+        "pd_tpot",
+        decode_exclusion);
+    return;
+  }
+  observe(HISTOGRAM_xllm_request_queue_microseconds,
+          snapshot.queued_time,
+          "queue",
+          exclusion);
+  observe(HISTOGRAM_xllm_request_prefill_microseconds,
+          snapshot.prefill_time,
+          "prefill",
+          exclusion);
+  if (exclusion == nullptr && num_generation_tokens == 1) {
+    exclusion = "single_token";
+  }
+  observe(HISTOGRAM_xllm_request_decode_microseconds,
+          snapshot.decode_time,
+          "decode",
+          exclusion);
+  observe(HISTOGRAM_xllm_request_tpot_microseconds,
+          request_tpot_sample(snapshot, num_generation_tokens),
+          "tpot",
+          exclusion);
+}
+
+void observe_request_pd_prefill_metrics(const RequestTimingSnapshot& snapshot,
+                                        bool single_output,
+                                        const char* exclusion) {
+  if (!snapshot.pd_local || snapshot.pd_imported) {
+    return;
+  }
+  if (exclusion == nullptr && !single_output) {
+    exclusion = "unsupported_output";
+  }
+  // Prefill completes before generation terminal. Publish at the first
+  // confirmed core result; later handoff success is a different boundary.
+  observe(
+      MULTI_HISTOGRAM_xllm_pd_request_queue_microseconds.get_stats({"prefill"}),
+      snapshot.queued_time,
+      "pd_prefill_queue",
+      segment_exclusion(snapshot.prefill_time, exclusion));
+  observe(MULTI_HISTOGRAM_xllm_pd_request_prefill_microseconds.get_stats(
+              {"prefill"}),
+          snapshot.prefill_time,
+          "pd_prefill",
+          exclusion);
+}
 
 Request::Request(const std::string& request_id,
                  const std::string& x_request_id,
@@ -81,6 +231,9 @@ Request::Request(const std::string& request_id,
                   source_xservice_addr,
                   rate_limiter),
       state_(std::move(state)) {
+  if (!state_.timing) {
+    state_.timing = std::make_shared<RequestTiming>();
+  }
   create_sequences_group();
 }
 
@@ -120,6 +273,7 @@ void Request::create_sequences_group() {
   sequence_params.json_reasoning_enabled = state_.json_reasoning_enabled;
   sequence_params.request_failure_state = failure_state_;
   sequence_params.speculative_token_stats = speculative_token_stats_;
+  sequence_params.request_timing = state_.timing;
   sequences_group_ =
       std::make_unique<SequencesGroup>(state_.prompt,
                                        state_.prompt_tokens,
@@ -203,6 +357,100 @@ void Request::record_token_output(const RequestOutput& output, bool submitted) {
   }
 }
 
+// Nested timing locks always follow timing_metrics_mutex_ -> RequestTiming's
+// mutex_. Timing methods release their lock before any callback into Request.
+void Request::update_timing_after_execution(bool generation_terminal) {
+  if (state_.is_graph_warmup) {
+    return;
+  }
+  const bool terminal = generation_terminal && finished();
+  const bool prefill =
+      !generation_terminal && state_.timing->has_generated_token() &&
+      !pd_prefill_metrics_observed_.load(std::memory_order_acquire);
+  if (!terminal && !prefill && !cancelled() && !error_status().has_value()) {
+    return;
+  }
+  // Recheck under the same lock used to publish cancellation.
+  std::lock_guard<std::mutex> lock(timing_metrics_mutex_);
+  if (cancelled() || error_status().has_value()) {
+    state_.timing->update_from_finished_request(/*generation_complete=*/false);
+    observe_terminal_timing_locked(cancelled() ? "cancelled" : "failed");
+    return;
+  }
+  if (terminal) {
+    state_.timing->update_from_finished_request(/*generation_complete=*/true);
+    observe_terminal_timing_locked(/*exclusion=*/nullptr);
+  } else if (!pd_prefill_metrics_observed_.load(std::memory_order_relaxed)) {
+    observe_request_pd_prefill_metrics(state_.timing->snapshot(),
+                                       supports_single_output_timing());
+    pd_prefill_metrics_observed_.store(true, std::memory_order_release);
+  }
+}
+
+void Request::observe_terminal_timing_locked(const char* exclusion) {
+  if (phase_metrics_observed_ || state_.is_graph_warmup) {
+    return;
+  }
+  const RequestTimingSnapshot snapshot = state_.timing->snapshot();
+  const bool single_output =
+      supports_single_output_timing() && sequences().size() == 1;
+  if (snapshot.pd_local && !snapshot.pd_imported) {
+    if (!pd_prefill_metrics_observed_.exchange(true,
+                                               std::memory_order_acq_rel)) {
+      observe_request_pd_prefill_metrics(snapshot, single_output, exclusion);
+    }
+  } else {
+    observe_request_phase_metrics(
+        snapshot,
+        single_output,
+        single_output ? sequences().front()->num_committed_generated_tokens()
+                      : 0,
+        exclusion);
+  }
+  phase_metrics_observed_ = true;
+}
+
+void Request::record_timing_failure(const Status& status) {
+  std::lock_guard<std::mutex> lock(timing_metrics_mutex_);
+  state_.timing->update_from_finished_request(/*generation_complete=*/false);
+  observe_terminal_timing_locked(
+      status.code() == StatusCode::CANCELLED ? "cancelled" : "failed");
+}
+
+bool Request::supports_single_output_timing() const {
+  return state_.n == 1 && state_.best_of == 1 && !check_beam_search() &&
+         state_.sample_slots.empty() && !state_.sampling_param.is_embeddings &&
+         !state_.is_graph_warmup;
+}
+
+bool Request::record_server_first_token(RequestTiming::TimePoint observed_at) {
+  if (cancelled() || error_status().has_value() ||
+      !state_.sample_slots.empty() || state_.sampling_param.is_embeddings ||
+      state_.is_graph_warmup || state_.timing->has_observed_token() ||
+      !state_.timing->has_generated_token()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(timing_metrics_mutex_);
+  // The lock-free checks are hints; recheck before publishing a sample.
+  if (cancelled() || error_status().has_value() ||
+      !state_.timing->has_generated_token() ||
+      state_.timing->has_observed_token()) {
+    return false;
+  }
+  state_.timing->record_first_token_observed(observed_at);
+  const RequestTimingSnapshot snapshot = state_.timing->snapshot(observed_at);
+  // Unlike the single-output vLLM comparison cohort below, this metric is
+  // once per Request, including n/best_of. Never publish an unfinished wait
+  // as TTFT. PD is complete only on the original ingress after handoff ACK.
+  if (snapshot.server_ttft.valid && !snapshot.server_ttft.partial &&
+      snapshot.server_ttft.milliseconds.has_value()) {
+    HISTOGRAM_OBSERVE(server_time_to_first_token_latency_milliseconds,
+                      static_cast<int64_t>(*snapshot.server_ttft.milliseconds));
+  }
+  observe_request_ttft_metric(snapshot, supports_single_output_timing());
+  return snapshot.server_ttft.valid;
+}
+
 void Request::set_upstream_latency_seconds(double upstream_latency_seconds) {
   const double latency_offset = upstream_latency_seconds - elapsed_seconds();
   end_to_end_latency_offset_seconds_ =
@@ -232,6 +480,11 @@ RequestTerminalOutcome Request::claim_terminal_outcome(
   if (!terminal_outcome_.compare_exchange_strong(
           expected, outcome, std::memory_order_relaxed)) {
     return RequestTerminalOutcome::NONE;
+  }
+  if (outcome != RequestTerminalOutcome::SUCCESS) {
+    record_timing_failure(outcome == RequestTerminalOutcome::CANCELLED
+                              ? Status(StatusCode::CANCELLED)
+                              : status.value());
   }
   return outcome;
 }
@@ -288,10 +541,12 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
       prefill_stage ? std::string_view(x_request_time_) : std::string_view();
   int32_t idx = 0;
   for (const auto& seq : sequences()) {
-    double ttft = seq->time_to_first_token_latency_seconds();
+    const double ttft = seq->time_to_first_token_latency_seconds();
     const size_t gen_tokens = seq->num_committed_generated_tokens();
     double tpot = 0.0;
     double gen_speed = 0.0;
+    // Preserve these legacy response-inclusive statistics. The request-level
+    // xllm_request_tpot_microseconds uses the core first-to-last token span.
     if (gen_tokens > 1 && total_latency > ttft && ttft > 0) {
       const double generation_latency = total_latency - ttft;
       tpot = (generation_latency * 1000.0) / (gen_tokens - 1);
@@ -383,7 +638,13 @@ size_t Request::total_num_blocks() {
 }
 
 void Request::set_cancel() {
-  cancelled_.store(true, std::memory_order_relaxed);
+  {
+    // Serialize cancellation publication with successful metric sampling.
+    std::lock_guard<std::mutex> lock(timing_metrics_mutex_);
+    state_.timing->update_from_finished_request(/*generation_complete=*/false);
+    cancelled_.store(true, std::memory_order_relaxed);
+    observe_terminal_timing_locked("cancelled");
+  }
   for (const auto& seq : sequences()) {
     seq->set_cancel();
   }

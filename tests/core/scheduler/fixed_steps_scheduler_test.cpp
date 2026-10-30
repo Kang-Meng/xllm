@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
 
 #include "common/metrics.h"
@@ -206,6 +207,70 @@ TEST(FixedStepsSchedulerTest, AddRequestSuccess) {
   auto requests = GenRequests({64}, {10}, RecType::kOneRec);
   std::shared_ptr<Request> req = requests[0];
   EXPECT_TRUE(scheduler.add_request(req));
+}
+
+TEST(FixedStepsSchedulerTest,
+     InternalRoundsAndRetainedBatchObserveAllRequests) {
+  class GeneratingEngine final : public FakeEngine {
+   public:
+    GeneratingEngine() : FakeEngine(32, 32) {}
+    std::vector<std::weak_ptr<Request>> requests;
+    std::optional<Batch> retained_batch;
+    ForwardOutput step(std::vector<Batch>& batches) override {
+      EXPECT_EQ(batches.front().size(), 2u);
+      for (int32_t round = 0; round < 2; ++round) {
+        for (Sequence* sequence : batches.front().get_sequences()) {
+          sequence->kv_state().set_kv_cache_tokens_num(sequence->num_tokens());
+          sequence->append_token(Token(65 + round));
+        }
+        batches.front().record_core_output();
+        for (const auto& weak : requests) {
+          const auto sample = weak.lock()->state().timing->snapshot();
+          EXPECT_TRUE(sample.server_ttft.valid);
+          EXPECT_FALSE(sample.terminal);
+        }
+      }
+      retained_batch.emplace(batches.front());
+      return {};
+    }
+  };
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), false);
+  for (bool stream : {false, true}) {
+    GeneratingEngine engine;
+    engine.requests.reserve(2);
+    {
+      FixedStepsScheduler scheduler(&engine, CreateOptions());
+      for (auto& request : GenRequests({16, 16}, {4, 4}, RecType::kLlmRec)) {
+        request->state().stream = stream;
+        request->state().timing->record_arrival();
+        request->state().output_func = [](const RequestOutput&) {
+          return true;
+        };
+        engine.requests.emplace_back(request);
+        ASSERT_TRUE(scheduler.add_request(request));
+      }
+      scheduler.step(absl::Milliseconds(100));
+    }
+    ASSERT_TRUE(engine.retained_batch.has_value());
+    for (const auto& weak : engine.requests) {
+      auto request = weak.lock();
+      ASSERT_NE(request, nullptr);
+      const auto first = request->state().timing->snapshot().server_ttft;
+      Sequence* sequence = request->sequences().front().get();
+      sequence->append_token(Token(67));
+      sequence->append_token(Token(68));
+      engine.retained_batch->record_core_output();
+      request->update_timing_after_execution(/*generation_terminal=*/true);
+      EXPECT_EQ(request->state().timing->snapshot().server_ttft.milliseconds,
+                first.milliseconds);
+      EXPECT_TRUE(request->state().timing->snapshot().decode_time.valid);
+    }
+    engine.retained_batch.reset();
+    for (const auto& weak : engine.requests) {
+      EXPECT_TRUE(weak.expired());
+    }
+  }
 }
 
 TEST(FixedStepsSchedulerTest, PrepareBatchEmptyWhenNoRequests) {

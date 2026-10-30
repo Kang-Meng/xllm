@@ -19,6 +19,7 @@ limitations under the License.
 #include <bvar/multi_dimension.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <initializer_list>
 #include <string>
 
@@ -28,6 +29,21 @@ limitations under the License.
 namespace xllm {
 
 using bvar::Adder;
+
+struct RequestTimingSnapshot;
+
+// Observe once at first output and generation completion, before response work.
+// Only complete local single-output samples enter these latency recorders.
+void observe_request_ttft_metric(const RequestTimingSnapshot& snapshot,
+                                 bool single_output);
+void observe_request_phase_metrics(const RequestTimingSnapshot& snapshot,
+                                   bool single_output,
+                                   uint64_t num_generation_tokens,
+                                   const char* exclusion = nullptr);
+// PD uses role-local boundaries, not complete-request or remote-clock spans.
+void observe_request_pd_prefill_metrics(const RequestTimingSnapshot& snapshot,
+                                        bool single_output,
+                                        const char* exclusion = nullptr);
 
 namespace scheduler_queue_metric {
 inline constexpr char kIngress[] = "ingress";
@@ -313,6 +329,18 @@ DECLARE_HISTOGRAM(num_prompt_tokens_per_request);
 DECLARE_HISTOGRAM(num_generated_tokens_per_request);
 
 DECLARE_HISTOGRAM(time_to_first_token_latency_milliseconds);
+DECLARE_HISTOGRAM(server_time_to_first_token_latency_milliseconds);
+DECLARE_HISTOGRAM(xllm_request_ttft_microseconds);
+DECLARE_HISTOGRAM(xllm_request_queue_microseconds);
+DECLARE_HISTOGRAM(xllm_request_prefill_microseconds);
+DECLARE_HISTOGRAM(xllm_request_decode_microseconds);
+DECLARE_HISTOGRAM(xllm_request_tpot_microseconds);
+DECLARE_MULTI_HISTOGRAM(xllm_pd_request_queue_microseconds);
+DECLARE_MULTI_HISTOGRAM(xllm_pd_request_prefill_microseconds);
+DECLARE_MULTI_HISTOGRAM(xllm_pd_request_decode_microseconds);
+DECLARE_MULTI_HISTOGRAM(xllm_pd_request_tpot_microseconds);
+extern bvar::MultiDimension<bvar::Adder<int64_t>>
+    MULTI_COUNTER_xllm_request_phase_skipped_total;
 DECLARE_HISTOGRAM(inter_token_latency_milliseconds);
 DECLARE_HISTOGRAM(inter_token_latency_microseconds);
 

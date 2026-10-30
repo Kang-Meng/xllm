@@ -238,7 +238,12 @@ void SchedulerPolicy::drain_request_queue(
     folly::MPMCQueue<std::shared_ptr<Request>>& request_queue) {
   std::vector<std::shared_ptr<Request>> incoming;
   std::shared_ptr<Request> request;
-  while (request_queue.read(request)) {
+  incoming.reserve(std::min(
+      state.ingress_request_count,
+      static_cast<size_t>(std::max<ssize_t>(request_queue.size(), 0))));
+  for (size_t index = 0;
+       index < state.ingress_request_count && request_queue.read(request);
+       ++index) {
     CHECK(request);
     incoming.emplace_back(std::move(request));
   }
@@ -545,6 +550,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     budget.estimate_latency += allocated_estimate_latency;
     queue->pop_top();
     request->record_first_batched_time();
+    request->mark_first_scheduled(state.scheduled_timestamp);
     state.running_requests.emplace_back(request);
     request->record_num_prefix_cache_tokens();
     state.running_sequences.insert(state.running_sequences.end(),
@@ -917,6 +923,7 @@ SchedulerPolicy::RestoreOutcome SchedulerPolicy::try_restore(
   }
 
   CHECK_LE(actual_tokens, budget.remaining_token_budget);
+  request->mark_first_scheduled(state.scheduled_timestamp);
   state.running_requests.emplace_back(request);
   state.running_sequences.emplace_back(sequence);
   state.running_sequences_budgets.emplace_back(actual_tokens);
@@ -1125,6 +1132,7 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
       }
       queue->pop_top();
       request->record_first_batched_time();
+      request->mark_first_scheduled(state.scheduled_timestamp);
       state.running_requests.emplace_back(request);
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),
@@ -1269,6 +1277,7 @@ void SchedulerPolicy::handle_abnormal_decode_request(
     // Partial schedule: commit the sequences we already allocated.
     queue->pop_top();
     request->record_first_batched_time();
+    request->mark_first_scheduled(state.scheduled_timestamp);
     state.running_requests.emplace_back(request);
     state.running_sequences.insert(state.running_sequences.end(),
                                    candidate_sequences.begin(),

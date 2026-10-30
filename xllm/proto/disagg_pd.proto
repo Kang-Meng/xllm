@@ -267,6 +267,22 @@ message RemoteToken {
   double time_to_first_token_latency_seconds = 6;
 }
 
+// Only stage durations cross hosts; no clock timestamps are transported.
+message RequestPhaseTimingSample {
+  optional double milliseconds = 1;
+  bool valid = 2;
+  bool partial = 3;
+  uint32 reason = 4;
+}
+
+message RequestPhaseTiming {
+  reserved 1;
+  reserved "boundary_version";
+  RequestPhaseTimingSample queued_time = 2;
+  RequestPhaseTimingSample prefill_time = 3;
+  RequestPhaseTimingSample decode_time = 4;
+}
+
 message DisaggGenerationsRequest {
   reserved 8, 13, 16;
 
@@ -286,6 +302,7 @@ message DisaggGenerationsRequest {
   repeated KVTransferGroup source_groups = 20;
   // Cumulative end-to-end latency measured by the source at handoff.
   optional double upstream_elapsed_seconds = 21;
+  RequestPhaseTiming phase_timing = 22;
 }
 
 message DisaggGenerationsRequests {

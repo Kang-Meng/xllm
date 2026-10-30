@@ -272,9 +272,50 @@ DEFINE_HISTOGRAM(num_prompt_tokens_per_request,
 DEFINE_HISTOGRAM(num_generated_tokens_per_request,
                  "Histogram of the generated token number per request");
 
-// ttft latency histogram
+// Preserve the legacy sequence-local TTFT alongside the request-level metric.
 DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
                  "Histogram of time to first token latency in milliseconds");
+DEFINE_HISTOGRAM(server_time_to_first_token_latency_milliseconds,
+                 "Time from preprocessing admission to scheduler first-token "
+                 "result readiness, or accepted PD ingress handoff ACK, once "
+                 "per request, in milliseconds; excludes detokenization and "
+                 "HTTP delivery");
+// Request-level phase latencies. Microseconds preserve sub-millisecond phases.
+// Only complete local single-output samples enter these recorders.
+DEFINE_HISTOGRAM(xllm_request_ttft_microseconds,
+                 "Request server time-to-first-token latency in microseconds");
+DEFINE_HISTOGRAM(xllm_request_queue_microseconds,
+                 "Request queue-wait latency in microseconds");
+DEFINE_HISTOGRAM(xllm_request_prefill_microseconds,
+                 "Request prefill latency in microseconds");
+DEFINE_HISTOGRAM(xllm_request_decode_microseconds,
+                 "Request decode latency in microseconds");
+DEFINE_HISTOGRAM(xllm_request_tpot_microseconds,
+                 "Request mean time-per-output-token in microseconds");
+// PD samples are separate from complete local requests. Imported upstream
+// Queue/Prefill samples are never re-recorded on Decode.
+DEFINE_MULTI_HISTOGRAM(xllm_pd_request_queue_microseconds,
+                       "role",
+                       "PD role-local admitted-to-first-batch wait in "
+                       "microseconds, independently for prefill and decode");
+DEFINE_MULTI_HISTOGRAM(xllm_pd_request_prefill_microseconds,
+                       "role",
+                       "PD Prefill first-batch-to-first-core-output latency "
+                       "in microseconds, recorded at stage completion");
+DEFINE_MULTI_HISTOGRAM(xllm_pd_request_decode_microseconds,
+                       "role",
+                       "Successful PD Decode local received-token-to-last-core-"
+                       "output latency in microseconds, including local "
+                       "preparation and scheduling waits; final local segment "
+                       "only for OOC migration");
+DEFINE_MULTI_HISTOGRAM(xllm_pd_request_tpot_microseconds,
+                       "role",
+                       "PD local Decode duration per newly committed local "
+                       "token in microseconds; received tokens excluded");
+bvar::MultiDimension<bvar::Adder<int64_t>>
+    MULTI_COUNTER_xllm_request_phase_skipped_total(
+        "xllm_request_phase_skipped_total",
+        {"phase", "reason"});
 // inter token latency histogram
 DEFINE_HISTOGRAM(inter_token_latency_milliseconds,
                  "Histogram of inter token latency in milliseconds");

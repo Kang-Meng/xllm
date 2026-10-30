@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/request/request_timing_proto.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
@@ -1119,6 +1120,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       brpc::Controller cntl;
       Timer rpc_timer;
       gen->set_upstream_elapsed_seconds(request->end_to_end_latency_seconds());
+      request_timing_to_proto(request->state().timing->snapshot(),
+                              gen->mutable_phase_timing());
       stub->FirstGeneration(&cntl, &gens, &resp, nullptr);
       const double rpc_seconds = rpc_timer.elapsed_seconds();
       VLOG(1) << "Prefill first-generation request_id=" << request->request_id()
@@ -1138,6 +1141,12 @@ void DisaggPDScheduler::prefill_send_first_generation() {
              "Failed to send first generation to decode instance"});
         continue;
       }
+
+      // Use the original ingress clock after Decode acknowledges acceptance.
+      // This completes ingress TTFT only; generation stages remain pd_local.
+      // Never subtract clocks across hosts.
+      request->state().timing->mark_pd_handoff_accepted();
+      request->record_server_first_token();
 
       // The handoff succeeded, so the Decode instance owns the reservation.
       request->state().decode_rpc_address.clear();
@@ -1397,7 +1406,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     int32_t src_dp_size,
     int32_t src_dp_rank,
     torch::Tensor mtp_bootstrap_embedding,
-    int32_t num_cached_tokens) {
+    int32_t num_cached_tokens,
+    const proto::RequestPhaseTiming* phase_timing) {
   Timer receive_timer;
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
@@ -1411,6 +1421,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     request = take_waiting_request(req_id);
   }
   auto& sequences = request->sequences();
+  request->state().timing->restore_pd(request_timing_from_proto(phase_timing));
   kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
   ScopeGuard prepare_guard([this] {
     kv_preparing_requests_.fetch_sub(1, std::memory_order_relaxed);
@@ -1495,6 +1506,10 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   } else {
     sequence->append_token(first_token);
   }
+  // Keep the received-token baseline and its local receipt clock together.
+  // Complete-request Decode stays partial; only role-local PD metrics use it.
+  request->state().timing->record_pd_decode_start(
+      sequence->num_committed_generated_tokens());
   const double prepare_seconds = receive_timer.elapsed_seconds();
 
   // Pull KV cache only in native PULL mode. Heterogeneous PUSH writes directly
@@ -1563,6 +1578,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
 
   Timer enqueue_timer;
   // Until ready is published, concurrent cancellation returns NOT_READY.
+  request->state().timing->record_queued();
   const bool enqueued = request_queue_.write(request);
   {
     std::unique_lock<std::mutex> lock(received_request_map_mutex_);
@@ -1722,20 +1738,24 @@ void DisaggPDScheduler::update_token_latency_metrics(
   const bool speculative_metrics_enabled =
       options_.num_speculative_tokens() > 0;
   for (Sequence* sequence : sequences) {
-    if (sequence->is_chunked_prefill_stage() ||
+    if (sequence->cancelled() || sequence->is_chunked_prefill_stage() ||
         sequence->last_token_handled()) {
       continue;
     }
     // Read the committed-token count before tbt(), which resets it.
     const size_t committed_tokens = sequence->generated_tokens_since_latency();
+    if (committed_tokens == 0) {
+      continue;
+    }
     const int64_t tbt_microseconds = sequence->tbt_microseconds(now);
     const int64_t tbt_milliseconds =
         microseconds_to_milliseconds(tbt_microseconds);
     if (sequence->is_first_token()) {
-      HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
-                        tbt_milliseconds);
+      // Preserve the legacy Sequence TTFT and heartbeat/deadline value.
       sequence->set_time_to_first_token_latency_seconds(
           static_cast<double>(tbt_milliseconds) / 1000);
+      HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
+                        tbt_milliseconds);
       recent_ttft_.emplace_back(tbt_milliseconds);
     } else {
       int64_t inter_token_latency_us = tbt_microseconds;

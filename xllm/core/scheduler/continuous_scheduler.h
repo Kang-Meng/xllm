@@ -375,6 +375,8 @@ class ContinuousScheduler : public Scheduler {
 
   // is last step handle prefill requests
   bool last_step_prefill_ = false;
+  // First SCHEDULED uses the start of the selecting scheduling round.
+  RequestTiming::TimePoint scheduled_timestamp_;
 
   // Decode queue: holds all decode-stage requests.
   std::unique_ptr<RequestPriorityQueue> decode_queue_;
@@ -392,6 +394,11 @@ class ContinuousScheduler : public Scheduler {
   InstanceInfo instance_info_;
 
   int32_t min_speculative_tokens_required_ = 0;
+
+  // Freeze the ingress request count before reading the round clock, then
+  // return it. Draining only this many requests keeps a later arrival from
+  // acquiring a SCHEDULED stamp earlier than its own QUEUED event.
+  size_t begin_schedule_round();
 
   // build a batch of requests from the priority queue
   virtual std::vector<Batch> prepare_batch();

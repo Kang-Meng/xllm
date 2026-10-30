@@ -337,6 +337,8 @@ class DelayedReservationService final : public proto::DisaggPDService {
 
   std::future<void> release_started() { return release_started_.get_future(); }
 
+  std::function<void()> before_first_generation_ack;
+
   void ReleaseReservation(google::protobuf::RpcController* /*controller*/,
                           const proto::ReleaseReservationRequest* request,
                           proto::ReleaseReservationResponse* response,
@@ -381,6 +383,9 @@ class DelayedReservationService final : public proto::DisaggPDService {
         /*source_mappings=*/{},
         gen.dp_size(),
         gen.dp_rank()));
+    if (before_first_generation_ack) {
+      before_first_generation_ack();
+    }
   }
 
   void resume_releases() {
@@ -1423,6 +1428,37 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
   EXPECT_GT(input.input_params.attention.host.kv_cache_tokens_nums[0], 0);
 }
 
+TEST(DisaggPDSchedulerTest, FirstGenerationQueuesLocalTimingBeforePublication) {
+  for (const bool previously_scheduled : {false, true}) {
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+    auto request = make_request({1, 2, 3, 4});
+    Sequence* sequence = request->sequences()[0].get();
+    ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+    sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+    if (previously_scheduled) {
+      request->mark_first_scheduled(RequestTiming::TimePoint{});
+    }
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    ASSERT_TRUE(recv_first_generation(&scheduler, torch::Tensor()));
+    const auto waiting = request->state().timing->snapshot();
+    EXPECT_TRUE(waiting.pd_imported);
+    EXPECT_EQ(waiting.pd_decode_tokens_at_start, 1u);
+    EXPECT_TRUE(request->state().timing->needs_pd_scheduling());
+    // Receipt bypasses add_request(), and may have no upstream timing at all.
+    EXPECT_EQ(waiting.pd_queued_time.reason, RequestTimingReason::WAITING_END);
+    EXPECT_TRUE(waiting.pd_queued_time.milliseconds.has_value());
+    const auto batches = scheduler.prepare_batch_test();
+    ASSERT_EQ(batches.front().size(), 1u);
+    const auto scheduled = request->state().timing->snapshot();
+    EXPECT_TRUE(scheduled.pd_queued_time.valid);
+    EXPECT_FALSE(scheduled.pd_queued_time.partial);
+    ASSERT_TRUE(scheduled.pd_queued_time.milliseconds.has_value());
+    EXPECT_GE(*scheduled.pd_queued_time.milliseconds, 0.0);
+    EXPECT_FALSE(request->state().timing->needs_pd_scheduling());
+  }
+}
+
 TEST(DisaggPDSchedulerTest, FirstDecodeTokenLatencyIsNonNegative) {
   FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
   TestDisaggPDScheduler scheduler(&engine, make_options());
@@ -2017,11 +2053,24 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
 
   auto local_healthy = make_request({11, 12}, "healthy");
   local_healthy->state().stream = true;
+  local_healthy->state().timing->record_arrival(RequestTiming::Clock::now() -
+                                                std::chrono::seconds(3));
+  local_healthy->state().timing->mark_pd_local();
+  const int64_t server_ttft_count =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  service.before_first_generation_ack = [&] {
+    EXPECT_FALSE(local_healthy->state().timing->snapshot().server_ttft.valid);
+    EXPECT_FALSE(remote_healthy->state().timing->snapshot().server_ttft.valid);
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count);
+  };
   prefill.admit_prefill(local_healthy, &stub);
   auto batch = prefill.prepare_batch_test();
   EXPECT_FALSE(batch[0].empty());
   if (!batch[0].empty()) {
     finish_prefill(local_healthy->sequences()[0].get());
+    local_healthy->state().timing->record_core_output(
+        RequestTiming::Clock::now());
     // Supply the engine's PD output without enabling global PD configuration.
     local_healthy->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
     prefill.prefill_send_first_generation();
@@ -2034,6 +2083,23 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   EXPECT_EQ(status, std::future_status::ready);
   std::shared_ptr<Request> queued;
   if (status == std::future_status::ready) {
+    const auto sample = local_healthy->state().timing->snapshot().server_ttft;
+    EXPECT_TRUE(sample.milliseconds.has_value());
+    if (sample.milliseconds.has_value()) {
+      EXPECT_GE(*sample.milliseconds, 3000.0);
+    }
+    EXPECT_TRUE(sample.valid);
+    EXPECT_FALSE(sample.partial);
+    EXPECT_EQ(sample.reason, RequestTimingReason::COMPLETE);
+    EXPECT_TRUE(local_healthy->state().timing->snapshot().pd_handoff_accepted);
+    EXPECT_FALSE(local_healthy->state().timing->snapshot().decode_time.valid);
+    // PR #2588 counts the original ingress ACK once, not the Decode copy.
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count + 1);
+    EXPECT_FALSE(remote_healthy->record_server_first_token());
+    EXPECT_FALSE(local_healthy->record_server_first_token());
+    EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+              server_ttft_count + 1);
     EXPECT_TRUE(decode.pop_decode_request_for_test(&queued));
     EXPECT_EQ(queued, remote_healthy);
     EXPECT_EQ(remote_healthy->sequences()[0]->num_generated_tokens(), 1u);
@@ -2051,6 +2117,32 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
     decode.pop_decode_request_for_test(&queued);
   }
   remote_healthy->sequences()[0]->reset();
+  // Reuse the live handoff setup to verify a rejected first-generation ACK.
+  service.before_first_generation_ack = {};
+  auto rejected = make_request({11, 12}, "handoff-failed");
+  rejected->state().timing->record_arrival();
+  rejected->state().timing->mark_pd_local();
+  rejected->state().pd_reservation_id = "missing-reservation";
+  rejected->state().decode_rpc_address = address;
+  rejected->state().output_func = [](const RequestOutput&) { return true; };
+  const int64_t before_rejection =
+      HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
+  prefill.admit_prefill(rejected, &stub);
+  batch = prefill.prepare_batch_test();
+  EXPECT_FALSE(batch[0].empty());
+  if (!batch[0].empty()) {
+    finish_prefill(rejected->sequences()[0].get());
+    rejected->state().timing->record_core_output(RequestTiming::Clock::now());
+    rejected->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
+    prefill.prefill_send_first_generation();
+    prefill.prefill_completion().get();
+    prefill.wait_notifications();
+  }
+  EXPECT_FALSE(rejected->state().timing->snapshot().server_ttft.valid);
+  EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
+            before_rejection);
+  batch.clear();
+  EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 0u);
   server.Stop(0);
   server.Join();
 }

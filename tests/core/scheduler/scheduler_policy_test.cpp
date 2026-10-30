@@ -574,11 +574,103 @@ TEST(SchedulerPolicyTest, UnifiedDrainRejectsBeforeQueueingRequest) {
   ASSERT_TRUE(request_queue.write(requests[0]));
   ASSERT_TRUE(request_queue.write(requests[1]));
 
+  state.ingress_request_count = 0;
+  policy->drain_request_queue(state, request_queue);
+  EXPECT_EQ(reject_calls, 0);
+  EXPECT_EQ(request_queue.size(), 2);
+  state.ingress_request_count = 1;
+  policy->drain_request_queue(state, request_queue);
+  EXPECT_EQ(reject_calls, 1);
+  EXPECT_TRUE(unified_queue.empty());
+  EXPECT_EQ(request_queue.size(), 1);
+
   policy->drain_request_queue(state, request_queue);
 
   EXPECT_EQ(reject_calls, 2);
   ASSERT_EQ(unified_queue.size(), 1u);
   EXPECT_EQ(unified_queue.front(), requests[1]);
+}
+
+TEST(SchedulerPolicyTest, FirstScheduledCarriesRoundStartNotSelectionTime) {
+  class RecordingScheduler final : public ContinuousScheduler {
+   public:
+    using ContinuousScheduler::ContinuousScheduler;
+    RequestTiming::TimePoint round_start() const {
+      return scheduled_timestamp_;
+    }
+    RequestTiming::TimePoint drained_at;
+    std::vector<std::shared_ptr<Request>> late_requests;
+    bool reject_queued_request(
+        const std::shared_ptr<Request>& /*request*/) override {
+      drained_at = RequestTiming::Clock::now();
+      // The real drain callback runs after the ingress/round-clock snapshot.
+      for (auto& request : late_requests) {
+        EXPECT_TRUE(add_request(request));
+      }
+      late_requests.clear();
+      return false;
+    }
+  };
+  for (const bool mix : {false, true}) {
+    ScopedConfigValue<bool> mix_guard(
+        SchedulerConfig::get_instance().enable_mix_batch(), mix);
+    for (const std::string& strategy : {"fcfs", "multi_slo_and_prio"}) {
+      for (const bool returning : {false, true}) {
+        auto options = create_scheduler_options(1024, 16, 0, 256, 1, strategy);
+        FakeEngine engine(64, 128);
+        RecordingScheduler scheduler(&engine, options);
+        auto request =
+            generate_request(
+                {16}, {returning ? 4 : 1}, std::nullopt, std::nullopt, 10000)
+                .front();
+        auto& timing = *request->state().timing;
+        if (returning) {
+          auto& sequence = *request->sequences().front();
+          ASSERT_TRUE(engine.block_manager_pool()->allocate(&sequence));
+          sequence.kv_state().set_kv_cache_tokens_num(16);
+          request->mark_first_scheduled(RequestTiming::TimePoint{});
+          timing.restore_pd(RequestTimingSnapshot{});
+          sequence.append_token(Token(65));
+          timing.record_pd_decode_start(
+              sequence.num_committed_generated_tokens());
+        }
+        const RequestTiming::TimePoint queued_at = RequestTiming::Clock::now();
+        timing.record_queued(queued_at);
+        ASSERT_TRUE(scheduler.add_request(request));
+        const auto late = generate_request(
+            {16, 16}, {1, 1}, std::nullopt, std::nullopt, 10000);
+        scheduler.late_requests = late;
+        const auto batches = scheduler.prepare_batch_test();
+        ASSERT_EQ(batches.front().size(), 1u);
+        const double expected = std::chrono::duration<double, std::milli>(
+                                    scheduler.round_start() - queued_at)
+                                    .count();
+        const auto snapshot = timing.snapshot();
+        const auto sample =
+            returning ? snapshot.pd_queued_time : snapshot.queued_time;
+        ASSERT_TRUE(sample.valid);
+        EXPECT_DOUBLE_EQ(*sample.milliseconds, expected);
+        EXPECT_FALSE(timing.needs_pd_scheduling());
+        EXPECT_GE(scheduler.drained_at, scheduler.round_start());
+        request->mark_first_scheduled(scheduler.round_start() +
+                                      std::chrono::seconds(1));
+        const auto repeated = timing.snapshot();
+        EXPECT_EQ((returning ? repeated.pd_queued_time : repeated.queued_time)
+                      .milliseconds,
+                  sample.milliseconds);
+        for (const auto& arrival : late) {
+          EXPECT_FALSE(arrival->state().timing->snapshot().queued_time.valid);
+        }
+        scheduler.prepare_batch_test();
+        for (const auto& arrival : late) {
+          const auto queue = arrival->state().timing->snapshot().queued_time;
+          ASSERT_TRUE(queue.valid);
+          ASSERT_TRUE(queue.milliseconds.has_value());
+          EXPECT_GE(*queue.milliseconds, 0.0);
+        }
+      }
+    }
+  }
 }
 
 TEST(SchedulerPolicyTest, UnifiedPrefixHitIncludesScheduledSuffixCapacity) {

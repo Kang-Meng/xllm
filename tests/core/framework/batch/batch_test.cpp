@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -204,7 +205,8 @@ void release_linear_source_for_test(Sequence& sequence) {
 }
 
 Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
-                             size_t index = 0) {
+                             size_t index = 0,
+                             std::shared_ptr<RequestTiming> timing = nullptr) {
   static RequestSamplingParam sampling_param;
   static StoppingChecker stopping_checker;
 
@@ -216,6 +218,7 @@ Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
   seq_params.echo = false;
   seq_params.logprobs = false;
   seq_params.enable_schedule_overlap = false;
+  seq_params.request_timing = std::move(timing);
 
   IncrementalDecoder decoder(/*prompt=*/"",
                              /*num_prompt_tokens=*/prompt_token_ids.size(),
@@ -229,12 +232,14 @@ Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
                   seq_params);
 }
 
-Sequence make_overlap_sequence(const std::vector<int32_t>& prompt_token_ids,
-                               size_t seq_capacity,
-                               RequestSamplingParam* sampling_param,
-                               StoppingChecker* stopping_checker,
-                               const std::string& request_id = "",
-                               size_t sequence_index = 0) {
+Sequence make_overlap_sequence(
+    const std::vector<int32_t>& prompt_token_ids,
+    size_t seq_capacity,
+    RequestSamplingParam* sampling_param,
+    StoppingChecker* stopping_checker,
+    const std::string& request_id = "",
+    size_t sequence_index = 0,
+    std::shared_ptr<RequestTiming> timing = nullptr) {
   SequenceParams seq_params;
   seq_params.seq_capacity = seq_capacity;
   seq_params.stopping_checker = stopping_checker;
@@ -244,6 +249,7 @@ Sequence make_overlap_sequence(const std::vector<int32_t>& prompt_token_ids,
   seq_params.logprobs = false;
   seq_params.enable_schedule_overlap = true;
   seq_params.request_id = request_id;
+  seq_params.request_timing = std::move(timing);
 
   IncrementalDecoder decoder(/*prompt=*/"",
                              /*num_prompt_tokens=*/prompt_token_ids.size(),
@@ -964,7 +970,8 @@ TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
   options.num_blocks(8).block_size(4);
   BlockManagerImpl manager(options);
 
-  Sequence sequence = make_basic_sequence({1, 2, 3});
+  auto timing = std::make_shared<RequestTiming>();
+  Sequence sequence = make_basic_sequence({1, 2, 3}, /*index=*/0, timing);
   sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   Batch batch(&sequence);
@@ -976,6 +983,7 @@ TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
   output.embeddings = torch::tensor({{3.0f, 4.0f}});
 
   batch.process_sample_output(output, /*replace_fake_token=*/false);
+  EXPECT_TRUE(timing->has_generated_token());
 
   torch::Tensor stored = sequence.get_mtp_bootstrap_embedding();
   ASSERT_TRUE(stored.defined());
@@ -1045,6 +1053,9 @@ TEST(BatchTest, ProcessRawOutputAccumulatesRequestSpeculativeStats) {
   seq_params.stopping_checker = &stopping_checker;
   seq_params.sampling_param = &sampling_param;
   seq_params.speculative_token_stats = request_stats;
+  seq_params.request_timing = std::make_shared<RequestTiming>();
+  const RequestTiming::TimePoint scheduled_at = RequestTiming::Clock::now();
+  seq_params.request_timing->record_scheduled(scheduled_at);
 
   IncrementalDecoder decoder("", 1, false, false);
   Sequence first(/*index=*/0,
@@ -1066,7 +1077,18 @@ TEST(BatchTest, ProcessRawOutputAccumulatesRequestSpeculativeStats) {
   raw_output.outputs.back().speculative_token_stats = {2, 5};
   raw_output.outputs.push_back(make_raw_sample_output(202, std::nullopt));
   raw_output.outputs.back().speculative_token_stats = {1, 3};
+  const RequestTiming::TimePoint before = RequestTiming::Clock::now();
   batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
+  const RequestTiming::TimePoint after = RequestTiming::Clock::now();
+  const auto sample = seq_params.request_timing->snapshot();
+  ASSERT_TRUE(sample.prefill_time.milliseconds.has_value());
+  EXPECT_GE(*sample.prefill_time.milliseconds,
+            (std::chrono::duration<double, std::milli>(before - scheduled_at)
+                 .count()));
+  EXPECT_LE(*sample.prefill_time.milliseconds,
+            (std::chrono::duration<double, std::milli>(after - scheduled_at)
+                 .count()));
+  EXPECT_EQ(sample.decode_time.milliseconds, 0.0);
 
   EXPECT_EQ(request_stats->accepted_tokens, 3);
   EXPECT_EQ(request_stats->proposed_tokens, 8);
@@ -3412,8 +3434,14 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   RequestSamplingParam sampling;
   StoppingChecker stopping;
   stopping.set_max_generated_tokens(32);
-  Sequence sequence = make_overlap_sequence(
-      std::vector<int32_t>(2046, 7), 4096, &sampling, &stopping);
+  auto timing = std::make_shared<RequestTiming>();
+  Sequence sequence = make_overlap_sequence(std::vector<int32_t>(2046, 7),
+                                            4096,
+                                            &sampling,
+                                            &stopping,
+                                            /*request_id=*/"",
+                                            /*sequence_index=*/0,
+                                            timing);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, 2046));
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
@@ -3425,9 +3453,11 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   prefill.add(&sequence, 2046);
   prefill.prepare_forward_input(1, 0, args);
   prefill.process_sample_output(fake, false);
+  EXPECT_FALSE(timing->has_generated_token());
   // A placeholder does not move the HBM cache cursor.
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 2046u);
   prefill.process_sample_output(first_token, true);
+  EXPECT_TRUE(timing->has_generated_token());
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 2046u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   Batch first;
@@ -3498,10 +3528,18 @@ TEST(BatchTest, IntermediatePrefillAdvancesCacheProgress) {
       BlockManagerImpl manager(options);
       RequestSamplingParam sampling;
       StoppingChecker stopping;
+      auto timing = std::make_shared<RequestTiming>();
       Sequence sequence =
-          overlap ? make_overlap_sequence(
-                        std::vector<int32_t>(12, 7), 32, &sampling, &stopping)
-                  : make_basic_sequence(std::vector<int32_t>(12, 7));
+          overlap ? make_overlap_sequence(std::vector<int32_t>(12, 7),
+                                          32,
+                                          &sampling,
+                                          &stopping,
+                                          /*request_id=*/"",
+                                          /*sequence_index=*/0,
+                                          timing)
+                  : make_basic_sequence(std::vector<int32_t>(12, 7),
+                                        /*index=*/0,
+                                        timing);
       sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
       RawForwardOutput raw_output;
       SampleOutput sample_output;
@@ -3527,6 +3565,7 @@ TEST(BatchTest, IntermediatePrefillAdvancesCacheProgress) {
         complete(first, true);
         complete(second, true);
       }
+      EXPECT_FALSE(timing->has_generated_token());
       EXPECT_EQ(sequence.kv_cache_tokens_num(), 8u);
     }
   }
@@ -3981,6 +4020,7 @@ TEST(BatchTest, SampleRequestProcessesAllMatchedRawOutputs) {
   seq_params.stopping_checker = &stopping_checker;
   seq_params.sampling_param = &sampling_param;
   seq_params.sample_slots = &sample_slots;
+  seq_params.request_timing = std::make_shared<RequestTiming>();
   seq_params.skip_special_tokens = true;
   seq_params.echo = false;
   seq_params.logprobs = true;
@@ -4007,6 +4047,7 @@ TEST(BatchTest, SampleRequestProcessesAllMatchedRawOutputs) {
   raw_output.outputs.push_back(
       make_raw_sample_output(202, -0.20f, {202, 212}, {-0.20f, -2.0f}));
   batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
+  EXPECT_FALSE(seq_params.request_timing->has_generated_token());
 
   const size_t prompt_tokens = seq.num_prompt_tokens();
   EXPECT_EQ(seq.num_generated_tokens(), 2);
