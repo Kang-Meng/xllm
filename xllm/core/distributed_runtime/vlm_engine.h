@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "core/distributed_runtime/dist_manager.h"
+#include "core/framework/batch/batch_input_builder.h"
 #include "engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
@@ -61,7 +62,12 @@ class VLMEngine : public Engine {
   bool init_model(MasterStatus master_status);
   KVCacheCapacity estimate_kv_cache_capacity();
   bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap);
-  std::vector<ForwardInput> prepare_inputs(std::vector<Batch>& batch);
+  std::vector<PreparedForwardInput> prepare_inputs(std::vector<Batch>& batch);
+  void execute_batch(std::vector<Batch>& batch,
+                     std::vector<PreparedForwardInput> prepared_inputs);
+  std::vector<uint64_t> forward_input_sizes(
+      const std::vector<PreparedForwardInput>& inputs) const;
+  [[noreturn]] void abort_execution(const std::string& reason);
   void setup_workers(const runtime::Options& options);
   void process_group_test();
 

@@ -16,6 +16,8 @@ limitations under the License.
 #include "shm_channel.h"
 
 #include "common/global_flags.h"
+#include "core/common/health_check_manager.h"
+#include "core/framework/config/execution_config.h"
 #include "util/net.h"
 
 namespace xllm {
@@ -24,12 +26,12 @@ ShmChannel::ShmChannel(int dp_group,
                        int rank,
                        bool is_driver,
                        const runtime::Options& options)
-    : enable_shm_(options.enable_shm()) {
+    : enable_shm_(options.enable_shm()), is_driver_(is_driver) {
   bool is_creator;
 
   std::string name_prefix =
       "xllm_" + net::extract_port(options.master_node_addr().value_or(""));
-  if (is_driver) {
+  if (enable_shm_) {
     auto name = ForwardSharedMemoryManager::create_unique_name(
         name_prefix, dp_group, ForwardType::RAW_INPUT, rank);
     input_shm_manager_ = std::make_unique<ForwardSharedMemoryManager>(
@@ -48,17 +50,27 @@ ShmChannel::ShmChannel(int dp_group,
 
 bool ShmChannel::execute_model_with_shm(const ForwardInput& input,
                                         RawForwardOutput& raw_output) {
-  if (input_shm_manager_) {
+  if (is_driver_) {
     bool use_shm_ret = input_shm_manager_->input_write(input);
     if (!use_shm_ret) {
-      enable_shm_ = false;
+      input_shm_manager_->cancel();
+      HealthCheckManager::instance().set_unhealthy(
+          "Worker SHM input write failed");
       LOG(ERROR)
-          << "RemoteWorker SharedMemoryManager write failed, fallback to brpc.";
+          << "Worker SHM input write failed; cancelling the worker group";
       return false;
     }
   }
-  output_shm_manager_->raw_output_read(raw_output);
-  return true;
+  const bool success = output_shm_manager_->raw_output_read(
+      raw_output,
+      std::chrono::milliseconds(
+          ExecutionConfig::get_instance().forward_execution_timeout_ms()),
+      input_shm_manager_.get());
+  if (!success) {
+    input_shm_manager_->cancel();
+    HealthCheckManager::instance().set_unhealthy("Worker SHM execution failed");
+  }
+  return success;
 }
 
 void ShmChannel::execute_model_async(
@@ -69,8 +81,10 @@ void ShmChannel::execute_model_async(
     bool shm_success = execute_model_with_shm(input, raw_output);
     if (shm_success) {
       promise.setValue(raw_output);
-      return;
+    } else {
+      promise.setValue(std::nullopt);
     }
+    return;
   }
   execute_model_with_brpc(input, promise);
 }

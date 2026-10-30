@@ -214,8 +214,10 @@ BatchInputBuilder::BatchInputBuilder(
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
     int32_t cp_size,
-    ThreadPool* thread_pool)
-    : sequences_(sequences),
+    ThreadPool* thread_pool,
+    bool commit_sequence_state)
+    : commit_sequence_state_(commit_sequence_state),
+      sequences_(sequences),
       allowed_max_tokens_(allowed_max_tokens),
       input_embeddings_vec_(input_embeddings_vec),
       mm_data_vec_(mm_data_vec),
@@ -229,6 +231,9 @@ BatchInputBuilder::BatchInputBuilder(
       cp_size_(1) {
   // Reserve space for better performance
   const size_t reserve_size = 1024;
+  if (!commit_sequence_state_) {
+    state_.sequence_updates.reserve(sequences.size() * 4);
+  }
   state_.flatten_tokens_vec.reserve(reserve_size);
   state_.flatten_positions_vec.reserve(reserve_size);
   state_.mrope_positions_vec.reserve(sequences.size());
@@ -263,11 +268,45 @@ BatchInputBuilder::BatchInputBuilder(
   state_.batch_forward_type = batch_forward_type;
 }
 
+ForwardInput PreparedForwardInput::commit() && {
+  CHECK(!committed_) << "Prepared input may only be committed once";
+  committed_ = true;
+  auto& mm_data = input_.input_params.multimodal.mm_data;
+  if (mm_data.valid()) {
+    mm_data.batch(mm_data.mm_data_vec());
+  }
+  for (auto& update : sequence_updates_) {
+    update();
+  }
+  sequence_updates_.clear();
+  return std::move(input_);
+}
+
+void BatchInputBuilder::apply_or_defer(BuilderState& state,
+                                       std::function<void()> update) {
+  if (commit_sequence_state_) {
+    update();
+  } else {
+    state.sequence_updates.emplace_back(std::move(update));
+  }
+}
+
+PreparedForwardInput BatchInputBuilder::build_prepared_forward_input() {
+  CHECK(!commit_sequence_state_);
+  PreparedForwardInput prepared;
+  prepared.input_ = build_forward_input(/*num_decoding_tokens=*/0,
+                                        /*min_decoding_batch_size=*/0);
+  prepared.sequence_updates_ = std::move(state_.sequence_updates);
+  return prepared;
+}
+
 TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const TransferKVInfo& full_info,
     Sequence* sequence,
     uint32_t seq_len,
-    uint32_t kv_split_size) {
+    uint32_t kv_split_size,
+    bool commit_sequence_state,
+    std::vector<std::function<void()>>* sequence_updates) {
   CHECK(sequence != nullptr);
 
   TransferKVInfo info;
@@ -363,11 +402,18 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t stable_end = static_cast<size_t>(seq_len / block_size);
     const size_t advanced_transfer_idx =
         std::max(next_transfer_idx, std::min(stable_end, map_end));
-    if (is_flat_kv) {
-      sequence->kv_state().advance_transfer_block_idx(advanced_transfer_idx);
-    } else {
-      sequence->kv_state().advance_group_transfer_block_idx(
-          block_type.value(), advanced_transfer_idx);
+    auto update = [sequence, is_flat_kv, block_type, advanced_transfer_idx] {
+      if (is_flat_kv) {
+        sequence->kv_state().advance_transfer_block_idx(advanced_transfer_idx);
+      } else {
+        sequence->kv_state().advance_group_transfer_block_idx(
+            block_type.value(), advanced_transfer_idx);
+      }
+    };
+    if (commit_sequence_state) {
+      update();
+    } else if (sequence_updates != nullptr) {
+      sequence_updates->emplace_back(std::move(update));
     }
     if (next_transfer_idx >= map_end || map_end <= remote_origin) {
       info.mappings.emplace_back(std::move(step_mapping));
@@ -521,6 +567,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 
   for (auto& thread_state : thread_builder_states) {
     thread_state.batch_forward_type = state_.batch_forward_type;
+    if (!commit_sequence_state_) {
+      thread_state.sequence_updates.reserve(sequences_per_thread * 4);
+    }
     // Reserve per-thread scratch so parallel processing does not repeatedly
     // reallocate (which serializes on the allocator and erodes the speedup).
     thread_state.block_tables_vec.reserve(sequences_per_thread);
@@ -636,8 +685,16 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   state_.paged_kv_indptr.reserve(total_seqs + 1);
   state_.paged_kv_last_page_len.reserve(total_seqs);
 
+  size_t total_updates = 0;
+  for (const auto& state : thread_builder_states) {
+    total_updates += state.sequence_updates.size();
+  }
+  state_.sequence_updates.reserve(total_updates);
   // Merge results from all threads
   for (auto& state : thread_builder_states) {
+    for (auto& update : state.sequence_updates) {
+      state_.sequence_updates.emplace_back(std::move(update));
+    }
     state_.flatten_tokens_vec.insert(state_.flatten_tokens_vec.end(),
                                      state.flatten_tokens_vec.begin(),
                                      state.flatten_tokens_vec.end());
@@ -943,7 +1000,8 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
       }
     }
     if (state.engram_history.size() > history_begin) {
-      sequence->mark_engram_history_restored();
+      apply_or_defer(state,
+                     [sequence] { sequence->mark_engram_history_restored(); });
     }
   }
   const auto& sample_slots = sequence->sample_slots();
@@ -952,7 +1010,7 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
   // Handle MRope positions
   if (use_mrope_) {
     state.mrope_positions_vec.emplace_back(
-        get_mrope_positions(sequence, n_kv_cache_tokens, seq_len));
+        get_mrope_positions(sequence, n_kv_cache_tokens, seq_len, state));
   }
 
   // Process real tokens
@@ -1093,12 +1151,15 @@ void BatchInputBuilder::handle_sampling_parameters(Sequence* sequence,
 
 torch::Tensor BatchInputBuilder::get_mrope_positions(Sequence* sequence,
                                                      uint32_t start,
-                                                     uint32_t end) {
+                                                     uint32_t end,
+                                                     BuilderState& state) {
   if (sequence->stage() == SequenceStage::DECODE) {
     // The prefill-stage positions cache is no longer needed once decoding
     // starts; release it to bound memory during long decodes.
     if (sequence->mrope_positions().defined()) {
-      sequence->set_mrope_positions(torch::Tensor());
+      apply_or_defer(state, [sequence] {
+        sequence->set_mrope_positions(torch::Tensor());
+      });
     }
     const int32_t mrope_position_delta = sequence->get_mrope_position_delta();
     const size_t num_tokens = sequence->num_tokens();
@@ -1114,8 +1175,13 @@ torch::Tensor BatchInputBuilder::get_mrope_positions(Sequence* sequence,
               args_->model_type());
       std::tuple<torch::Tensor, int32_t> result =
           generator->generate(sequence->tokens(), sequence->mm_data(), *args_);
-      sequence->set_mrope_position_delta(std::get<1>(result));
-      sequence->set_mrope_positions(std::get<0>(result));
+      auto positions = std::get<0>(result);
+      const int32_t delta = std::get<1>(result);
+      apply_or_defer(state, [sequence, positions, delta] {
+        sequence->set_mrope_position_delta(delta);
+        sequence->set_mrope_positions(positions);
+      });
+      return positions.slice(/*dim=*/1, start, end);
     }
     return sequence->mrope_positions().slice(/*dim=*/1, start, end);
   }
@@ -1132,7 +1198,9 @@ void BatchInputBuilder::setup_kv_cache_info(
   std::unordered_set<int32_t>& write_block_ids =
       write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
 
-  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
+  apply_or_defer(state, [sequence, q_seq_len] {
+    sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
+  });
 
   const auto blocks = sequence->kv_state().blocks(BlockType::KV);
   if (sequence->kv_state().has_multi_block_export()) {
@@ -1160,7 +1228,9 @@ void BatchInputBuilder::setup_kv_cache_info(
           transfer_kv_info.value(),
           sequence,
           seq_len,
-          static_cast<uint32_t>(util::kv_split_size_effective()));
+          static_cast<uint32_t>(util::kv_split_size_effective()),
+          commit_sequence_state_,
+          &state.sequence_updates);
       const bool has_transfer =
           std::any_of(step_info.mappings.begin(),
                       step_info.mappings.end(),
@@ -1214,7 +1284,9 @@ void BatchInputBuilder::setup_kv_cache_info(
         transfer_kv_info.value(),
         sequence,
         seq_len,
-        static_cast<uint32_t>(util::kv_split_size_effective()));
+        static_cast<uint32_t>(util::kv_split_size_effective()),
+        commit_sequence_state_,
+        &state.sequence_updates);
     const bool has_transfer = std::any_of(step_info.mappings.begin(),
                                           step_info.mappings.end(),
                                           [](const KVTransferMapping& mapping) {
@@ -1373,7 +1445,9 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   batch_mm_data_vec.insert(batch_mm_data_vec.end(),
                            state_.scheduled_mm_data_vec.begin(),
                            state_.scheduled_mm_data_vec.end());
-  input_params.multimodal.mm_data.batch(batch_mm_data_vec);
+  input_params.multimodal.mm_data.batch(
+      std::move(batch_mm_data_vec),
+      /*materialize_tensors=*/commit_sequence_state_);
 
   // Setup block tables
   // DFlash2 checks future capacity before prelaunch. Keep a missing page
@@ -1430,7 +1504,8 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
     input_params.embedding.mtp_bootstrap_embeddings =
         torch::cat(state_.mtp_bootstrap_embeddings, /*dim=*/0);
     for (Sequence* sequence : sequences_) {
-      sequence->clear_mtp_bootstrap_embedding();
+      apply_or_defer(state_,
+                     [sequence] { sequence->clear_mtp_bootstrap_embedding(); });
     }
   }
   input_params.meta.batch_id = batch_id_;
@@ -1525,7 +1600,9 @@ void BatchInputBuilder::process_swap_block_infos(ForwardInput& forward_input) {
   }
 
   auto& input_params = forward_input.input_params;
-  auto& swap_blocks = *swap_block_transfer_infos_;
+  // Only the generated kernel input needs sorted sources; no consumer relies
+  // on the Batch's original ordering. Keep it unchanged during previews.
+  auto swap_blocks = *swap_block_transfer_infos_;
   if (::xllm::BeamSearchConfig::get_instance().enable_block_copy_kernel()) {
     std::sort(swap_blocks.begin(),
               swap_blocks.end(),
@@ -1573,17 +1650,24 @@ void BatchInputBuilder::process_multi_modal_inputs(Sequence* sequence,
                                                    int32_t seq_index,
                                                    BuilderState* state_ptr) {
   BuilderState& state = state_ptr ? *state_ptr : state_;
-  MMData& mm_data = sequence->mutable_mm_data();
-  if ((sequence->stage() != SequenceStage::DECODE) && mm_data.valid()) {
-    UpdateMMItemScheduleStateVisitor visitor(
-        n_kv_cache_tokens, q_seq_len, seq_index);
-    mm_data.foreach (visitor);
-    if (visitor.mm_data_items_.empty()) {
-      return;
-    }
-    MMData scheduled_mm_data(visitor.scheduled_type_,
-                             std::move(visitor.mm_data_items_));
-    state.scheduled_mm_data_vec.emplace_back(std::move(scheduled_mm_data));
+  if (sequence->stage() == SequenceStage::DECODE ||
+      !sequence->mm_data().valid()) {
+    return;
   }
+  // The scheduling visitor updates item indices and ranges. Stage those
+  // updates on a shallow metadata copy, sharing the original tensor storage.
+  MMData mm_data = sequence->mm_data();
+  UpdateMMItemScheduleStateVisitor visitor(
+      n_kv_cache_tokens, q_seq_len, seq_index);
+  mm_data.foreach (visitor);
+  if (visitor.mm_data_items_.empty()) {
+    return;
+  }
+  apply_or_defer(state, [sequence, mm_data = std::move(mm_data)]() mutable {
+    sequence->mutable_mm_data() = std::move(mm_data);
+  });
+  MMData scheduled_mm_data(visitor.scheduled_type_,
+                           std::move(visitor.mm_data_items_));
+  state.scheduled_mm_data_vec.emplace_back(std::move(scheduled_mm_data));
 }
 }  // namespace xllm

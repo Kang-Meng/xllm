@@ -116,6 +116,32 @@ TEST(SharedMemoryManagerTest, RejectsLegacyLayoutWithoutChangingIt) {
   ASSERT_EQ(shm_unlink(name.c_str()), 0);
 }
 
+TEST(SharedMemoryManagerTest, RejectsV2ControlLayoutWithMatchingMappingSize) {
+  const std::string name = "xllm_shm_v2_test_" + std::to_string(getpid());
+  constexpr size_t kPayloadSize = 4096;
+  // A v2 outer header has the same magic and mapping size, but its forward
+  // payload starts with an eight-byte control header instead of sixteen.
+  std::array<uint64_t, 8> header = {
+      0x584C4C4D53484D32ULL, (uint64_t{64} << 32) | 2, kPayloadSize, 1};
+  const int32_t fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  ASSERT_NE(fd, -1);
+  ASSERT_EQ(ftruncate(fd, sizeof(header) + kPayloadSize), 0);
+  ASSERT_EQ(pwrite(fd, header.data(), sizeof(header), 0), sizeof(header));
+  EXPECT_EXIT(
+      {
+        bool is_creator = false;
+        SharedMemoryManager manager(name, kPayloadSize, is_creator);
+      },
+      testing::KilledBySignal(SIGABRT),
+      "incompatible shared memory layout version");
+  std::array<uint64_t, 8> unchanged;
+  ASSERT_EQ(pread(fd, unchanged.data(), sizeof(unchanged), 0),
+            sizeof(unchanged));
+  EXPECT_EQ(unchanged, header);
+  EXPECT_EQ(close(fd), 0);
+  EXPECT_EQ(shm_unlink(name.c_str()), 0);
+}
+
 TEST(SharedMemoryManagerTest, DoesNotCreatePerSegmentLockObjects) {
   const std::string name =
       "xllm_shm_lock_test_" + std::to_string(static_cast<int64_t>(getpid()));

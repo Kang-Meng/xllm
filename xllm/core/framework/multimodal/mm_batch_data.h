@@ -48,7 +48,8 @@ class MMBatchData {
   static MMBatchData to(const MMBatchData& mm_data,
                         const torch::Device& device);
 
-  void batch(const std::vector<MMData>& mm_datas);
+  // Size-only previews may use meta tensors; they must never be dispatched.
+  void batch(std::vector<MMData> mm_datas, bool materialize_tensors = true);
 
   template <typename T>
   std::optional<T> get(const MMKey& key) const {

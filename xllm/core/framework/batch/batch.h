@@ -37,6 +37,7 @@ limitations under the License.
 namespace xllm {
 
 struct ModelArgs;
+class PreparedForwardInput;
 
 static uint64_t batch_counter_ = 1;
 constexpr uint64_t UNINITIALIZED_BATCH_ID = 0x0;
@@ -99,6 +100,17 @@ class Batch {
   ForwardInput prepare_forward_input(const ModelArgs& args,
                                      ThreadPool* thread_pool,
                                      int32_t cp_size = 1);
+
+  // Prepare on a candidate Batch; commit only after all ranks pass capacity.
+  // This updates the candidate's ordering/output targets. Its input may contain
+  // metadata-only multimodal tensors and must not be dispatched before commit.
+  PreparedForwardInput prepare_forward_input_candidate(const ModelArgs& args,
+                                                       ThreadPool* thread_pool,
+                                                       int32_t cp_size = 1);
+  ForwardInput commit_forward_input(PreparedForwardInput prepared);
+
+  // Preserve each request (including its beams) as one scheduling unit.
+  std::vector<Batch> split_by_request() const;
 
   // process output
   //

@@ -51,7 +51,7 @@ endif()
 
 cc_test(
   NAME llm_engine_host_transfer_test
-  SRCS llm_engine_host_transfer_test.cpp
+  SRCS llm_engine_host_transfer_test.cpp comm_channel_failure_test.cpp
   DEPS :distributed_runtime :xllm_server :batch :block GTest::gtest_main
 )
 target_link_libraries(llm_engine_host_transfer_test PRIVATE

@@ -20,9 +20,11 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/framework/multimodal/mm_data.h"
@@ -34,6 +36,29 @@ namespace xllm {
 
 class BatchInputBuilderTestPeer;
 struct ModelArgs;
+
+// A transport candidate owns its input and deferred sequence updates. Dropping
+// it leaves sequences untouched; committing materializes only the MM payload.
+// Sequence pointers in deferred updates are non-owning. Keep their owners alive
+// and commit before any result processing can replace the Sequence objects.
+class PreparedForwardInput final {
+ public:
+  PreparedForwardInput() = default;
+  PreparedForwardInput(PreparedForwardInput&&) = default;
+  PreparedForwardInput& operator=(PreparedForwardInput&&) = default;
+  PreparedForwardInput(const PreparedForwardInput&) = delete;
+  PreparedForwardInput& operator=(const PreparedForwardInput&) = delete;
+
+  ForwardInput& input() { return input_; }
+  const ForwardInput& input() const { return input_; }
+  ForwardInput commit() &&;
+
+ private:
+  friend class BatchInputBuilder;
+  ForwardInput input_;
+  std::vector<std::function<void()>> sequence_updates_;
+  bool committed_ = false;
+};
 
 class BatchInputBuilder {
  public:
@@ -48,13 +73,18 @@ class BatchInputBuilder {
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
       int32_t cp_size = 1,
-      ThreadPool* thread_pool = nullptr);
+      ThreadPool* thread_pool = nullptr,
+      bool commit_sequence_state = true);
 
   ForwardInput build_forward_input(uint32_t num_decoding_tokens,
                                    uint32_t min_decoding_batch_size);
 
+  PreparedForwardInput build_prepared_forward_input();
+
  private:
   friend class BatchInputBuilderTestPeer;
+
+  bool commit_sequence_state_ = true;
 
   // Core building methods
   void process_sequences();
@@ -68,12 +98,15 @@ class BatchInputBuilder {
       const TransferKVInfo& full_info,
       Sequence* sequence,
       uint32_t seq_len,
-      uint32_t kv_split_size);
+      uint32_t kv_split_size,
+      bool commit_sequence_state = true,
+      std::vector<std::function<void()>>* sequence_updates = nullptr);
 
   void process_swap_block_infos(ForwardInput& forward_input);
 
   // State management
   struct BuilderState {
+    std::vector<std::function<void()>> sequence_updates;
     // Token and position data
     std::vector<int32_t> flatten_tokens_vec;
     std::vector<int32_t> flatten_positions_vec;
@@ -147,6 +180,8 @@ class BatchInputBuilder {
     std::vector<int32_t> paged_kv_last_page_len;
   };
 
+  void apply_or_defer(BuilderState& state, std::function<void()> update);
+
   // Helper methods for sequence processing
   void process_single_sequence(
       int32_t seq_index,
@@ -164,7 +199,8 @@ class BatchInputBuilder {
   void append_linear_state_row(Sequence* sequence, BuilderState& state);
   torch::Tensor get_mrope_positions(Sequence* sequence,
                                     uint32_t start,
-                                    uint32_t end);
+                                    uint32_t end,
+                                    BuilderState& state);
 
   void handle_sampling_parameters(Sequence* sequence,
                                   BuilderState* state_ptr = nullptr);

@@ -16,17 +16,70 @@ limitations under the License.
 #include "comm_channel.h"
 
 #include <brpc/controller.h>
+#include <brpc/policy/baidu_rpc_meta.pb.h>
 #include <glog/logging.h>
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/wire_format_lite.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "common/global_flags.h"
+#include "core/common/health_check_manager.h"
+#include "core/framework/config/execution_config.h"
 
 namespace xllm {
+namespace {
+
+uint64_t forward_rpc_envelope_size(uint64_t max_body_size) {
+  // ExecuteModel uses baidu_std without authentication, attachments, streams,
+  // or user fields. Bound every optional field its controller/BRPC can add,
+  // including tracing and baidu_std_protocol_deliver_timeout_ms.
+  brpc::policy::RpcMeta meta;
+  auto* request = meta.mutable_request();
+  const auto* service = proto::DistributeWorker::descriptor();
+  request->set_service_name(service->full_name());
+  request->set_method_name(service->FindMethodByName("ExecuteModel")->name());
+  request->set_trace_id(std::numeric_limits<int64_t>::min());
+  request->set_span_id(std::numeric_limits<int64_t>::min());
+  request->set_parent_span_id(std::numeric_limits<int64_t>::min());
+  request->set_timeout_ms(std::numeric_limits<int32_t>::max());
+  meta.set_correlation_id(std::numeric_limits<int64_t>::min());
+  meta.set_compress_type(brpc::COMPRESS_TYPE_NONE);
+
+  // ForwardInput wraps PackedForwardInput, which wraps the raw payload. Each
+  // length prefix is bounded by the body limit. The 12-byte PRPC header is
+  // outside BRPC's body_size and must not be included here.
+  using WireFormat = google::protobuf::internal::WireFormatLite;
+  const uint64_t length_size =
+      google::protobuf::io::CodedOutputStream::VarintSize64(max_body_size);
+  return meta.ByteSizeLong() +
+         WireFormat::TagSize(proto::ForwardInput::kPackedInputFieldNumber,
+                             WireFormat::TYPE_MESSAGE) +
+         WireFormat::TagSize(proto::PackedForwardInput::kPayloadFieldNumber,
+                             WireFormat::TYPE_BYTES) +
+         2 * length_size;
+}
+
+}  // namespace
 
 bool CommChannel::init_brpc(const std::string& server_address) {
+  // Transport capacity is fixed for this channel's lifetime, after flags have
+  // been parsed. Unknown capacity must fail before any input is dispatched.
+  std::string value;
+  CHECK(gflags::GetCommandLineOption("max_body_size", &value))
+      << "BRPC max_body_size must be registered before channel initialization";
+  // gflags has already validated the registered uint64 value. Protobuf's
+  // serialized message size must also fit its signed 32-bit size limit.
+  const uint64_t max_body_size = std::min<uint64_t>(
+      std::stoull(value), std::numeric_limits<int32_t>::max());
+  const uint64_t envelope_size = forward_rpc_envelope_size(max_body_size);
+  // input_size includes SHM control bytes absent from RPC, so retaining them
+  // in this budget leaves a small additional safety margin.
+  forward_input_limit_ =
+      max_body_size > envelope_size ? max_body_size - envelope_size : 0;
   options_.connection_type = "pooled";
   options_.timeout_ms = -1;
   options_.connect_timeout_ms = -1;
@@ -561,10 +614,15 @@ bool CommChannel::get_last_step_result_async(
   proto::Empty req;
   proto::ForwardOutput pb_output;
   brpc::Controller cntl;
+  cntl.set_timeout_ms(
+      ExecutionConfig::get_instance().forward_execution_timeout_ms());
+  cntl.set_max_retry(0);
   stub_->GetLastStepResult(&cntl, &req, &pb_output, nullptr);
   if (cntl.Failed()) {
     LOG(ERROR) << "Get last step model output result failed, "
                << cntl.ErrorText();
+    HealthCheckManager::instance().set_unhealthy(cntl.ErrorText());
+    promise.setValue(std::nullopt);
     return false;
   }
 
@@ -620,6 +678,10 @@ bool CommChannel::execute_model_with_brpc(
   }
 
   auto done = new ExecuteModelClosure();
+  done->cntl.set_timeout_ms(
+      ExecutionConfig::get_instance().forward_execution_timeout_ms());
+  // Execution may have reached other ranks; replaying one rank is unsafe.
+  done->cntl.set_max_retry(0);
   done->promise = std::move(promise);
   stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);
   return true;
@@ -631,6 +693,9 @@ void ExecuteModelClosure::Run() {
   if (cntl.Failed()) {
     LOG(ERROR) << "Execute_model_async failed. Error code : "
                << cntl.ErrorCode() << ", error message : " << cntl.ErrorText();
+    HealthCheckManager::instance().set_unhealthy(cntl.ErrorText());
+    promise.setValue(std::nullopt);
+    return;
   }
 
   RawForwardOutput raw_forward_output;

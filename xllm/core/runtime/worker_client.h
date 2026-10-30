@@ -18,6 +18,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <limits>
+
 #include "common/types.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "forward_params.h"
@@ -38,6 +40,10 @@ namespace xllm {
 // which just a wrapper of worker instance.
 class WorkerClient {
  public:
+  virtual uint64_t forward_input_limit() const {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  virtual void cancel_execution() {}
   WorkerClient() = default;
   explicit WorkerClient(Worker* w) : worker_(w) {}
   virtual ~WorkerClient() = default;

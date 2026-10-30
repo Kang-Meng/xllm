@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 
+#include <glog/logging.h>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -84,6 +86,11 @@ DEFINE_uint64(output_shm_size,
               128,
               "Output shared memory size, default is 128MB.");
 
+DEFINE_int32(forward_execution_timeout_ms,
+             300000,
+             "Deadline in milliseconds for a dispatched worker execution. "
+             "Must be positive; idle workers are not timed out.");
+
 DEFINE_int32(random_seed, -1, "Random seed for random number generator.");
 
 DEFINE_string(
@@ -132,6 +139,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(input_shm_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(output_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(forward_execution_timeout_ms);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(random_seed);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(python_graph_backend);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_fia_decode);
@@ -151,6 +159,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(input_shm_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(output_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(forward_execution_timeout_ms);
   XLLM_CONFIG_ASSIGN_FROM_JSON(random_seed);
   XLLM_CONFIG_ASSIGN_FROM_JSON(python_graph_backend);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_fia_decode);
@@ -185,6 +194,8 @@ void ExecutionConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, output_shm_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, forward_execution_timeout_ms);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, random_seed);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, python_graph_backend);
@@ -204,6 +215,7 @@ void ExecutionConfig::initialize() {
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
   }
+  CHECK_GT(forward_execution_timeout_ms(), 0);
 }
 
 }  // namespace xllm

@@ -32,7 +32,8 @@ namespace {
 
 constexpr char kGenerationLockName[] = "/xllm_shm_generation_lock_v2";
 constexpr uint64_t kSharedMemoryMagic = 0x584C4C4D53484D32ULL;
-constexpr uint32_t kSharedMemoryLayoutVersion = 2;
+// v3 expands the forward control header with a cancellation flag.
+constexpr uint32_t kSharedMemoryLayoutVersion = 3;
 
 class alignas(64) SharedMemoryLayoutHeader final {
  public:

@@ -24,8 +24,8 @@ limitations under the License.
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <chrono>
-#include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/interruption_bus.h"
 #include "common/metrics.h"
 #include "core/common/global_flags.h"
+#include "core/common/health_check_manager.h"
 #include "core/distributed_runtime/engine_utils.h"
 #include "core/distributed_runtime/master.h"
 #include "core/framework/config/execution_config.h"
@@ -40,6 +41,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/prefix_cache/block_hasher.h"
+#include "core/runtime/forward_shared_memory_manager.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -426,7 +428,159 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
 
-  auto forward_inputs = prepare_inputs(batch);
+  std::vector<uint64_t> limits(dp_size_, std::numeric_limits<uint64_t>::max());
+  for (uint32_t rank = 0; rank < worker_clients_num_; ++rank) {
+    const uint32_t dp_rank = rank / dp_local_tp_size_;
+    limits[dp_rank] =
+        std::min(limits[dp_rank], worker_clients_[rank]->forward_input_limit());
+  }
+  // Batch metadata is staged too: a rejected preview must not reorder the
+  // scheduler's sequences or replace its output targets.
+  // Containers and block references are copied; Sequence pointers and tensor
+  // storage remain shared, with sequence mutations deferred until commit.
+  auto candidate_batch = batch;
+  auto prepared_inputs = prepare_inputs(candidate_batch);
+  const auto sizes = forward_input_sizes(prepared_inputs);
+  bool fits = true;
+  for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    fits &= sizes[dp_rank] <= limits[dp_rank];
+  }
+  if (fits) {
+    batch = std::move(candidate_batch);
+    execute_batch(batch, std::move(prepared_inputs));
+    COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+    return {};
+  }
+
+  prepared_inputs.clear();
+  candidate_batch.clear();
+
+  if (options_.enable_schedule_overlap()) {
+    // The overlap protocol has one outstanding result slot per worker. Do not
+    // overwrite it by issuing multiple forwards for one scheduler step.
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (sizes[dp_rank] <= limits[dp_rank]) {
+        continue;
+      }
+      for (Sequence* sequence : batch[dp_rank].get_sequences()) {
+        sequence->fail(Status(
+            StatusCode::RESOURCE_EXHAUSTED,
+            "Inference batch exceeds transport capacity with schedule overlap; "
+            "reduce multimodal input size or disable schedule overlap to allow "
+            "request-level batch splitting"));
+      }
+      batch[dp_rank] = Batch();
+    }
+    if (std::any_of(batch.begin(), batch.end(), [](const Batch& b) {
+          return !b.empty();
+        })) {
+      execute_batch(batch, prepare_inputs(batch));
+    }
+    return {};
+  }
+
+  LOG(INFO) << "Splitting inference batch before dispatch: transport capacity "
+               "exceeded";
+
+  // An oversized candidate has not advanced any sequence or reached a worker.
+  // Split at request boundaries, never inside one request's multimodal item.
+  std::vector<std::vector<Batch>> parts(dp_size_);
+  size_t num_rounds = 0;
+  for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    if (!batch[dp_rank].empty()) {
+      parts[dp_rank] = batch[dp_rank].split_by_request();
+      num_rounds = std::max(num_rounds, parts[dp_rank].size());
+    }
+  }
+  for (size_t round = 0; round < num_rounds; ++round) {
+    std::vector<Batch> sub_batch(dp_size_);
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (round < parts[dp_rank].size()) {
+        sub_batch[dp_rank] = std::move(parts[dp_rank][round]);
+      }
+    }
+    auto sub_inputs = prepare_inputs(sub_batch);
+    const auto sub_sizes = forward_input_sizes(sub_inputs);
+    bool rejected = false;
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (sub_sizes[dp_rank] <= limits[dp_rank]) {
+        continue;
+      }
+      const std::string message =
+          "Serialized inference input exceeds transport capacity: " +
+          std::to_string(sub_sizes[dp_rank]) + " bytes required, " +
+          std::to_string(limits[dp_rank]) +
+          " bytes available. Reduce image resolution/count or video frames.";
+      LOG(WARNING) << message;
+      for (Sequence* sequence : sub_batch[dp_rank].get_sequences()) {
+        sequence->fail(Status(StatusCode::INVALID_ARGUMENT, message));
+      }
+      sub_batch[dp_rank] = Batch();
+      rejected = true;
+    }
+    const bool all_empty =
+        std::all_of(sub_batch.begin(), sub_batch.end(), [](const Batch& b) {
+          return b.empty();
+        });
+    if (!all_empty) {
+      if (rejected) {
+        // Empty ranks change DP globals; rebuild only on this rejection path.
+        sub_inputs = prepare_inputs(sub_batch);
+      }
+      execute_batch(sub_batch, std::move(sub_inputs));
+    }
+  }
+  // Beam updates can replace sequences in the shared groups. Rebuild the
+  // caller's pointer lists as well as the sub-batch lists refreshed above.
+  for (auto& dp_batch : batch) {
+    dp_batch.refresh_sequences_from_groups();
+  }
+  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+  return {};
+}
+
+std::vector<uint64_t> VLMEngine::forward_input_sizes(
+    const std::vector<PreparedForwardInput>& inputs) const {
+  std::vector<uint64_t> sizes;
+  sizes.reserve(inputs.size());
+  for (const auto& input : inputs) {
+    sizes.emplace_back(ForwardSharedMemoryManager::input_size(input.input()));
+  }
+  return sizes;
+}
+
+[[noreturn]] void VLMEngine::abort_execution(const std::string& reason) {
+  HealthCheckManager::instance().set_unhealthy(reason);
+  for (auto& worker : worker_clients_) {
+    worker->cancel_execution();
+  }
+  LOG(FATAL) << reason
+             << "; worker state is not recoverable, restart the worker group";
+}
+
+void VLMEngine::execute_batch(
+    std::vector<Batch>& batch,
+    std::vector<PreparedForwardInput> prepared_inputs) {
+  std::vector<ForwardInput> forward_inputs;
+  forward_inputs.reserve(prepared_inputs.size());
+  for (size_t dp_rank = 0; dp_rank < prepared_inputs.size(); ++dp_rank) {
+    forward_inputs.emplace_back(batch[dp_rank].commit_forward_input(
+        std::move(prepared_inputs[dp_rank])));
+  }
+
+  // Last guard before any rank can observe an input. A mismatch with the
+  // preview is an invariant failure, not a reason to switch transports.
+  for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    const uint64_t input_size =
+        ForwardSharedMemoryManager::input_size(forward_inputs[dp_rank]);
+    const uint32_t first_rank = dp_rank * dp_local_tp_size_;
+    for (uint32_t rank = first_rank; rank < first_rank + dp_local_tp_size_;
+         ++rank) {
+      if (input_size > worker_clients_[rank]->forward_input_limit()) {
+        abort_execution("Forward input capacity changed after preflight");
+      }
+    }
+  }
 
   DCHECK(dp_size_ == forward_inputs.size())
       << "The processed forward inputs size " << forward_inputs.size()
@@ -444,7 +598,20 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   }
 
   // wait for the all future to complete
-  auto results = folly::collectAll(futures).get();
+  auto completion =
+      folly::collectAll(futures)
+          .within(std::chrono::milliseconds(
+              ExecutionConfig::get_instance().forward_execution_timeout_ms()))
+          .getTry();
+  if (completion.hasException()) {
+    abort_execution("Failed or timed out waiting for the worker group");
+  }
+  auto results = std::move(completion).value();
+  for (const auto& result : results) {
+    if (result.hasException() || !result.value().has_value()) {
+      abort_execution("Worker group execution failed");
+    }
+  }
 
   assert(dp_size_ == worker_clients_num_ / dp_local_tp_size_);
   size_t dp_rank = 0;
@@ -458,32 +625,25 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
       ++dp_rank;
       continue;
     }
-    if (result.has_value()) {
-      if (result.value().outputs.empty() && layer_forward_interrupted_) {
-        throw ForwardInterruptedException();
-      }
-      // if src_seq_idxes is not empty, skip sample output processing and
-      // process beam search output instead
-      if (result.value().src_seq_idxes.size() == 0) {
-        // set second input param enable_schedule_overlap to false,
-        // if it's not enabled, process_sample_output will append the real
-        // token, if it's enabled, this false here will append the fake token in
-        // process_sample_output
-        batch[dp_rank].process_sample_output(
-            result.value(), /*replace_fake_token=*/false, std::cref(args_));
-      } else {
-        batch[dp_rank].process_beam_search_output(result.value(), false);
-      }
-      // Keep Batch::sequences_ aligned with SequencesGroup after beam updates.
-      batch[dp_rank].refresh_sequences_from_groups();
-    } else {
-      LOG(FATAL) << "Failed to execute model, result has no value";
+    if (result.value().outputs.empty() && layer_forward_interrupted_) {
+      throw ForwardInterruptedException();
     }
+    // if src_seq_idxes is not empty, skip sample output processing and
+    // process beam search output instead
+    if (result.value().src_seq_idxes.size() == 0) {
+      // set second input param enable_schedule_overlap to false,
+      // if it's not enabled, process_sample_output will append the real
+      // token, if it's enabled, this false here will append the fake token in
+      // process_sample_output
+      batch[dp_rank].process_sample_output(
+          result.value(), /*replace_fake_token=*/false, std::cref(args_));
+    } else {
+      batch[dp_rank].process_beam_search_output(result.value(), false);
+    }
+    // Keep Batch::sequences_ aligned with SequencesGroup after beam updates.
+    batch[dp_rank].refresh_sequences_from_groups();
     ++dp_rank;
   }
-
-  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
-  return {};
 }
 
 void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
@@ -504,16 +664,25 @@ void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
         worker_clients_[worker_rank]->get_last_step_result_async());
   }
   // wait for the all future to complete
-  auto last_step_results = folly::collectAll(futures).get();
+  auto completion =
+      folly::collectAll(futures)
+          .within(std::chrono::milliseconds(
+              ExecutionConfig::get_instance().forward_execution_timeout_ms()))
+          .getTry();
+  if (completion.hasException()) {
+    abort_execution("Failed or timed out retrieving overlapped worker results");
+  }
+  auto last_step_results = std::move(completion).value();
+  for (const auto& result : last_step_results) {
+    if (result.hasException() || !result.value().has_value()) {
+      abort_execution("Failed to retrieve overlapped worker results");
+    }
+  }
 
   for (int32_t worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += dp_local_tp_size_) {
     auto result = last_step_results[worker_rank / stride].value();
-    if (result.has_value()) {
-      raw_forward_outputs.emplace_back(std::move(result.value()));
-    } else {
-      throw std::runtime_error("Failed to get last step results.");
-    }
+    raw_forward_outputs.emplace_back(std::move(result.value()));
   }
 
   for (size_t i = 0; i < last_batch.size(); ++i) {
@@ -549,8 +718,9 @@ std::vector<int64_t> VLMEngine::get_active_activation_memory() const {
   return active_activation_memories;
 }
 
-std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
-  std::vector<ForwardInput> batched_inputs;
+std::vector<PreparedForwardInput> VLMEngine::prepare_inputs(
+    std::vector<Batch>& batch) {
+  std::vector<PreparedForwardInput> batched_inputs;
   batched_inputs.reserve(dp_size_);
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
@@ -565,34 +735,38 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
     if (batch[dp_rank].empty()) {
       // Use value-initialization to zero primitive fields for empty shard.
-      ForwardInput empty_input;
-      empty_input.input_params.meta.batch_forward_type = BatchForwardType();
-      empty_input.input_params.meta.batch_id = UNINITIALIZED_BATCH_ID;
-      batched_inputs.emplace_back(std::move(empty_input));
+      batched_inputs.emplace_back();
+      batched_inputs.back().input().input_params.meta.batch_forward_type =
+          BatchForwardType();
+      batched_inputs.back().input().input_params.meta.batch_id =
+          UNINITIALIZED_BATCH_ID;
     } else {
-      batched_inputs.emplace_back(std::move(
-          batch[dp_rank].prepare_forward_input(args_, threadpool_.get())));
+      batched_inputs.emplace_back(
+          batch[dp_rank].prepare_forward_input_candidate(args_,
+                                                         threadpool_.get()));
     }
-    dp_global_token_nums[dp_rank] =
-        static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
+    dp_global_token_nums[dp_rank] = static_cast<int32_t>(
+        batched_inputs[dp_rank].input().host_token_ids().numel());
     dp_global_kv_max_seq_lens[dp_rank] =
-        batched_inputs[dp_rank].input_params.meta.kv_max_seq_len;
+        batched_inputs[dp_rank].input().input_params.meta.kv_max_seq_len;
     // BatchInputBuilder returns materialized states/snapshots; packing happens
     // at dispatch. An empty shard carries neither and stays plain.
     const bool shard_has_json_object =
-        !batched_inputs[dp_rank].json_object_states.empty() ||
-        !batched_inputs[dp_rank].json_object_state_snapshots.empty();
+        !batched_inputs[dp_rank].input().json_object_states.empty() ||
+        !batched_inputs[dp_rank].input().json_object_state_snapshots.empty();
     dp_global_json_object_active[dp_rank] = shard_has_json_object ? 1 : 0;
     if (batch_forward_type.is_empty() &&
         !batched_inputs[dp_rank]
+             .input()
              .input_params.meta.batch_forward_type.is_empty()) {
       batch_forward_type =
-          batched_inputs[dp_rank].input_params.meta.batch_forward_type;
+          batched_inputs[dp_rank].input().input_params.meta.batch_forward_type;
     }
     dp_is_decode[dp_rank] =
         batched_inputs[dp_rank]
+            .input()
             .input_params.meta.batch_forward_type.is_decode() &&
-        batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
+        batched_inputs[dp_rank].input().input_params.meta.q_max_seq_len == 1;
   }
 
   // Empty DP ranks inherit decode below and use fake inputs in WorkerImpl.
@@ -600,6 +774,7 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
       batch_forward_type.is_decode()) {
     for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
       if (batched_inputs[dp_rank]
+              .input()
               .input_params.meta.batch_forward_type.is_empty() &&
           dp_global_token_nums[dp_rank] == 0) {
         dp_is_decode[dp_rank] = 1;
@@ -609,18 +784,25 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
 
   // update dp_global_token_nums and batch_forward_type
   for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
-    batched_inputs[dp_rank].input_params.parallel.dp_global_token_nums =
+    batched_inputs[dp_rank].input().input_params.parallel.dp_global_token_nums =
         dp_global_token_nums;
-    batched_inputs[dp_rank].input_params.parallel.raw_dp_global_token_nums =
-        dp_global_token_nums;
-    batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =
+    batched_inputs[dp_rank]
+        .input()
+        .input_params.parallel.raw_dp_global_token_nums = dp_global_token_nums;
+    batched_inputs[dp_rank]
+        .input()
+        .input_params.parallel.dp_global_kv_max_seq_lens =
         dp_global_kv_max_seq_lens;
-    batched_inputs[dp_rank].input_params.parallel.dp_global_json_object_active =
+    batched_inputs[dp_rank]
+        .input()
+        .input_params.parallel.dp_global_json_object_active =
         dp_global_json_object_active;
-    batched_inputs[dp_rank].input_params.parallel.dp_is_decode = dp_is_decode;
+    batched_inputs[dp_rank].input().input_params.parallel.dp_is_decode =
+        dp_is_decode;
     if (batched_inputs[dp_rank]
+            .input()
             .input_params.meta.batch_forward_type.is_empty()) {
-      batched_inputs[dp_rank].input_params.meta.batch_forward_type =
+      batched_inputs[dp_rank].input().input_params.meta.batch_forward_type =
           batch_forward_type;
     }
   }

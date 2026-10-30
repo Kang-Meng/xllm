@@ -516,6 +516,69 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
   return forward_input;
 }
 
+PreparedForwardInput Batch::prepare_forward_input_candidate(
+    const ModelArgs& args,
+    ThreadPool* thread_pool,
+    int32_t cp_size) {
+  dp_balance_shuffle_seqs();
+  refresh_output_targets();
+  BatchInputBuilder builder(sequences_,
+                            allowed_max_tokens_,
+                            input_embeddings_vec_,
+                            mm_data_vec_,
+                            &swap_block_transfer_infos_,
+                            batch_id_,
+                            &args,
+                            batch_forward_type_,
+                            cp_size,
+                            thread_pool,
+                            /*commit_sequence_state=*/false);
+  auto prepared = builder.build_prepared_forward_input();
+  prepared.input().input_params.meta.requires_host_restore =
+      requires_host_restore_;
+  if (has_partial_finished_beam_group()) {
+    prepared.input().sampling_params.acc_logprob = torch::Tensor();
+  }
+  return prepared;
+}
+
+ForwardInput Batch::commit_forward_input(PreparedForwardInput prepared) {
+  auto input = std::move(prepared).commit();
+  stamp_host_restore(input);
+  return input;
+}
+
+std::vector<Batch> Batch::split_by_request() const {
+  // Block-copy operations may depend on sources belonging to another request.
+  // Such a batch must remain atomic rather than replay its copies per split.
+  if (requires_host_restore_ || !swap_block_transfer_infos_.empty()) {
+    return {*this};
+  }
+  std::vector<Batch> parts;
+  parts.reserve(sequences_.size());
+  std::unordered_map<std::string, size_t> request_parts;
+  request_parts.reserve(sequences_.size());
+  for (size_t i = 0; i < sequences_.size(); ++i) {
+    const auto [iter, inserted] =
+        request_parts.try_emplace(sequences_[i]->request_id(), parts.size());
+    if (inserted) {
+      parts.emplace_back();
+      parts.back().batch_id_ = batch_id_;
+    }
+    parts[iter->second].add(sequences_[i], allowed_max_tokens_[i]);
+  }
+  for (SequencesGroup* group : sequence_groups_) {
+    if (group->sequences().empty()) {
+      continue;
+    }
+    const auto iter =
+        request_parts.find(group->sequences().front()->request_id());
+    CHECK(iter != request_parts.end());
+    parts[iter->second].add(group);
+  }
+  return parts;
+}
+
 void Batch::stamp_host_restore(ForwardInput& forward_input) {
   forward_input.input_params.meta.requires_host_restore =
       std::exchange(requires_host_restore_, false);

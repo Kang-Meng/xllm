@@ -3526,7 +3526,23 @@ std::string ForwardSharedMemoryManager::create_unique_name(
   return filename;
 }
 
+uint64_t ForwardSharedMemoryManager::input_size(const ForwardInput& input) {
+  return sizeof(ControlMetadata) + type_size<uint64_t> +
+         get_input_layout_size(calculate_forward_input_layout(input));
+}
+
+void ForwardSharedMemoryManager::cancel() {
+  __atomic_store_n(&control_ptr_->cancelled, uint64_t{1}, __ATOMIC_RELEASE);
+}
+
+bool ForwardSharedMemoryManager::cancelled() const {
+  return __atomic_load_n(&control_ptr_->cancelled, __ATOMIC_ACQUIRE) != 0;
+}
+
 bool ForwardSharedMemoryManager::input_write(const ForwardInput& input) {
+  if (cancelled()) {
+    return false;
+  }
   const RawInputLayoutHeader layout = calculate_forward_input_layout(input);
   const uint64_t payload_size = get_input_layout_size(layout);
   const uint64_t total_size =
@@ -3552,11 +3568,14 @@ bool ForwardSharedMemoryManager::input_write(const ForwardInput& input) {
   return true;
 }
 
-void ForwardSharedMemoryManager::input_read(
+bool ForwardSharedMemoryManager::input_read(
     ForwardInput& input,
     const torch::Device& device,
     InputDeviceMaterializationPolicy policy) {
   while (true) {
+    if (cancelled()) {
+      return false;
+    }
     if (control_ptr_->version != last_version_) {
       last_version_ = control_ptr_->version;
       std::atomic_thread_fence(std::memory_order_acquire);
@@ -3600,7 +3619,7 @@ void ForwardSharedMemoryManager::input_read(
                                     materialize_device_buffer,
                                     /*stabilize_dit_host_tensors=*/true);
 
-  return;
+  return true;
 }
 
 bool ForwardSharedMemoryManager::raw_output_write(
@@ -3669,12 +3688,24 @@ bool ForwardSharedMemoryManager::raw_output_write(
   return true;
 }
 
-void ForwardSharedMemoryManager::raw_output_read(RawForwardOutput& output) {
+bool ForwardSharedMemoryManager::raw_output_read(
+    RawForwardOutput& output,
+    std::chrono::milliseconds timeout,
+    const ForwardSharedMemoryManager* input_manager) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
+    if (cancelled() ||
+        (input_manager != nullptr && input_manager->cancelled())) {
+      return false;
+    }
     if (control_ptr_->version != last_version_) {
       last_version_ = control_ptr_->version;
       std::atomic_thread_fence(std::memory_order_acquire);
       break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      LOG(ERROR) << "Timed out waiting for worker shared memory output";
+      return false;
     }
     std::this_thread::sleep_for(std::chrono::nanoseconds(kNumWaitNanoseconds));
   }
@@ -3683,7 +3714,7 @@ void ForwardSharedMemoryManager::raw_output_read(RawForwardOutput& output) {
       static_cast<char*>(base_address()) + sizeof(ControlMetadata);
   deserialize_raw_forward_output(data_ptr, output);
 
-  return;
+  return true;
 }
 
 void ForwardSharedMemoryManager::clear() {

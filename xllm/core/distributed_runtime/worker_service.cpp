@@ -474,8 +474,9 @@ void WorkerService::create_polling_shm_thread(
               options_.enable_schedule_overlap() && options_.enable_graph()
                   ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
                   : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
-          input_shm_manager->input_read(
-              fwd_input, device_, materialization_policy);
+          CHECK(input_shm_manager->input_read(
+              fwd_input, device_, materialization_policy))
+              << "Worker group execution was cancelled; restart the group";
           timer.reset();
           // model output variables
           torch::Tensor next_tokens;

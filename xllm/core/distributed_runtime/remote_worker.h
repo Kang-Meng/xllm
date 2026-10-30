@@ -39,6 +39,10 @@ namespace xllm {
 
 class RemoteWorker : public WorkerClient {
  public:
+  uint64_t forward_input_limit() const override {
+    return channel_->forward_input_limit();
+  }
+  void cancel_execution() override { channel_->cancel_execution(); }
   explicit RemoteWorker(int32_t global_rank,
                         const std::string& server_address,
                         const torch::Device& d,

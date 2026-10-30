@@ -2401,7 +2401,8 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                               {"request-a", "request-b"}));
 
   RawForwardOutput round_trip;
-  reader_manager.raw_output_read(round_trip);
+  ASSERT_TRUE(
+      reader_manager.raw_output_read(round_trip, std::chrono::seconds(30)));
 
   ASSERT_EQ(round_trip.outputs.size(), 2u);
   EXPECT_EQ(round_trip.outputs[0].speculative_token_stats.accepted_tokens, 1);

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "mm_batch_data.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "core/util/tensor_helper.h"
@@ -50,6 +51,36 @@ void MMBatchData::get(const MMKey& key, std::vector<torch::Tensor>& vec) const {
 }
 
 namespace {
+bool concat_metadata(const std::vector<torch::Tensor>& tensors,
+                     torch::Tensor& output) {
+  if (tensors.empty() || !tensors.front().defined()) {
+    return false;
+  }
+  const auto device = tensors.front().device();
+  const bool can_use_meta = std::all_of(
+      tensors.begin(), tensors.end(), [&device](const torch::Tensor& tensor) {
+        return tensor.defined() && tensor.device() == device &&
+               tensor.layout() == torch::kStrided;
+      });
+  if (!can_use_meta) {
+    // Preserve safe_concat's original device/layout compatibility semantics.
+    return safe_concat(tensors, output);
+  }
+
+  if (!can_concat_tensors(tensors)) {
+    return false;
+  }
+  auto sizes = tensors.front().sizes().vec();
+  sizes.front() = 0;
+  for (const auto& tensor : tensors) {
+    sizes.front() += tensor.size(0);
+  }
+  // Do not run cat on meta tensors: its Python kernel can wait for the GIL
+  // while the serving thread is waiting for this C++ input-building task.
+  output = torch::empty(sizes, tensors.front().options().device(torch::kMeta));
+  return true;
+}
+
 void move_dict_to_device(MMDict& dict, const torch::Device& device) {
   for (auto& [key, value] : dict) {
     if (std::holds_alternative<torch::Tensor>(value)) {
@@ -89,16 +120,20 @@ MMBatchData MMBatchData::to(const MMBatchData& mm_data,
   return new_mm_data;
 }
 
-void MMBatchData::batch(const std::vector<MMData>& mm_datas) {
+void MMBatchData::batch(std::vector<MMData> mm_datas,
+                        bool materialize_tensors) {
   mm_datas_ = std::move(mm_datas);
   CollectMMDataTensorVisitor visitor;
   this->foreach (static_cast<MMData::IVisitor&>(visitor));
 
   MMDict dict;
-  for (const auto& pair : visitor.datas_) {
+  for (auto& pair : visitor.datas_) {
     torch::Tensor tar;
-    if (safe_concat(pair.second, tar)) {
-      dict[pair.first] = tar;
+    const bool concatenated = materialize_tensors
+                                  ? safe_concat(pair.second, tar)
+                                  : concat_metadata(pair.second, tar);
+    if (concatenated) {
+      dict[pair.first] = std::move(tar);
     } else {
       dict[pair.first] = std::move(pair.second);
     }

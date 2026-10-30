@@ -28,6 +28,17 @@ class ShmChannel : public CommChannel {
                       const runtime::Options& options);
   ~ShmChannel() = default;
 
+  uint64_t forward_input_limit() const override {
+    return enable_shm_ ? input_shm_manager_->size()
+                       : CommChannel::forward_input_limit();
+  }
+  void cancel_execution() override {
+    if (input_shm_manager_) {
+      input_shm_manager_->cancel();
+    }
+    output_shm_manager_->cancel();
+  }
+
   void execute_model_async(
       const ForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise) override;
@@ -37,6 +48,7 @@ class ShmChannel : public CommChannel {
                               RawForwardOutput& raw_output);
 
   bool enable_shm_ = false;
+  bool is_driver_ = false;
   std::unique_ptr<ForwardSharedMemoryManager> input_shm_manager_ = nullptr;
   std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager_ = nullptr;
 };

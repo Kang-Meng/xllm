@@ -53,6 +53,7 @@ class ExecutionConfig final {
          "use_contiguous_input_buffer",
          "input_shm_size",
          "output_shm_size",
+         "forward_execution_timeout_ms",
          "random_seed",
          "python_graph_backend",
          "enable_fia_decode",
@@ -83,6 +84,8 @@ class ExecutionConfig final {
   PROPERTY(uint64_t, input_shm_size) = 1024;
 
   PROPERTY(uint64_t, output_shm_size) = 128;
+
+  PROPERTY(int32_t, forward_execution_timeout_ms) = 300000;
 
   PROPERTY(int32_t, random_seed) = -1;
 

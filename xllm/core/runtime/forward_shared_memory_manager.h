@@ -15,7 +15,9 @@ limitations under the License.
 
 #include <stddef.h>
 
+#include <chrono>
 #include <memory>
+#include <type_traits>
 
 #include "dit_forward_params.h"
 #include "forward_params.h"
@@ -30,7 +32,16 @@ constexpr int64_t kNumWaitNanoseconds = 1000;  // 1us
 
 struct ControlMetadata {
   volatile uint64_t version;
+  uint64_t cancelled;
 };
+
+static_assert(std::is_standard_layout_v<ControlMetadata>);
+static_assert(sizeof(ControlMetadata) == 16);
+static_assert(offsetof(ControlMetadata, version) == 0);
+static_assert(offsetof(ControlMetadata, cancelled) == 8);
+static_assert(alignof(ControlMetadata) >= alignof(uint64_t));
+static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
+              "SHM cancellation requires lock-free cross-process atomics");
 
 struct PbMetadata {
   uint64_t pb_size;
@@ -109,7 +120,13 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
   };
 
   bool input_write(const ForwardInput& input);
-  void input_read(ForwardInput& input,
+  // Includes the control header and payload length used by input_write.
+  static uint64_t input_size(const ForwardInput& input);
+
+  void cancel();
+  bool cancelled() const;
+
+  bool input_read(ForwardInput& input,
                   const torch::Device& device,
                   InputDeviceMaterializationPolicy policy =
                       InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ);
@@ -132,7 +149,10 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
       const std::vector<JsonObjectOutputError>& json_object_errors,
       const std::vector<std::string>& failed_request_ids,
       const std::vector<MMDict>& mm_dict_vec = {});
-  void raw_output_read(RawForwardOutput& outputs);
+  bool raw_output_read(
+      RawForwardOutput& outputs,
+      std::chrono::milliseconds timeout,
+      const ForwardSharedMemoryManager* input_manager = nullptr);
 
   void clear();
 

@@ -26,6 +26,7 @@ cc_test(
     batch_test
   SRCS
     batch_test.cpp
+    batch_transport_test.cpp
   DEPS
     :config
     :batch

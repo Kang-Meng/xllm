@@ -36,6 +36,8 @@ namespace xllm {
 
 class CommChannel {
  public:
+  virtual uint64_t forward_input_limit() const { return forward_input_limit_; }
+  virtual void cancel_execution() {}
   CommChannel() = default;
   virtual ~CommChannel() = default;
 
@@ -128,6 +130,7 @@ class CommChannel {
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
  private:
+  uint64_t forward_input_limit_ = 0;
   brpc::Channel channel_;
   brpc::ChannelOptions options_;
   std::unique_ptr<proto::DistributeWorker_Stub> stub_;
