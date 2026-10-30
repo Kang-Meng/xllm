@@ -22,6 +22,7 @@ limitations under the License.
 #include <butil/endpoint.h>
 
 #include <chrono>
+#include <future>
 #include <random>
 #include <string>
 #include <vector>
@@ -314,6 +315,14 @@ PDOOCScheduler::~PDOOCScheduler() {
   if (send_pull_signal_thread_ && send_pull_signal_thread_->joinable()) {
     send_pull_signal_thread_->join();
   }
+
+  // Response continuations may still enqueue handoffs. Drain them, then the
+  // FIFO handoff worker, while this scheduler and its RPC server remain alive.
+  response_processor_->wait_completion();
+  std::promise<void> handoffs_done;
+  auto handoffs_completed = handoffs_done.get_future();
+  prefill_threadpool_.schedule([&handoffs_done] { handoffs_done.set_value(); });
+  handoffs_completed.get();
 
   LOG(INFO) << "Stop scheduler rpc server " << server_name_ << ".";
   auto rpc_server = ServerRegistry::get_instance().get_server(server_name_);
@@ -1622,6 +1631,19 @@ void PDOOCScheduler::dispatch_requests() {
   }
 }
 
+void PDOOCScheduler::schedule_prefill_handoff(const Request& request,
+                                              ThreadPool::Runnable runnable) {
+  auto enqueue_handoff = [this, runnable = std::move(runnable)]() mutable {
+    prefill_threadpool_.schedule(std::move(runnable));
+  };
+  if (request.state().stream) {
+    response_processor_->schedule_after_stream_response(
+        request, std::move(enqueue_handoff));
+  } else {
+    enqueue_handoff();
+  }
+}
+
 void PDOOCScheduler::prefill_send_first_generation() {
   if (running_sequences_.size() == 0) {
     return;
@@ -1660,11 +1682,11 @@ void PDOOCScheduler::prefill_send_first_generation() {
     return;
   }
 
-  prefill_threadpool_.schedule([this,
-                                requests = std::move(requests)]() mutable {
-    // send request first token to remote instance
-    // TODO: here we only support one sequence for now.
-    for (auto& request : requests) {
+  // step() has already queued each stream response. Only enqueue its handoff
+  // once that response completes; a blocked callback must not occupy Prefill's
+  // single handoff worker while unrelated responses are ready.
+  for (auto& request : requests) {
+    schedule_prefill_handoff(*request, [this, request] {
       // TODO: support batch request later
       proto::DisaggGenerationsRequests gens;
       auto gen = gens.mutable_multi_gens()->Add();
@@ -1732,6 +1754,7 @@ void PDOOCScheduler::prefill_send_first_generation() {
       // TODO: Async call later
       proto::Status resp;
       brpc::Controller cntl;
+      // Cumulative upstream wall time includes response delivery and queuing.
       gen->set_upstream_elapsed_seconds(request->end_to_end_latency_seconds());
       request_timing_to_proto(request->state().timing->snapshot(),
                               gen->mutable_phase_timing());
@@ -1750,8 +1773,8 @@ void PDOOCScheduler::prefill_send_first_generation() {
         req_to_channel_map_.erase(request->request_id());
       }
       kv_cache_manager_->deallocate(request.get());
-    }
-  });
+    });
+  }
 }
 
 // request is received from prefill
@@ -2237,27 +2260,27 @@ void PDOOCScheduler::prefill_send_multi_generations() {
     return;
   }
 
-  prefill_threadpool_.schedule([this,
-                                transfer_pairs =
-                                    std::move(transfer_pairs)]() mutable {
-    // Add requests to remote_requests_map_ for response handling
-    {
-      std::lock_guard<std::mutex> lock(remote_requests_map_mutex_);
-      for (auto& pair : transfer_pairs) {
-        auto& request = pair.first;
-        if (remote_requests_map_.find(request->request_id()) !=
-            remote_requests_map_.end()) {
-          LOG(FATAL)
-              << "Two request has the same request_id, check the requests map.";
-        }
-        remote_requests_map_[request->request_id()] = request;
-      }
-    }
-
-    // send multiple tokens to remote instance
+  // Migration resumes an existing offline sequence. Any queued P stream
+  // chunks must complete before D can produce the following chunks as well.
+  {
+    std::lock_guard<std::mutex> lock(remote_requests_map_mutex_);
     for (auto& pair : transfer_pairs) {
-      auto request = pair.first;
-      auto target_instance = pair.second;
+      auto& request = pair.first;
+      if (remote_requests_map_.find(request->request_id()) !=
+          remote_requests_map_.end()) {
+        LOG(FATAL)
+            << "Two request has the same request_id, check the requests map.";
+      }
+      remote_requests_map_[request->request_id()] = request;
+    }
+  }
+
+  for (auto& pair : transfer_pairs) {
+    auto request = std::move(pair.first);
+    std::string target_instance = std::move(pair.second);
+    auto send_migration = [this,
+                           request,
+                           target_instance = std::move(target_instance)] {
       proto::DisaggGenerationsRequests multi_reqs;
       auto multi_req = multi_reqs.mutable_multi_gens()->Add();
       multi_req->set_req_id(request->request_id());
@@ -2281,8 +2304,9 @@ void PDOOCScheduler::prefill_send_multi_generations() {
       auto kv_cache_transfer_mode = options_.kv_cache_transfer_mode();
 #if defined(USE_DCU)
       if (kv_cache_transfer_mode == "PUSH") {
-        // Offline migration happens after prefill forward has produced tokens.
-        // Use decode-side pull so KV is copied before the request continues.
+        // Offline migration happens after prefill forward has produced
+        // tokens. Use decode-side pull so KV is copied before the request
+        // continues.
         kv_cache_transfer_mode = "PULL";
       }
 #endif
@@ -2321,12 +2345,14 @@ void PDOOCScheduler::prefill_send_multi_generations() {
       if (!stub) {
         LOG(ERROR) << "Failed to create RPC channel to target instance: "
                    << target_instance;
-        continue;
+        return;
       }
 
       // TODO: Async call later
       proto::Status resp;
       brpc::Controller cntl;
+      // Preserve cumulative wall time across migration, including response
+      // delivery.
       multi_req->set_upstream_elapsed_seconds(
           request->end_to_end_latency_seconds());
       request_timing_to_proto(request->state().timing->snapshot(),
@@ -2345,8 +2371,9 @@ void PDOOCScheduler::prefill_send_multi_generations() {
         req_to_channel_map_.erase(request->request_id());
       }
       kv_cache_manager_->deallocate(request.get());
-    }
-  });
+    };
+    schedule_prefill_handoff(*request, std::move(send_migration));
+  }
 }
 
 void PDOOCScheduler::build_disagg_requests(

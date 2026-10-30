@@ -62,6 +62,12 @@ class AsyncResponseProcessor final {
   void batch_process_completed_requests(
       std::vector<std::shared_ptr<Request>>& requests,
       bool terminal = true);
+
+  // Enqueue work after this request's already queued stream response. Batched
+  // responses complete on the RPC worker; direct responses on their own worker.
+  void schedule_after_stream_response(const Request& request,
+                                      ThreadPool::Runnable runnable);
+
   // wait for all responses in queue to be handled
   void wait_completion();
 

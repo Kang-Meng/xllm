@@ -108,6 +108,9 @@ class PDOOCScheduler : public DisaggPDScheduler {
       RequestPriorityQueue* running_queue);
 
  private:
+  void schedule_prefill_handoff(const Request& request,
+                                ThreadPool::Runnable runnable);
+
   void handle_prefill_requests_impl(
       double& latency_budget,
       double& estimate_latency,

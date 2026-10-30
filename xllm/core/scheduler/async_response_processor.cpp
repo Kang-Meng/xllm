@@ -437,6 +437,25 @@ void AsyncResponseProcessor::process_stream_requests(
   }
 }
 
+void AsyncResponseProcessor::schedule_after_stream_response(
+    const Request& request,
+    ThreadPool::Runnable runnable) {
+  if (enable_batch_response_ && !request.service_request_id().empty()) {
+    // process_stream_requests() has already queued the batch RPC. Its single
+    // FIFO worker finishes delivery before it runs this continuation.
+    rpc_threadpool_.schedule(std::move(runnable));
+    return;
+  }
+  const int32_t thread_id = request.state().response_thread_id;
+  if (thread_id >= 0) {
+    response_threadpool_.schedule_with_tid(std::move(runnable),
+                                           static_cast<size_t>(thread_id));
+    return;
+  }
+  // No direct response was queued for this request.
+  runnable();
+}
+
 // for batch generate, wait all response done.
 void AsyncResponseProcessor::wait_completion() {
   auto wait_threadpool = [](ThreadPool& threadpool) {

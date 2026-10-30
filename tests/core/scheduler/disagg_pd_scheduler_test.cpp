@@ -45,6 +45,7 @@ limitations under the License.
 #include "framework/block/block_manager_pool.h"
 #include "framework/config/rec_config.h"
 #include "framework/config/scheduler_config.h"
+#include "framework/config/service_config.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
@@ -221,21 +222,63 @@ class FakeEngine final : public Engine {
   ModelArgs model_args_;
 };
 
-class TestDisaggPDScheduler final : public DisaggPDScheduler {
+template <typename Scheduler>
+class PrefillTestScheduler : public Scheduler {
+ public:
+  using Scheduler::Scheduler;
+
+  void admit_prefill(std::shared_ptr<Request> request,
+                     proto::DisaggPDService_Stub* stub = nullptr) {
+    // Seed an accepted request and its D channel, bypassing discovery and
+    // remote KV reservation. The test uses step() for scheduling and output.
+    {
+      std::lock_guard<std::mutex> lock(this->req_to_channel_map_mutex_);
+      this->req_to_channel_map_[request->request_id()] = stub;
+    }
+    this->request_queue_.write(std::move(request));
+  }
+
+  void enable_batched_responses() {
+    // Exercise batched delivery without initializing service discovery.
+    this->response_processor_ = std::make_unique<AsyncResponseProcessor>(
+        this->engine_->tokenizer(),
+        this->options_.instance_role(),
+        /*enable_service_routing=*/true,
+        this->options_.disable_log_stats(),
+        [cancel_queue =
+             this->cancel_request_queue_](std::shared_ptr<Request> request) {
+          cancel_queue->submit(std::move(request));
+        });
+  }
+
+  std::future<void> prefill_completion() {
+    // One FIFO worker makes this marker wait for handoff and its cleanup.
+    std::promise<void> done;
+    auto completed = done.get_future();
+    this->prefill_threadpool_.schedule(
+        [done = std::move(done)]() mutable { done.set_value(); });
+    return completed;
+  }
+
+  void wait_prefill_completion() {
+    // Async response continuations must enqueue their handoffs before we add
+    // the handoff marker. Callers have already released their response gates.
+    this->response_processor_->wait_completion();
+    auto completed = prefill_completion();
+    ASSERT_EQ(completed.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+  }
+};
+
+class TestDisaggPDScheduler final
+    : public PrefillTestScheduler<DisaggPDScheduler> {
  public:
   TestDisaggPDScheduler(Engine* engine,
                         const Options& options,
                         bool start_services = true)
-      : DisaggPDScheduler(engine, options, start_services) {}
-
-  void admit_prefill(std::shared_ptr<Request> request,
-                     proto::DisaggPDService_Stub* stub = nullptr) {
-    {
-      std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
-      req_to_channel_map_[request->request_id()] = stub;
-    }
-    request_queue_.write(std::move(request));
-  }
+      : PrefillTestScheduler<DisaggPDScheduler>(engine,
+                                                options,
+                                                start_services) {}
 
   bool reject_queued_for_test(const std::shared_ptr<Request>& request) {
     return reject_queued_request(request);
@@ -278,19 +321,6 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     return cancel_request_queue_;
   }
 
-  std::future<void> prefill_completion() {
-    std::promise<void> done;
-    auto future = done.get_future();
-    prefill_threadpool_.schedule(
-        [done = std::move(done)]() mutable { done.set_value(); });
-    return future;
-  }
-
-  void emit_stream_for_test(const std::shared_ptr<Request>& request) {
-    std::vector<std::shared_ptr<Request>> requests{request};
-    response_processor_->process_stream_requests(requests);
-  }
-
   void cache_prefill_blocks_for_test(Request* request) {
     cache_prefill_blocks(request);
   }
@@ -314,17 +344,24 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
 class FirstGenerationOrderService final : public proto::DisaggPDService {
  public:
   std::future<void> received() { return received_.get_future(); }
+  std::function<void(const proto::DisaggGenerationsRequests&)> on_handoff_;
 
   void FirstGeneration(google::protobuf::RpcController* /*controller*/,
-                       const proto::DisaggGenerationsRequests* /*request*/,
+                       const proto::DisaggGenerationsRequests* request,
                        proto::Status* response,
                        google::protobuf::Closure* done) override {
     brpc::ClosureGuard done_guard(done);
-    received_.set_value();
+    if (received_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      received_.set_value();
+    }
+    if (on_handoff_) {
+      on_handoff_(*request);
+    }
     response->set_ok(true);
   }
 
  private:
+  std::atomic<int32_t> received_count_{0};
   std::promise<void> received_;
 };
 
@@ -461,10 +498,12 @@ class ReservationService final : public proto::DisaggPDService {
   DisaggPDScheduler* scheduler_;
 };
 
-class TestPDOOCScheduler final : public PDOOCScheduler {
+class TestPDOOCScheduler final : public PrefillTestScheduler<PDOOCScheduler> {
  public:
-  TestPDOOCScheduler(Engine* engine, const Options& options)
-      : PDOOCScheduler(engine, options, false) {}
+  TestPDOOCScheduler(Engine* engine,
+                     const Options& options,
+                     bool start_services = false)
+      : PrefillTestScheduler<PDOOCScheduler>(engine, options, start_services) {}
 
   void enqueue_dispatch(std::shared_ptr<Request> request) {
     enqueue_ready_request(std::move(request));
@@ -2821,7 +2860,13 @@ TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
   EXPECT_EQ(pool->num_used_blocks()[0], 0u);
 }
 
-TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
+namespace {
+template <typename Scheduler>
+void check_prefill_response_completes_before_decode_handoff(
+    bool enable_service_routing = false) {
+  auto previous_perf_model = perf_model::get_perf_model();
+  ScopeGuard restore_perf_model(
+      [&] { perf_model::set_perf_model(previous_perf_model); });
   FirstGenerationOrderService service;
   auto received = service.received();
   brpc::Server server;
@@ -2834,9 +2879,14 @@ TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
   proto::DisaggPDService_Stub stub(&channel);
 
   FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  // Provide model dimensions for OOC FLOPs and saturation estimates.
+  set_metrics_model(engine);
   auto options = make_options();
   options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
-  TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
+  Scheduler prefill(&engine, options, /*start_services=*/false);
+  if (enable_service_routing) {
+    prefill.enable_batched_responses();
+  }
   auto request = make_request({11, 12}, "first-token-order");
   request->state().stream = true;
   std::atomic<bool> first_token_observed{false};
@@ -2844,27 +2894,52 @@ TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
   auto started = response_started.get_future();
   std::promise<void> release_response;
   auto released = release_response.get_future().share();
-  request->state().output_func = [&response_started,
-                                  &first_token_observed,
-                                  released](const RequestOutput& output) {
+  auto observe_output = [&response_started, &first_token_observed, released](
+                            const RequestOutput& output) {
     first_token_observed =
         output.outputs.size() == 1 && output.outputs[0].text == "999";
     response_started.set_value();
     released.wait();
     return true;
   };
+  request->state().output_func =
+      [observe_output, enable_service_routing](const RequestOutput& output) {
+        EXPECT_FALSE(enable_service_routing);
+        return observe_output(output);
+      };
+  request->state().outputs_func =
+      [observe_output,
+       enable_service_routing](const std::vector<RequestOutput>& outputs) {
+        EXPECT_TRUE(enable_service_routing);
+        EXPECT_EQ(outputs.size(), 1u);
+        if (outputs.size() != 1u) {
+          return std::vector<bool>(outputs.size(), false);
+        }
+        return std::vector<bool>{observe_output(outputs[0])};
+      };
+  engine.forward = [](std::vector<Batch>& batch) {
+    EXPECT_EQ(batch.size(), 1u);
+    if (batch.size() != 1u) {
+      return ForwardOutput{};
+    }
+    EXPECT_EQ(batch[0].size(), 1u);
+    if (batch[0].size() != 1u) {
+      return ForwardOutput{};
+    }
+    Sequence* sequence = batch[0][0];
+    finish_prefill(sequence);
+    sequence->first_token() = RemoteToken{.token_id = 999};
+    return ForwardOutput{};
+  };
+  // Seed admission to isolate response ordering from discovery and KV RPCs.
+  // step() drives the real output processor and FirstGeneration handoff.
   prefill.admit_prefill(request, &stub);
-  auto batch = prefill.prepare_batch_test();
-  ASSERT_FALSE(batch[0].empty());
-  finish_prefill(request->sequences()[0].get());
-  request->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
-  prefill.emit_stream_for_test(request);
+  prefill.step(absl::ZeroDuration());
   const bool output_started =
       started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
   EXPECT_TRUE(output_started);
   EXPECT_TRUE(first_token_observed.load());
   if (output_started) {
-    prefill.prefill_send_first_generation();
     const std::future_status before_response_completed =
         received.wait_for(std::chrono::milliseconds(250));
     EXPECT_EQ(before_response_completed, std::future_status::timeout)
@@ -2876,8 +2951,209 @@ TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
   if (output_started) {
     EXPECT_EQ(received.wait_for(std::chrono::seconds(5)),
               std::future_status::ready);
-    prefill.prefill_completion().get();
+    ASSERT_NO_FATAL_FAILURE(prefill.wait_prefill_completion());
   }
+  server.Stop(0);
+  server.Join();
+}
+}  // namespace
+
+TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
+  check_prefill_response_completes_before_decode_handoff<
+      TestDisaggPDScheduler>();
+}
+
+TEST(PDOOCSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
+  check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>();
+}
+
+TEST(PDOOCSchedulerTest, BatchedPrefillResponseCompletesBeforeDecodeHandoff) {
+  check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>(
+      /*enable_service_routing=*/true);
+}
+
+TEST(PDOOCSchedulerTest, BatchHandoffDoesNotWaitForLaterResponses) {
+  auto previous_perf_model = perf_model::get_perf_model();
+  ScopeGuard restore_perf_model(
+      [&] { perf_model::set_perf_model(previous_perf_model); });
+  FirstGenerationOrderService service;
+  auto received = service.received();
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(address.c_str(), nullptr), 0);
+  proto::DisaggPDService_Stub stub(&channel);
+
+  std::promise<void> release_handoff;
+  auto handoff_released = release_handoff.get_future().share();
+  std::promise<void> second_handoff;
+  auto second_received = second_handoff.get_future();
+  std::atomic<int32_t> handoffs{0};
+  service.on_handoff_ =
+      [&handoffs, &second_handoff, handoff_released](
+          const proto::DisaggGenerationsRequests& /*unused*/) {
+        const int32_t count = handoffs.fetch_add(1) + 1;
+        if (count == 1) {
+          handoff_released.wait();
+        } else if (count == 2) {
+          second_handoff.set_value();
+        }
+      };
+
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  set_metrics_model(engine);
+  auto options = make_options();
+  options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
+  TestPDOOCScheduler prefill(&engine, options, /*start_services=*/false);
+  engine.forward = [](std::vector<Batch>& batch) {
+    EXPECT_EQ(batch.size(), 1u);
+    if (batch.size() != 1u) {
+      return ForwardOutput{};
+    }
+    for (size_t i = 0; i < batch[0].size(); ++i) {
+      Sequence* sequence = batch[0][i];
+      finish_prefill(sequence);
+      sequence->first_token() = RemoteToken{.token_id = 999};
+    }
+    return ForwardOutput{};
+  };
+  for (int32_t i = 0; i < 2; ++i) {
+    auto request = make_request({11, 12}, "batch-order-" + std::to_string(i));
+    request->state().stream = true;
+    request->state().output_func = [](const RequestOutput&) { return true; };
+    prefill.admit_prefill(std::move(request), &stub);
+  }
+  prefill.step(absl::ZeroDuration());
+
+  const bool first_received =
+      received.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(first_received);
+  std::promise<void> response_started;
+  auto started = response_started.get_future();
+  std::promise<void> release_response;
+  auto response_released = release_response.get_future().share();
+  auto later = make_request({21, 22}, "later-response");
+  later->state().stream = true;
+  later->state().output_func = [&response_started,
+                                response_released](const RequestOutput&) {
+    response_started.set_value();
+    response_released.wait();
+    return true;
+  };
+  // Queue a slow response from the next step while the first batch's RPC
+  // is held. It must not add another barrier between this batch's handoffs.
+  if (first_received) {
+    prefill.admit_prefill(std::move(later), &stub);
+    prefill.step(absl::ZeroDuration());
+    EXPECT_EQ(started.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+  }
+  release_handoff.set_value();
+  if (first_received) {
+    EXPECT_EQ(second_received.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+  }
+  release_response.set_value();
+  ASSERT_NO_FATAL_FAILURE(prefill.wait_prefill_completion());
+  EXPECT_EQ(handoffs.load(), 3);
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  server.Stop(0);
+  server.Join();
+}
+
+TEST(PDOOCSchedulerTest, BlockedResponseDoesNotDelayAnotherReadyHandoff) {
+  ASSERT_GE(ServiceConfig::get_instance().num_response_handling_threads(), 2);
+  auto previous_perf_model = perf_model::get_perf_model();
+  ScopeGuard restore_perf_model(
+      [&] { perf_model::set_perf_model(previous_perf_model); });
+  FirstGenerationOrderService service;
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(address.c_str(), nullptr), 0);
+  proto::DisaggPDService_Stub stub(&channel);
+
+  std::promise<void> slow_started;
+  auto started = slow_started.get_future();
+  std::promise<void> release_slow;
+  auto released = release_slow.get_future().share();
+  std::promise<void> slow_handoff;
+  auto slow_received = slow_handoff.get_future();
+  std::promise<void> ready_handoff;
+  auto ready_received = ready_handoff.get_future();
+  std::atomic<bool> slow_completed{false};
+  std::atomic<bool> ready_completed{false};
+  service.on_handoff_ =
+      [&slow_handoff, &ready_handoff, &slow_completed, &ready_completed](
+          const proto::DisaggGenerationsRequests& gens) {
+        EXPECT_EQ(gens.multi_gens_size(), 1);
+        if (gens.multi_gens_size() != 1) {
+          return;
+        }
+        if (gens.multi_gens(0).req_id() == "slow-response") {
+          EXPECT_TRUE(slow_completed.load());
+          slow_handoff.set_value();
+        } else {
+          EXPECT_EQ(gens.multi_gens(0).req_id(), "ready-response");
+          EXPECT_TRUE(ready_completed.load());
+          ready_handoff.set_value();
+        }
+      };
+
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  set_metrics_model(engine);
+  auto options = make_options();
+  options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
+  TestPDOOCScheduler prefill(&engine, options, /*start_services=*/false);
+  engine.forward = [](std::vector<Batch>& batch) {
+    EXPECT_EQ(batch.size(), 1u);
+    if (batch.size() != 1u) {
+      return ForwardOutput{};
+    }
+    for (size_t i = 0; i < batch[0].size(); ++i) {
+      Sequence* sequence = batch[0][i];
+      finish_prefill(sequence);
+      sequence->first_token() = RemoteToken{.token_id = 999};
+    }
+    return ForwardOutput{};
+  };
+  auto slow = make_request({11, 12}, "slow-response");
+  slow->state().stream = true;
+  slow->state().output_func =
+      [&slow_started, &slow_completed, released](const RequestOutput&) {
+        slow_started.set_value();
+        released.wait();
+        slow_completed = true;
+        return true;
+      };
+  auto ready = make_request({21, 22}, "ready-response");
+  ready->state().stream = true;
+  ready->state().output_func = [&ready_completed](const RequestOutput&) {
+    ready_completed = true;
+    return true;
+  };
+  prefill.admit_prefill(std::move(slow), &stub);
+  prefill.admit_prefill(std::move(ready), &stub);
+  prefill.step(absl::ZeroDuration());
+  EXPECT_EQ(started.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(ready_received.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready)
+      << "A ready request must not wait for another request's blocked "
+         "response.";
+  EXPECT_EQ(slow_received.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout);
+  release_slow.set_value();
+  EXPECT_EQ(slow_received.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  ASSERT_NO_FATAL_FAILURE(prefill.wait_prefill_completion());
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
   server.Stop(0);
   server.Join();
 }
