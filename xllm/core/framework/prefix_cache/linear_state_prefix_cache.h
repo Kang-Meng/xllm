@@ -32,12 +32,12 @@ namespace xllm {
 // machinery as the base; only match() differs.
 class LinearStatePrefixCache final : public PrefixCache {
  public:
-  LinearStatePrefixCache(uint32_t block_size, BlockHasherType hasher_type)
-      : PrefixCache(block_size, hasher_type) {}
+  explicit LinearStatePrefixCache(const Options& options)
+      : PrefixCache(options) {}
 
   // Walks the chain per block position: hit -> emplace + LRU-promote; miss
   // -> emplace invalid placeholder. Trims trailing misses. Reach in tokens
-  // is `returned.size() * block_size_`.
+  // is `returned.size() * options_.block_size()`.
   std::vector<Block> match(const Slice<int32_t>& token_ids,
                            const Slice<Block>& existed_shared_blocks = {},
                            const MMData& mm_data = MMData(),

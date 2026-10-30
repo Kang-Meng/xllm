@@ -130,3 +130,22 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
   target_link_options(dflash_async_input_builder_test PRIVATE
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
+
+cc_test(
+  NAME
+    adaptive_pruning_helpers_test
+  SRCS
+    adaptive_pruning_helpers_test.cpp
+  DEPS
+    :speculative
+    torch
+    glog::glog
+    GTest::gtest_main
+)
+target_link_libraries(adaptive_pruning_helpers_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)

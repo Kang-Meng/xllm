@@ -48,6 +48,14 @@ enum class PrefixCachePublishMode : int8_t {
   EXPLICIT,
 };
 
+// Heartbeat capacity for one block manager. free_blocks is physically free
+// blocks plus prefix-cache blocks that can still be evicted.
+struct BlockCapacitySnapshot {
+  size_t free_blocks = 0;
+  size_t used_blocks = 0;
+  size_t total_blocks = 0;
+};
+
 class BlockManager {
  public:
   struct Options {

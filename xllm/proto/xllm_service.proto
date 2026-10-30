@@ -33,6 +33,7 @@ import "rerank.proto";
 import "models.proto";
 import "anthropic.proto";
 import "common.proto";
+import "provider.proto";
 
 message HttpRequest {
 };
@@ -153,4 +154,11 @@ service XllmAPIService {
   rpc PauseHttp (HttpRequest) returns (HttpResponse);
   rpc Resume (ResumeRequest) returns (ResumeResponse);
   rpc ResumeHttp (HttpRequest) returns (HttpResponse);
+
+  // Drain no longer crosses this RPC boundary. Service records DRAINING and
+  // RELEASABLE in etcd and decides idleness from heartbeat request counts.
+
+  // Engine-wide KV journal page. This is not a prefill/decode handoff, so it
+  // lives on the service-facing engine port rather than DisaggPDService.
+  rpc GetKVCacheSnapshot (KVCacheSnapshotRequest) returns (KVCacheSnapshotPage);
 }; 

@@ -37,7 +37,11 @@ class CompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
   // brpc call_data needs to use shared_ptr
   void process_async_impl(std::shared_ptr<CompletionCall> call);
 
-  void process_async_rpc_impl(const proto::CompletionRequest* request);
+  // `done` stays pending until the scheduled request finishes or the Service
+  // closes the RPC. The request watches that controller and cancels itself.
+  void process_async_rpc_impl(const proto::CompletionRequest* request,
+                              brpc::Controller* controller,
+                              ::google::protobuf::Closure* done);
 
   void add_model_master(const std::string& model, LLMMaster* master);
 

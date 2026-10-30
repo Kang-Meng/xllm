@@ -47,6 +47,7 @@ limitations under the License.
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
@@ -169,8 +170,8 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
                              const proto::CompletionRequest* request,
                              proto::CompletionResponse* response,
                              ::google::protobuf::Closure* done) {
-  // Service RPC only acknowledges admission. The external Service owns the
-  // request in/ok/fail counters for this dispatch path, not the engine ACK.
+  // Hold `done` until the request finishes. The Service closes this RPC when
+  // its deadline expires, and the scheduled request cancels from that signal.
   brpc::ClosureGuard done_guard(done);
   if (!request || !response || !controller) {
     LOG(ERROR) << "brpc request | response | controller is null.";
@@ -179,7 +180,8 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
 
   if (completion_service_impl_) {
-    completion_service_impl_->process_async_rpc_impl(request);
+    completion_service_impl_->process_async_rpc_impl(
+        request, ctrl, done_guard.release());
   } else if (rec_completion_service_impl_) {
     request_in_metric(nullptr);
     auto arena = GetArenaWithCheck<CompletionCall>(response);
@@ -564,7 +566,8 @@ void APIService::ChatCompletions(::google::protobuf::RpcController* controller,
                                  const proto::ChatRequest* request,
                                  proto::ChatResponse* response,
                                  ::google::protobuf::Closure* done) {
-  // Service RPC only acknowledges admission; the Service owns completion.
+  // Hold `done` until the request finishes. Deadline cancellation is a closed
+  // RPC, which the Engine observes through the stored controller.
   brpc::ClosureGuard done_guard(done);
   if (!request || !response || !controller) {
     LOG(ERROR) << "brpc request | response | controller is null";
@@ -572,9 +575,28 @@ void APIService::ChatCompletions(::google::protobuf::RpcController* controller,
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  // Maybe need double check later
-
-  chat_service_impl_->process_async_rpc_impl(request);
+  // A VLM Engine has no ChatServiceImpl (ServiceImplFactory registers only
+  // the multimodal impls), but the Service may still route text-only chat
+  // here as the local instance. Hand those requests to the multimodal impl,
+  // which wraps text content and runs the VLM pipeline - mirroring the HTTP
+  // handler that parses all chat traffic (text included) via
+  // ServingMode::VLM. Before this branch existed, the unconditional
+  // chat_service_impl_->process_async_rpc_impl(request) dereferenced null
+  // on VLM and crashed the Engine process.
+  if (mm_chat_service_impl_) {
+    mm_chat_service_impl_->process_async_rpc_impl(
+        request, ctrl, done_guard.release());
+    return;
+  }
+  if (!chat_service_impl_) {
+    const char* msg =
+        "ChatCompletions brpc API is not available on this server.";
+    ctrl->SetFailed(msg);
+    LOG(ERROR) << msg;
+    return;
+  }
+  chat_service_impl_->process_async_rpc_impl(
+      request, ctrl, done_guard.release());
 }
 
 void APIService::ChatCompletionsHttp(
@@ -1958,6 +1980,28 @@ void APIService::ResumeHttp(::google::protobuf::RpcController* controller,
   std::string json_output;
   json2pb::ProtoMessageToJson(*resp_pb, &json_output, nullptr);
   ctrl->response_attachment().append(json_output);
+}
+
+void APIService::GetKVCacheSnapshot(
+    ::google::protobuf::RpcController* controller,
+    const proto::KVCacheSnapshotRequest* request,
+    proto::KVCacheSnapshotPage* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (request == nullptr || response == nullptr) {
+    return;
+  }
+  static_cast<void>(controller);
+  XServiceClient* client = XServiceClient::get_instance();
+  // The journal is process-wide. A missing client means this engine cannot
+  // return its resident hashes, so fail the snapshot instead of an empty
+  // success.
+  if (client == nullptr || !client->initialize_done()) {
+    response->set_status(proto::KV_SNAPSHOT_STATUS_INVALID_REQUEST);
+    response->set_status_message("KV event journal is unavailable");
+    return;
+  }
+  *response = client->get_kv_cache_snapshot(*request);
 }
 
 }  // namespace xllm

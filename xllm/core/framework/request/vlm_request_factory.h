@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,18 +52,26 @@ class Tokenizer;
 // limiter); the owner must outlive the factory.
 class VLMRequestFactory final {
  public:
+  // Turns a batch of request outputs into an xllm-service RPC response.
+  // Injected by VLMMaster so the factory can install a batch callback when
+  // service routing is enabled, without depending on VLMMaster directly.
+  using RpcResponseHandler =
+      std::function<std::vector<bool>(const std::vector<RequestOutput>&)>;
+
   VLMRequestFactory(MultimodalProcessorBase* processor,
                     ChatTemplate* chat_template,
                     const Tokenizer* tokenizer,
                     const ModelArgs* model_args,
                     const Options* options,
-                    RateLimiter* rate_limiter);
+                    RateLimiter* rate_limiter,
+                    RpcResponseHandler rpc_response_handler);
 
   // completion: a text prompt plus already-decoded multimodal data.
   std::shared_ptr<Request> create(std::string prompt,
                                   MMData mm_data,
                                   const RequestParams& sp,
-                                  OutputCallback callback);
+                                  OutputCallback callback,
+                                  std::optional<Call*> call = std::nullopt);
 
   // chat: decodes the multimodal payload and renders messages into a prompt,
   // then delegates to the completion overload above.
@@ -70,14 +79,16 @@ class VLMRequestFactory final {
                                   const RequestParams& sp,
                                   BinaryPayload payload,
                                   OutputCallback callback,
-                                  bool use_prompt_as_is = false);
+                                  bool use_prompt_as_is = false,
+                                  std::optional<Call*> call = std::nullopt);
 
  private:
   std::shared_ptr<Request> build_request(std::string prompt,
                                          std::vector<int32_t> prompt_tokens,
                                          MMData mm_data,
                                          const RequestParams& sp,
-                                         OutputCallback callback);
+                                         OutputCallback callback,
+                                         std::optional<Call*> call);
 
   // Builds the stopping checker, encoding any stop sequences. Returns
   // std::nullopt after firing an error callback when a stop sequence fails to
@@ -94,6 +105,7 @@ class VLMRequestFactory final {
   const ModelArgs* model_args_ = nullptr;
   const Options* options_ = nullptr;
   RateLimiter* rate_limiter_ = nullptr;
+  RpcResponseHandler rpc_response_handler_;
 };
 
 }  // namespace xllm

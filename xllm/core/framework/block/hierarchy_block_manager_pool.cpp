@@ -544,6 +544,31 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
   offload_block_pair_queues_.resize(host_block_managers_.size());
 }
 
+void HierarchyBlockManagerPool::reset_prefix_cache() {
+  BlockManagerPool::reset_prefix_cache();
+  if (!options_.enable_prefix_cache()) {
+    return;
+  }
+  for (auto& host_manager : host_block_managers_) {
+    if (host_manager != nullptr) {
+      host_manager->reset_prefix_cache();
+    }
+  }
+}
+
+std::vector<size_t> HierarchyBlockManagerPool::num_blocks_in_prefix_cache()
+    const {
+  std::vector<size_t> counts = BlockManagerPool::num_blocks_in_prefix_cache();
+  for (size_t dp_rank = 0; dp_rank < host_block_managers_.size(); ++dp_rank) {
+    if (dp_rank >= counts.size() || host_block_managers_[dp_rank] == nullptr) {
+      continue;
+    }
+    counts[dp_rank] +=
+        host_block_managers_[dp_rank]->num_blocks_in_prefix_cache();
+  }
+  return counts;
+}
+
 void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);

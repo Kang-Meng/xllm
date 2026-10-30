@@ -21,6 +21,7 @@ limitations under the License.
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -58,14 +59,15 @@ class PrefixCache {
   PrefixCache& operator=(const PrefixCache&) = delete;
   PrefixCache& operator=(PrefixCache&&) = delete;
 
-  explicit PrefixCache(uint32_t block_size,
-                       BlockHasherType hasher_type = BlockHasherType::TEXT)
-      : block_size_(block_size), hasher_type_(hasher_type), num_blocks_(0) {}
+  explicit PrefixCache(const Options& options)
+      : options_(options), num_blocks_(0) {}
+
+  const Options& options() const { return options_; }
 
   virtual ~PrefixCache();
 
   // Solid-prefix probe: walks the chain per block position, stops on the
-  // first miss. Reach in tokens is `returned.size() * block_size_`.
+  // first miss. Reach in tokens is `returned.size() * options_.block_size()`.
   // When `block_hashes` covers all matchable blocks it is consumed as-is;
   // otherwise the chain is computed on the fly from `token_ids` / `mm_data`.
   virtual std::vector<Block> match(
@@ -201,8 +203,9 @@ class PrefixCache {
   };
 
   DNodeList lru_lst_;
-  uint32_t block_size_;
-  BlockHasherType hasher_type_;
+  // Construction input. block_size is the hash stride, hasher_type selects
+  // the chain, and block_type is what the journal filters.
+  Options options_;
   size_t num_blocks_ = 0;
   size_t num_evictable_ = 0;
   std::unordered_map<XXH3Key, Node*, FixedStringKeyHash, FixedStringKeyEqual>

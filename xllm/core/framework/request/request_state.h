@@ -114,7 +114,8 @@ class RequestState final {
                bool enable_schedule_overlap,
                const OutputFunc& output_func,
                const OutputsFunc& outputs_func,
-               const std::string& decode_address = "");
+               const std::string& decode_address = "",
+               std::optional<Call*> call = std::nullopt);
 
   // for profiling run, only provide prompt tokens
   RequestState(const std::vector<int32_t>& prompt_tokens);
@@ -181,6 +182,7 @@ class RequestState final {
   // P-side link generation observed before requesting a Decode reservation.
   uint64_t decode_link_epoch = 0;
 
+  // Canonical cache namespace preserved across P/D request construction.
   torch::Tensor input_embedding;
 
   // multimodal

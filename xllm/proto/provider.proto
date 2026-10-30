@@ -1,0 +1,687 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+option go_package = "jd.com/jd-infer/xllm;xllm";
+package xllm.proto;
+
+// Provider contract version 1 is the shared xLLM Service V2 wire schema. The
+// Service validates all enum values and required semantic fields fail closed.
+enum ProviderId {
+  PROVIDER_ID_UNSPECIFIED = 0;
+  PROVIDER_ID_XLLM_NATIVE = 1;
+  PROVIDER_ID_VLLM_ASCEND = 2;
+}
+
+enum ProviderCapability {
+  PROVIDER_CAPABILITY_UNSPECIFIED = 0;
+  PROVIDER_CAPABILITY_AGGREGATED = 1;
+  PROVIDER_CAPABILITY_REMOTE_PD_PULL = 2;
+  PROVIDER_CAPABILITY_REMOTE_PD_LAYERWISE_PUSH = 3;
+  PROVIDER_CAPABILITY_LOCAL_PREFILL_DECODE = 4;
+  PROVIDER_CAPABILITY_MIXED_PREFILL_DECODE_ACCOUNTING = 5;
+  PROVIDER_CAPABILITY_PREFILL_ONLY = 6;
+  PROVIDER_CAPABILITY_NATIVE_RESERVATION = 7;
+  PROVIDER_CAPABILITY_ATTEMPT_QUERY = 8;
+  PROVIDER_CAPABILITY_CANCEL_FENCE = 9;
+  PROVIDER_CAPABILITY_ENGINE_LOCAL_DEADLINE = 10;
+  PROVIDER_CAPABILITY_STRUCTURED_ADMISSION = 11;
+  PROVIDER_CAPABILITY_PER_DP_STATE = 12;
+  PROVIDER_CAPABILITY_DEEP_HEALTH = 13;
+  PROVIDER_CAPABILITY_SELF_FENCING = 14;
+  PROVIDER_CAPABILITY_DRAIN = 15;
+  PROVIDER_CAPABILITY_PREFIX_EVENTS = 16;
+  PROVIDER_CAPABILITY_EXTERNAL_KV_STORE = 17;
+  PROVIDER_CAPABILITY_KV_OFFLOAD = 18;
+  // Reserved for a future contract version with negotiated capability support.
+  // Contract v1 producers must not publish enum values unknown to older v1
+  // Services: Native KV totals and vLLM admission totals are authoritative by
+  // the established v1 provider semantics.
+  PROVIDER_CAPABILITY_AUTHORITATIVE_CAPACITY = 19;
+}
+
+enum EngineRole {
+  ENGINE_ROLE_UNSPECIFIED = 0;
+  ENGINE_ROLE_AGGREGATED = 1;
+  ENGINE_ROLE_PREFILL = 2;
+  ENGINE_ROLE_DECODE = 3;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_AGGREGATED = 1;
+  EXECUTION_MODE_REMOTE_PD = 2;
+  EXECUTION_MODE_LOCAL_PREFILL_DECODE = 3;
+  EXECUTION_MODE_PREFILL_ONLY = 4;
+}
+
+enum TransferMode {
+  TRANSFER_MODE_UNSPECIFIED = 0;
+  TRANSFER_MODE_NONE = 1;
+  TRANSFER_MODE_PULL = 2;
+  TRANSFER_MODE_LAYERWISE_PUSH = 3;
+}
+
+enum SelectionOrder {
+  SELECTION_ORDER_UNSPECIFIED = 0;
+  SELECTION_ORDER_SINGLE = 1;
+  SELECTION_ORDER_P_FIRST = 2;
+  SELECTION_ORDER_D_FIRST = 3;
+  SELECTION_ORDER_P_ONLY = 4;
+  SELECTION_ORDER_D_ONLY = 5;
+}
+
+enum BindingStage {
+  BINDING_STAGE_UNSPECIFIED = 0;
+  BINDING_STAGE_AT_SUBMIT = 1;
+  BINDING_STAGE_BEFORE_PREFILL = 2;
+}
+
+enum ApiKind {
+  API_KIND_UNSPECIFIED = 0;
+  API_KIND_CHAT_COMPLETIONS = 1;
+  API_KIND_COMPLETIONS = 2;
+  API_KIND_ANTHROPIC_MESSAGES = 3;
+}
+
+enum TokenCountQuality {
+  TOKEN_COUNT_QUALITY_UNSPECIFIED = 0;
+  TOKEN_COUNT_QUALITY_EXACT = 1;
+  TOKEN_COUNT_QUALITY_BOUNDED = 2;
+  TOKEN_COUNT_QUALITY_UNKNOWN = 3;
+}
+
+enum EngineLifecycle {
+  ENGINE_LIFECYCLE_UNSPECIFIED = 0;
+  ENGINE_LIFECYCLE_STARTING = 1;
+  ENGINE_LIFECYCLE_READY = 2;
+  ENGINE_LIFECYCLE_DRAINING = 3;
+  ENGINE_LIFECYCLE_FENCED = 4;
+  ENGINE_LIFECYCLE_MEMBERSHIP_LOST = 5;
+}
+
+// Provider lifecycle commands are Engine-local. The deployment actuator owns
+// CREATE/TERMINATE; an Engine only accepts drain admission changes.
+enum ProviderLifecycleAction {
+  PROVIDER_LIFECYCLE_ACTION_UNSPECIFIED = 0;
+  PROVIDER_LIFECYCLE_ACTION_BEGIN_DRAIN = 1;
+  PROVIDER_LIFECYCLE_ACTION_CANCEL_DRAIN = 2;
+}
+
+enum ProviderLifecycleCode {
+  PROVIDER_LIFECYCLE_CODE_UNSPECIFIED = 0;
+  PROVIDER_LIFECYCLE_CODE_NOT_FOUND = 1;
+  PROVIDER_LIFECYCLE_CODE_ACCEPTED = 2;
+  PROVIDER_LIFECYCLE_CODE_IN_PROGRESS = 3;
+  PROVIDER_LIFECYCLE_CODE_SUCCEEDED = 4;
+  PROVIDER_LIFECYCLE_CODE_RETRYABLE_ERROR = 5;
+  PROVIDER_LIFECYCLE_CODE_TERMINAL_ERROR = 6;
+  PROVIDER_LIFECYCLE_CODE_FENCED = 7;
+  PROVIDER_LIFECYCLE_CODE_CONFLICT = 8;
+  PROVIDER_LIFECYCLE_CODE_INVALID = 9;
+}
+
+enum EngineOwnership {
+  ENGINE_OWNERSHIP_UNSPECIFIED = 0;
+  ENGINE_OWNERSHIP_OWNED = 1;
+  ENGINE_OWNERSHIP_UNCERTAIN = 2;
+  ENGINE_OWNERSHIP_FENCED = 3;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNKNOWN = 0;
+  HEALTH_STATUS_HEALTHY = 1;
+  HEALTH_STATUS_UNHEALTHY = 2;
+}
+
+enum StateQuality {
+  STATE_QUALITY_UNSPECIFIED = 0;
+  STATE_QUALITY_FULL = 1;
+  STATE_QUALITY_PARTIAL = 2;
+  STATE_QUALITY_STALE = 3;
+}
+
+// KV events are a soft routing observation. They never grant ownership,
+// allocation, admission, or transfer authority.
+enum KVEventKind {
+  KV_EVENT_KIND_UNSPECIFIED = 0;
+  KV_EVENT_KIND_STORED = 1;
+  KV_EVENT_KIND_REMOVED = 2;
+  KV_EVENT_KIND_CLEARED = 3;
+}
+
+enum KVCacheTier {
+  KV_CACHE_TIER_UNSPECIFIED = 0;
+  KV_CACHE_TIER_HBM = 1;
+  KV_CACHE_TIER_HOST = 2;
+  KV_CACHE_TIER_SSD = 3;
+  KV_CACHE_TIER_STORE = 4;
+}
+
+enum KVEventReason {
+  KV_EVENT_REASON_UNSPECIFIED = 0;
+  KV_EVENT_REASON_PREFIX_PUBLISHED = 1;
+  KV_EVENT_REASON_CAPACITY_EVICTED = 2;
+  KV_EVENT_REASON_EXPLICIT_REMOVED = 3;
+  KV_EVENT_REASON_CACHE_RESET = 4;
+  KV_EVENT_REASON_OFFLOADED = 5;
+  KV_EVENT_REASON_RESTORED = 6;
+  KV_EVENT_REASON_PROCESS_FENCED = 7;
+}
+
+enum KVSnapshotStatus {
+  KV_SNAPSHOT_STATUS_UNSPECIFIED = 0;
+  KV_SNAPSHOT_STATUS_OK = 1;
+  KV_SNAPSHOT_STATUS_INVALID_REQUEST = 2;
+  KV_SNAPSHOT_STATUS_STALE_EPOCH = 3;
+  KV_SNAPSHOT_STATUS_EXPIRED = 4;
+  KV_SNAPSHOT_STATUS_CAPACITY_EXCEEDED = 5;
+}
+
+// Stable fail-closed reasons shared by the Service and every provider adapter.
+// Detailed messages are diagnostic only; callers branch on this enum.
+enum ProviderContractError {
+  PROVIDER_CONTRACT_ERROR_UNSPECIFIED = 0;
+  PROVIDER_CONTRACT_ERROR_OK = 1;
+  PROVIDER_CONTRACT_ERROR_UNSUPPORTED_CONTRACT_VERSION = 2;
+  PROVIDER_CONTRACT_ERROR_MISSING_REQUIRED_FIELD = 3;
+  PROVIDER_CONTRACT_ERROR_UNKNOWN_ENUM_VALUE = 4;
+  PROVIDER_CONTRACT_ERROR_DUPLICATE_ENTRY = 5;
+  PROVIDER_CONTRACT_ERROR_INVALID_MODE_SPEC = 6;
+  PROVIDER_CONTRACT_ERROR_MISSING_CAPABILITY = 7;
+  PROVIDER_CONTRACT_ERROR_MODE_NOT_OPEN = 8;
+  PROVIDER_CONTRACT_ERROR_DESCRIPTOR_MISMATCH = 9;
+  PROVIDER_CONTRACT_ERROR_INVALID_SELECTED_ROLES = 10;
+  PROVIDER_CONTRACT_ERROR_INVALID_STATE = 11;
+  PROVIDER_CONTRACT_ERROR_DUPLICATE_ADAPTER = 12;
+  PROVIDER_CONTRACT_ERROR_ENCODING_FAILED = 13;
+}
+
+// Admission is deliberately a three-way result. Callers may retry temporary
+// failures on another eligible holder, but permanent failures are properties
+// of the request/profile contract and must not be hidden by retry loops.
+enum AdmissionDisposition {
+  ADMISSION_DISPOSITION_UNSPECIFIED = 0;
+  ADMISSION_DISPOSITION_ACCEPTED = 1;
+  ADMISSION_DISPOSITION_PERMANENTLY_INFEASIBLE = 2;
+  ADMISSION_DISPOSITION_TEMPORARILY_UNAVAILABLE = 3;
+}
+
+// Stable resource-protocol reasons. Free-form messages are diagnostics only;
+// request control flow branches on this enum and AdmissionDisposition.
+enum AdmissionReason {
+  ADMISSION_REASON_UNSPECIFIED = 0;
+  ADMISSION_REASON_NONE = 1;
+  ADMISSION_REASON_INVALID_REQUEST = 2;
+  ADMISSION_REASON_CONTEXT_TOO_LARGE = 3;
+  ADMISSION_REASON_KV_PERMANENTLY_INFEASIBLE = 4;
+  ADMISSION_REASON_UNSUPPORTED_KV_LAYOUT = 5;
+  ADMISSION_REASON_ATTEMPT_CONFLICT = 6;
+  ADMISSION_REASON_KV_TEMPORARILY_INSUFFICIENT = 7;
+  ADMISSION_REASON_DECODE_CREDIT_EXHAUSTED = 8;
+  ADMISSION_REASON_SLOT_EXHAUSTED = 9;
+  ADMISSION_REASON_CAPACITY_CHANGED = 10;
+  ADMISSION_REASON_STALE_INCARNATION = 11;
+  ADMISSION_REASON_ENGINE_DRAINING = 12;
+  ADMISSION_REASON_TOMBSTONE_CAPACITY = 13;
+  ADMISSION_REASON_CANCEL_FENCE_CAPACITY = 14;
+  ADMISSION_REASON_RECOVERY_FENCE_PRESSURE = 15;
+  ADMISSION_REASON_CANCELLED_BEFORE_CREATE = 16;
+  ADMISSION_REASON_RESERVATION_EXPIRED = 17;
+  ADMISSION_REASON_TRANSFER_NOT_STARTED = 18;
+  ADMISSION_REASON_HANDOFF_REJECTED = 19;
+  ADMISSION_REASON_DEADLINE_EXCEEDED = 20;
+  ADMISSION_REASON_INTERNAL_ERROR = 21;
+  ADMISSION_REASON_ATTEMPT_TERMINAL = 22;
+  ADMISSION_REASON_CANCELLED = 23;
+  ADMISSION_REASON_ATTEMPT_NOT_FOUND = 24;
+  ADMISSION_REASON_LINK_UNAVAILABLE = 25;
+}
+
+enum AttemptLifecycleState {
+  ATTEMPT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  ATTEMPT_LIFECYCLE_STATE_ABSENT = 1;
+  ATTEMPT_LIFECYCLE_STATE_RESERVED = 2;
+  ATTEMPT_LIFECYCLE_STATE_RECEIVING = 3;
+  ATTEMPT_LIFECYCLE_STATE_GENERATION_COMMITTED = 4;
+  ATTEMPT_LIFECYCLE_STATE_RUNNING = 5;
+  ATTEMPT_LIFECYCLE_STATE_DONE = 6;
+  ATTEMPT_LIFECYCLE_STATE_CANCELLED = 7;
+  ATTEMPT_LIFECYCLE_STATE_EXPIRED = 8;
+  ATTEMPT_LIFECYCLE_STATE_FAILED = 9;
+  ATTEMPT_LIFECYCLE_STATE_CANCELLED_BEFORE_CREATE = 10;
+  ATTEMPT_LIFECYCLE_STATE_LOCAL_GENERATION_COMMITTED = 11;
+}
+
+message RequestAttemptKey {
+  string request_uid = 1;
+  optional uint64 attempt_seq = 2;
+  string incarnation_id = 3;
+}
+
+message ExecutionAttemptId {
+  string request_uid = 1;
+  optional uint64 attempt_seq = 2;
+}
+
+message AdmissionResult {
+  AdmissionDisposition disposition = 1;
+  AdmissionReason reason = 2;
+  AttemptLifecycleState state = 3;
+  bool replayed = 4;
+  optional uint64 reservation_ttl_ms = 5;
+  // Per-rank admission evidence is not part of the V2 delivery until the
+  // native and aggregated admission paths both produce and consume it.
+  reserved 6;
+  reserved "per_rank";
+  optional uint64 retry_after_ms = 7;
+}
+
+enum ExecutionHoldKind {
+  EXECUTION_HOLD_KIND_UNSPECIFIED = 0;
+  EXECUTION_HOLD_KIND_REMOTE_D_RESERVATION = 1;
+  EXECUTION_HOLD_KIND_LOCAL_DECODE_SUBMISSION = 2;
+  EXECUTION_HOLD_KIND_AGGREGATED_EXECUTION = 3;
+}
+
+enum ExecutionHoldProof {
+  EXECUTION_HOLD_PROOF_UNSPECIFIED = 0;
+  EXECUTION_HOLD_PROOF_OUTCOME_UNKNOWN = 1;
+  EXECUTION_HOLD_PROOF_PROVEN_PRECOMMIT = 2;
+  EXECUTION_HOLD_PROOF_GENERATION_COMMITTED = 3;
+  EXECUTION_HOLD_PROOF_TERMINAL = 4;
+}
+
+enum HolderConvergenceProof {
+  HOLDER_CONVERGENCE_PROOF_UNSPECIFIED = 0;
+  HOLDER_CONVERGENCE_PROOF_TERMINAL_OUTCOME = 1;
+  HOLDER_CONVERGENCE_PROOF_CANCEL_FENCE_ACK = 2;
+  HOLDER_CONVERGENCE_PROOF_SELF_FENCED = 3;
+  HOLDER_CONVERGENCE_PROOF_PROCESS_TERMINATED = 4;
+  HOLDER_CONVERGENCE_PROOF_HARD_TIME_BOUND = 5;
+  // Query ABSENT is represented so callers cannot accidentally reinterpret it
+  // as one of the proofs above; cleanup validation always rejects it.
+  HOLDER_CONVERGENCE_PROOF_QUERY_ABSENT = 6;
+}
+
+message ExecutionHolder {
+  string engine_uid = 1;
+  string incarnation_id = 2;
+}
+
+message ExecutionResourceHold {
+  ExecutionHoldKind kind = 1;
+  ExecutionAttemptId attempt = 2;
+  string coordinator_incarnation_id = 3;
+  repeated ExecutionHolder potential_holders = 4;
+  optional ExecutionHolder confirmed_holder = 5;
+  optional ExecutionHolder likely_holder = 6;
+  ExecutionHoldProof proof = 7;
+}
+
+message ProviderIdentity {
+  string engine_uid = 1;
+  ProviderId provider_id = 3;
+  string runtime_family = 4;
+  string runtime_version = 5;
+  string plugin_version = 6;
+  string hardware_runtime_version = 7;
+  uint32 protocol_version = 8;
+}
+
+message ProviderEndpoint {
+  string control_transport = 1;
+  string data_transport = 2;
+  string address = 3;
+}
+
+message ExecutionModeSpec {
+  ExecutionMode mode = 1;
+  TransferMode transfer_mode = 2;
+  SelectionOrder selection_order = 3;
+  BindingStage binding_stage = 4;
+  bool p_selection_delegated = 5;
+}
+
+message ServingDescriptor {
+  EngineRole role = 1;
+  repeated ExecutionModeSpec execution_modes = 2;
+  repeated string api_features = 3;
+}
+
+message ModelDescriptor {
+  string model_revision = 1;
+  string tokenizer_revision = 2;
+  string chat_template_digest = 3;
+  string quantization = 4;
+  // Digest of the complete tokenizer + template rendering contract.
+  string renderer_digest = 5;
+}
+
+message TopologyDescriptor {
+  string soc = 1;
+  uint32 device_count = 2;
+  uint32 tp = 3;
+  uint32 dp = 4;
+  uint32 pp = 5;
+  uint32 ep = 6;
+  uint32 cp = 7;
+  // Physical super-node id this engine belongs to. Empty means unrestricted.
+  string super_node_id = 8;
+}
+
+message KVDescriptor {
+  string kv_layout_digest = 1;
+  string cache_dtype = 2;
+  uint32 block_size = 3;
+  repeated string cache_groups = 4;
+  string head_shard_mapping_digest = 5;
+  string connector = 6;
+  string connector_version = 7;
+  repeated TransferMode transfer_modes = 8;
+  reserved 9;
+  reserved "storage";
+  uint32 hash_version = 11;
+  uint64 hash_seed = 12;
+  // Exact logical KV bytes owned by one transfer rank for one prompt token.
+  // Native Engines publish this only when the allocated layout can be derived
+  // without an accelerator- or connector-specific estimate. Absence means the
+  // Router must use an explicit deployment calibration or fail closed.
+  optional uint64 logical_bytes_per_token = 13;
+  // Native PUSH semantic compatibility, independent of local logical block
+  // size, CP/KV split and head placement. Engine binds model/cache semantics
+  // and isolation identity into this digest; actual byte coverage is still
+  // negotiated by the P/D link. Local hashing MUST continue using fields 3/10.
+  // Absent on older Engines: peers then require the legacy exact KV contract.
+  string transfer_compatibility_digest = 14;
+}
+
+message SchedulerDescriptor {
+  string scheduler_class = 1;
+  uint32 max_num_seqs = 2;
+  uint64 max_num_batched_tokens = 3;
+  string scheduler_policy_digest = 4;
+}
+
+// A drain is complete only when admission is closed and every Engine-local
+// source of owned or in-flight work is zero.
+message ProviderDrainProof {
+  bool admission_closed = 1;
+  uint64 prefill_queue = 2;
+  uint64 active_transfers = 3;
+  uint64 active_reservations = 4;
+  uint64 decode_sequences = 5;
+  uint64 pending_output = 6;
+  uint64 pending_cleanup = 7;
+}
+
+message ProviderLifecycleCommand {
+  uint32 schema_version = 1;
+  string operation_id = 2;
+  string leader_incarnation = 3;
+  uint64 leader_epoch = 4;
+  uint64 desired_generation = 5;
+  string engine_uid = 6;
+  string engine_incarnation = 7;
+  ProviderLifecycleAction action = 8;
+}
+
+message ProviderLifecycleResponse {
+  ProviderLifecycleCode code = 1;
+  string operation_id = 2;
+  ProviderLifecycleAction action = 3;
+  string leader_incarnation = 4;
+  uint64 leader_epoch = 5;
+  uint64 desired_generation = 6;
+  string engine_uid = 7;
+  string engine_incarnation = 8;
+  EngineLifecycle lifecycle = 9;
+  ProviderDrainProof drain = 10;
+  bool replayed = 11;
+  string message = 12;
+}
+
+message ProviderDescriptor {
+  uint32 contract_version = 1;
+  ProviderIdentity identity = 2;
+  ProviderEndpoint endpoint = 3;
+  ServingDescriptor serving = 4;
+  ModelDescriptor model = 5;
+  TopologyDescriptor topology = 6;
+  KVDescriptor kv = 7;
+  SchedulerDescriptor scheduler = 8;
+  repeated ProviderCapability capabilities = 9;
+  string profile_digest = 10;
+}
+
+message CanonicalRequest {
+  uint32 contract_version = 1;
+  string global_request_id = 2;
+  string trace_id = 3;
+  string request_uid = 4;
+  optional uint64 attempt_seq = 5;
+  ApiKind api_kind = 6;
+  string model_revision = 7;
+  bool strict = 8;
+  string canonical_payload_schema = 9;
+  bytes canonical_payload = 10;
+  uint64 effective_max_new_tokens = 11;
+  uint32 n = 12;
+  uint32 best_of = 13;
+  int32 priority = 14;
+  uint64 remaining_deadline_ms = 15;
+  repeated ProviderCapability required_capabilities = 16;
+  repeated string required_api_features = 17;
+  optional uint64 ttft_slo_ms = 18;
+  optional uint64 tpot_slo_ms = 19;
+}
+
+message EncodedRequest {
+  ProviderId provider_id = 1;
+  TokenCountQuality token_count_quality = 2;
+  uint64 prompt_tokens = 3;
+  uint64 prompt_tokens_upper_bound = 4;
+  string renderer_digest = 5;
+  bytes provider_payload = 6;
+}
+
+message PerDpEngineState {
+  uint32 dp_rank = 1;
+  optional uint64 running = 2;
+  optional uint64 waiting_capacity = 3;
+  optional uint64 waiting_deferred = 4;
+  optional double kv_used_ratio = 5;
+  optional uint64 kv_free_blocks = 6;
+  optional uint64 admission_credit = 7;
+  // Authoritative capacity ceilings for this exact Engine incarnation. Free
+  // values alone cannot distinguish reflected dispatch from real shrinkage.
+  optional uint64 kv_total_blocks = 8;
+  optional uint64 admission_capacity = 9;
+}
+
+message EngineState {
+  string engine_uid = 1;
+  // Service assigns the receive-time order. Engines do not report a sequence
+  // or an observation timestamp.
+  reserved 3, 4;
+  reserved "state_seq", "observed_at_unix_ms";
+  EngineLifecycle lifecycle = 5;
+  EngineOwnership ownership = 6;
+  HealthStatus shallow_health = 7;
+  HealthStatus deep_health = 8;
+  repeated PerDpEngineState per_dp = 9;
+  // Dynamic performance ranking is not part of the current V2 delivery.
+  reserved 10, 11, 12, 13;
+  reserved "latency_histogram_delta", "throughput_tokens_per_second",
+      "connector_state", "failure_counters";
+  StateQuality state_quality = 14;
+  ProviderId provider_id = 15;
+  string profile_digest = 16;
+  string model_revision = 17;
+  optional uint64 heartbeat_age_ms_at_publish = 18;
+  optional uint64 state_age_ms_at_publish = 19;
+  optional ProviderDrainProof drain = 20;
+  optional string lifecycle_operation_id = 21;
+  optional uint64 lifecycle_leader_epoch = 22;
+  optional uint64 lifecycle_desired_generation = 23;
+}
+
+message ProviderEngineKey {
+  ProviderId provider_id = 1;
+  string profile_digest = 2;
+  string engine_uid = 3;
+}
+
+// Identity and ordering domain for one Engine KV stream.
+message KVStreamIdentity {
+  ProviderEngineKey engine = 1;
+  string model_revision = 2;
+  uint64 cache_epoch = 4;
+}
+
+message KVBlockEntry {
+  bytes block_hash = 1;
+  reserved 2, 3, 4, 5, 6, 7, 8;
+  reserved "parent_hash", "token_begin", "token_end", "cache_group", "tier",
+      "dp_rank", "device_rank";
+}
+
+message KVEvent {
+  uint64 event_seq = 1;
+  KVEventKind kind = 2;
+  optional KVBlockEntry block = 3;
+  KVEventReason reason = 4;
+  optional uint64 event_age_ms_at_publish = 5;
+}
+
+// Engine -> current master. commit_version is the resident version after this
+// batch was applied locally. A failed earlier commit stays attached until the
+// Service version covers it.
+message KVEventBatch {
+  uint32 contract_version = 1;
+  KVStreamIdentity identity = 2;
+  repeated KVEvent events = 3;
+  reserved 4, 5, 6;
+  reserved "gap_before_events", "last_event_seq", "batch_age_ms_at_publish";
+  // Resident version committed with this batch. Strictly increases per batch.
+  uint64 commit_version = 7;
+  // Version of the previous committed batch. Zero means this is the first.
+  uint64 previous_commit_version = 8;
+  // Present when an earlier commit was not delivered. Service pulls a snapshot
+  // when this is newer than its local version.
+  optional uint64 failed_commit_version = 9;
+  optional string failed_commit_error = 10;
+}
+
+message KVCacheSnapshotRequest {
+  uint32 contract_version = 1;
+  KVStreamIdentity identity = 2;
+  reserved 3, 4, 5, 6, 7;
+  reserved "snapshot_id", "cursor", "max_entries", "max_bytes",
+      "max_generation_time_ms";
+}
+
+message KVCacheSnapshotPage {
+  uint32 contract_version = 1;
+  KVSnapshotStatus status = 2;
+  string status_message = 3;
+  KVStreamIdentity identity = 4;
+  reserved 5, 6, 8, 9;
+  reserved "snapshot_id", "base_event_seq", "next_cursor", "done";
+  // Full resident hash set copied under the same lock as commit_version.
+  repeated KVBlockEntry entries = 7;
+  uint64 serialized_bytes = 10;
+  uint64 commit_version = 11;
+}
+
+enum EnsureLinkDisposition {
+  ENSURE_LINK_DISPOSITION_UNSPECIFIED = 0;
+  ENSURE_LINK_DISPOSITION_READY = 1;
+  ENSURE_LINK_DISPOSITION_CONNECTING = 2;
+  ENSURE_LINK_DISPOSITION_DEGREE_LIMITED = 3;
+  ENSURE_LINK_DISPOSITION_NEGATIVE_CACHED = 4;
+  ENSURE_LINK_DISPOSITION_FENCED = 5;
+  ENSURE_LINK_DISPOSITION_INCOMPATIBLE = 6;
+  ENSURE_LINK_DISPOSITION_INVALID = 7;
+  ENSURE_LINK_DISPOSITION_FAILED = 8;
+  ENSURE_LINK_DISPOSITION_DRAINING = 9;
+}
+
+message EnsureLinkSpec {
+  uint32 contract_version = 1;
+  ProviderEngineKey prefill = 2;
+  ProviderEngineKey decode = 3;
+  string model_revision = 4;
+  string compatibility_proof = 5;
+  uint64 adjacency_generation = 6;
+  TransferMode transfer_mode = 7;
+  uint64 coordinator_epoch = 8;
+}
+
+message EnsureLinkResult {
+  EnsureLinkDisposition disposition = 1;
+  uint64 link_generation = 2;
+  optional uint64 retry_after_ms = 3;
+  bool replayed = 4;
+  string reason = 5;
+}
+
+message SelectedEngineRole {
+  EngineRole role = 1;
+  string engine_uid = 2;
+  string incarnation_id = 3;
+  uint32 order_index = 4;
+}
+
+message PlanResourceEstimate {
+  uint64 prompt_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 kv_blocks = 3;
+}
+
+message DeadlineBudget {
+  uint64 remaining_ms = 1;
+  uint64 submit_ms = 2;
+  uint64 handoff_ms = 3;
+  uint64 output_ms = 4;
+}
+
+message ExecutionPlan {
+  // Version 1 covers the original Provider execution envelope. Native
+  // REMOTE_PD uses version 2 so old readers reject routes whose additive
+  // Coordinator/adjacency/link generation fields they cannot validate.
+  uint32 contract_version = 1;
+  string request_uid = 2;
+  optional uint64 attempt_seq = 3;
+  ProviderId provider_id = 4;
+  ExecutionMode mode = 5;
+  TransferMode transfer_mode = 6;
+  SelectionOrder selection_order = 7;
+  repeated SelectedEngineRole selected_roles = 8;
+  bool p_selection_delegated = 9;
+  BindingStage binding_stage = 10;
+  string compatibility_proof = 11;
+  bytes provider_payload = 12;
+  reserved 13;
+  reserved "prediction";
+  DeadlineBudget deadline_budget = 14;
+  repeated string reason_codes = 15;
+  repeated ProviderCapability required_capabilities = 16;
+  PlanResourceEstimate resource_estimate = 17;
+  double score = 18;
+}
+
+

@@ -31,6 +31,21 @@ class thread_pool;
 
 namespace xllm {
 
+// Keep lifecycle verbosity owned by glog even when a caller includes Torch,
+// whose non-glog build can redefine VLOG/VLOG_IS_ON. The implementation is
+// compiled without Torch headers; --v=1 controls these ordinary log records.
+bool level_one_trace_enabled();
+void log_level_one_trace(const char* file,
+                         int32_t line,
+                         const std::string& message);
+
+struct VerboseTraceStats {
+  uint64_t attempted = 0;
+  uint64_t queue_overruns = 0;
+  uint64_t queue_capacity = 0;
+  bool enabled = false;
+};
+
 [[nodiscard]] std::string resolve_verbose_trace_log_path(
     const std::string& configured_path,
     int32_t nnodes,
@@ -53,11 +68,17 @@ class VerboseTraceLogger final {
   void initialize(bool enabled,
                   const std::string& file_path,
                   int32_t max_size_mb,
-                  int32_t max_files);
+                  int32_t max_files,
+                  int32_t queue_size = 8192);
 
   bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
 
   void log(const std::string& entry);
+
+  // A non-zero queue_overruns value means at least one lifecycle entry was
+  // overwritten to keep serving threads non-blocking. Validation gates use
+  // this to reject an incomplete trace instead of treating it as evidence.
+  VerboseTraceStats stats() const;
 
   void shutdown();
 
@@ -65,9 +86,18 @@ class VerboseTraceLogger final {
   VerboseTraceLogger() = default;
   ~VerboseTraceLogger();
 
+  struct State;
   std::atomic<bool> enabled_{false};
-  std::shared_ptr<spdlog::details::thread_pool> thread_pool_;
-  std::shared_ptr<spdlog::logger> logger_;
+  // shutdown() waits only for calls that crossed the enabled fast path. This
+  // keeps the disabled cost at one relaxed load while making final attempted /
+  // overrun counters a closed physical accounting interval.
+  std::atomic<uint64_t> active_log_calls_{0};
+  std::atomic<uint64_t> attempted_{0};
+  std::atomic<uint64_t> last_queue_overruns_{0};
+  std::atomic<uint64_t> last_queue_capacity_{0};
+  // C++17 atomic shared_ptr free functions protect log() from racing shutdown.
+  // An in-flight call retains its snapshot until spdlog copies the entry.
+  std::shared_ptr<State> state_;
 };
 
 namespace detail {

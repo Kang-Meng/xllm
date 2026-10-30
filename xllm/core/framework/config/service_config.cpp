@@ -58,6 +58,10 @@ DEFINE_int32(num_response_handling_threads,
              4,
              "Number of threads for handling responses.");
 
+DEFINE_int32(output_delivery_rpc_timeout_ms,
+             100,
+             "Hard timeout for one Generations RPC attempt.");
+
 DEFINE_int32(health_check_interval_ms,
              3000,
              "Worker health check interval in milliseconds.");
@@ -116,6 +120,7 @@ void ServiceConfig::from_flags() {
   }
   XLLM_CONFIG_ASSIGN_FROM_FLAG(num_request_handling_threads);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(num_response_handling_threads);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(output_delivery_rpc_timeout_ms);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(health_check_interval_ms);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_json_object_output);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_verbose_trace_log);
@@ -137,6 +142,7 @@ void ServiceConfig::from_json(const JsonReader& json) {
   // propagated to workers and may be exported for diagnostics.
   XLLM_CONFIG_ASSIGN_FROM_JSON(num_request_handling_threads);
   XLLM_CONFIG_ASSIGN_FROM_JSON(num_response_handling_threads);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(output_delivery_rpc_timeout_ms);
   XLLM_CONFIG_ASSIGN_FROM_JSON(health_check_interval_ms);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_json_object_output);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_verbose_trace_log);
@@ -166,6 +172,8 @@ void ServiceConfig::append_config_json(
       config_json, default_config, num_request_handling_threads);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, num_response_handling_threads);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, output_delivery_rpc_timeout_ms);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, health_check_interval_ms);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

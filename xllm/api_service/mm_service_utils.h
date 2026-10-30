@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "butil/base64.h"
+#include "chat.pb.h"
 #include "common.pb.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
@@ -174,6 +175,55 @@ bool build_messages(const google::protobuf::RepeatedPtrField<
 
   return true;
 };
+
+// Wraps a service-routed brpc ChatRequest's text-only messages into the
+// multimodal Message shape served by a VLM Engine. Each ChatMessage carries
+// its content as a plain string, while the VLM path expects MMContentVec
+// content; each string becomes a single "text" content item, the same shape
+// the ServingMode::VLM HTTP parser produces for a text-only request body.
+// Tool calls, tool_call_id and reasoning_content ride along unchanged so
+// multi-turn conversations and tool flows keep working. There is no image
+// here, so no image_limit check applies.
+inline std::vector<Message> build_text_only_messages(
+    const google::protobuf::RepeatedPtrField<proto::ChatMessage>&
+        req_messages) {
+  std::vector<Message> out_messages;
+  out_messages.reserve(req_messages.size());
+
+  for (const auto& req_message : req_messages) {
+    MMContentVec contents;
+    contents.reserve(1);
+    contents.emplace_back("text", req_message.content());
+    out_messages.emplace_back(req_message.role(), std::move(contents));
+    auto& msg = out_messages.back();
+
+    if (req_message.has_tool_call_id()) {
+      msg.tool_call_id = req_message.tool_call_id();
+    }
+
+    if (req_message.has_reasoning_content()) {
+      msg.reasoning_content = req_message.reasoning_content();
+    }
+
+    if (req_message.tool_calls_size() > 0) {
+      Message::ToolCallVec tool_calls;
+      tool_calls.reserve(req_message.tool_calls_size());
+      for (const auto& tool_call : req_message.tool_calls()) {
+        tool_calls.emplace_back();
+        auto& tc = tool_calls.back();
+        if (tool_call.has_id()) {
+          tc.id = tool_call.id();
+        }
+        tc.type = tool_call.type();
+        tc.function.name = tool_call.function().name();
+        tc.function.arguments = tool_call.function().arguments();
+      }
+      msg.tool_calls = std::move(tool_calls);
+    }
+  }
+
+  return out_messages;
+}
 
 }  // namespace mm_service_utils
 }  // namespace xllm

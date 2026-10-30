@@ -74,6 +74,9 @@ class ConcurrentBlockManagerImpl : public BlockManager {
   size_t num_used_blocks() const override;
   size_t num_total_blocks() const override;
   double kv_cache_utilization() const override;
+  // Reads the inner allocator under one lock. Heartbeat callers must use this
+  // instead of composing the individual statistic getters.
+  BlockCapacitySnapshot capacity_snapshot() const;
 
  private:
   std::unique_ptr<BlockManager> inner_;  // always a leaf, never a composite

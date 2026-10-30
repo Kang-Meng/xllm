@@ -38,13 +38,23 @@ DEFINE_string(etcd_namespace,
               "",
               "Optional etcd namespace prefix for all xllm keys, e.g. prod-a.");
 
+DEFINE_string(control_plane_shard_id,
+              "default",
+              "Static ModelPool/tenant-quota xllm-service control-plane "
+              "shard id. The default retains the legacy master key.");
+
 DEFINE_bool(enable_service_routing,
             false,
             "Whether to use xllm service routing.");
 
-DEFINE_double(heart_beat_interval, 0.5, "Heart beat interval.");
+DEFINE_double(heart_beat_interval,
+              0.5,
+              "Heartbeat and membership reconcile interval in seconds.");
 
-DEFINE_int32(etcd_ttl, 3, "Time to live for etcd.");
+DEFINE_int32(etcd_ttl,
+             15,
+             "Engine membership lease TTL in seconds; service routing "
+             "requires at least 15 seconds.");
 
 namespace xllm {
 
@@ -55,6 +65,7 @@ void DistributedConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(node_rank);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_addr);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_namespace);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(control_plane_shard_id);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_service_routing);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(heart_beat_interval);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_ttl);
@@ -68,6 +79,7 @@ void DistributedConfig::from_json(const JsonReader& json) {
   // XLLM_CONFIG_ASSIGN_FROM_JSON(node_rank);
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_addr);
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_namespace);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(control_plane_shard_id);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_service_routing);
   XLLM_CONFIG_ASSIGN_FROM_JSON(heart_beat_interval);
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_ttl);
@@ -88,6 +100,8 @@ void DistributedConfig::append_config_json(
       config_json, default_config, etcd_addr);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, etcd_namespace);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, control_plane_shard_id);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_service_routing);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

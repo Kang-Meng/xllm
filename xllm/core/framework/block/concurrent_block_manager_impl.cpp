@@ -136,4 +136,13 @@ double ConcurrentBlockManagerImpl::kv_cache_utilization() const {
   return inner_->kv_cache_utilization();
 }
 
+BlockCapacitySnapshot ConcurrentBlockManagerImpl::capacity_snapshot() const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return BlockCapacitySnapshot{
+      .free_blocks = inner_->num_available_blocks(),
+      .used_blocks = inner_->num_used_blocks(),
+      .total_blocks = inner_->num_total_blocks(),
+  };
+}
+
 }  // namespace xllm

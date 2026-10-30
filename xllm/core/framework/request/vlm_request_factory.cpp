@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
+#include "framework/request/request_state.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "util/scope_guard.h"
 #include "util/timer.h"
@@ -97,13 +98,15 @@ VLMRequestFactory::VLMRequestFactory(MultimodalProcessorBase* processor,
                                      const Tokenizer* tokenizer,
                                      const ModelArgs* model_args,
                                      const Options* options,
-                                     RateLimiter* rate_limiter)
+                                     RateLimiter* rate_limiter,
+                                     RpcResponseHandler rpc_response_handler)
     : processor_(processor),
       chat_template_(chat_template),
       tokenizer_(tokenizer),
       model_args_(model_args),
       options_(options),
-      rate_limiter_(rate_limiter) {
+      rate_limiter_(rate_limiter),
+      rpc_response_handler_(std::move(rpc_response_handler)) {
   CHECK(processor_ != nullptr);
   CHECK(chat_template_ != nullptr);
   CHECK(tokenizer_ != nullptr);
@@ -115,7 +118,8 @@ VLMRequestFactory::VLMRequestFactory(MultimodalProcessorBase* processor,
 std::shared_ptr<Request> VLMRequestFactory::create(std::string prompt,
                                                    MMData mm_data,
                                                    const RequestParams& sp,
-                                                   OutputCallback callback) {
+                                                   OutputCallback callback,
+                                                   std::optional<Call*> call) {
   // Guard the rate-limit slot acquired at the service entry. build_request
   // installs its own guard, so we dismiss ours before forwarding.
   xllm::ScopeGuard rate_limit_guard(
@@ -140,7 +144,8 @@ std::shared_ptr<Request> VLMRequestFactory::create(std::string prompt,
                        std::move(prompt_tokens),
                        std::move(mm_data),
                        sp,
-                       std::move(callback));
+                       std::move(callback),
+                       call);
 }
 
 std::shared_ptr<Request> VLMRequestFactory::build_request(
@@ -148,7 +153,8 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
     std::vector<int32_t> prompt_tokens,
     MMData mm_data,
     const RequestParams& sp,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<Call*> call) {
   // Guard the rate-limit slot acquired at the service entry. Any early
   // return below releases it; success path dismisses right before Request
   // takes ownership.
@@ -205,6 +211,28 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
     stream = false;
   }
 
+  // Mirror llm_request_factory.cpp: install the injected RPC response handler
+  // as the RequestState batch callback when service routing is enabled, so a
+  // service-routed multimodal request delivers completed outputs back to the
+  // Service through XServiceClient::generations instead of dying with
+  // SUBSCRIBER_REJECTED ("Missing generation delivery callback") — which is
+  // what the previous hardcoded nullptr caused: no delivery path, an aborted
+  // request, and a STALE_STATE reaper 503. Capture a copy of the handler
+  // rather than `this`: the callback is stored in RequestState and drained by
+  // the scheduler during shutdown, which happens after this factory is
+  // destroyed. Copying keeps the callback self-contained and avoids a
+  // use-after-free on the factory.
+  OutputsFunc batch_callback = nullptr;
+  if (options_->enable_service_routing()) {
+    batch_callback = [handler = rpc_response_handler_](
+                         const std::vector<RequestOutput>& req_outputs) {
+      for (const auto& req_output : req_outputs) {
+        req_output.log_request_status();
+      }
+      return handler(req_outputs);
+    };
+  }
+
   RequestState req_state(std::move(prompt),
                          std::move(prompt_tokens),
                          std::move(mm_data),
@@ -219,9 +247,16 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
                          sp.skip_special_tokens,
                          options_->enable_schedule_overlap(),
                          callback,
-                         nullptr);
+                         batch_callback,
+                         /*decode_address=*/"",
+                         call);
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
   req_state.timing = sp.timing;
+  // Restore V2 disagg PD fields dropped during the v033->main merge (see
+  // llm_request_factory.cpp for the same restoration). RequestState keeps a
+  // default-constructed decode_address, so a service-routed MM request that
+  // only populated sp.decode_address would silently execute LOCAL mode.
+  req_state.decode_address = sp.decode_address;
 
   rate_limit_guard.dismiss();
   // add one sequence, rest will be added by scheduler
@@ -273,7 +308,8 @@ std::shared_ptr<Request> VLMRequestFactory::create(
     const RequestParams& sp,
     BinaryPayload payload,
     OutputCallback callback,
-    bool use_prompt_as_is) {
+    bool use_prompt_as_is,
+    std::optional<Call*> call) {
   // Guard the rate-limit slot acquired at the service entry. The next hop
   // (create(prompt, ...)) installs its own guard, so we dismiss ours before
   // forwarding.
@@ -350,8 +386,11 @@ std::shared_ptr<Request> VLMRequestFactory::create(
   COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
 
   rate_limit_guard.dismiss();
-  return create(
-      std::move(prompt.value()), std::move(mm_data), sp, std::move(callback));
+  return create(std::move(prompt.value()),
+                std::move(mm_data),
+                sp,
+                std::move(callback),
+                call);
 }
 
 }  // namespace xllm

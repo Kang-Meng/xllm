@@ -144,6 +144,7 @@ class CompositeBlockManager : public BlockManager {
   double kv_cache_utilization() const override;
   std::unordered_map<BlockType, double> block_utilization_by_type() const;
   void free(Block* block) override;
+  BlockCapacitySnapshot capacity_snapshot() const;
   size_t num_total_blocks() const override;
 
   void reserve_xtensor_padding_blocks() override;
@@ -154,6 +155,11 @@ class CompositeBlockManager : public BlockManager {
   friend class BlockManagerPoolTestPeer;
 
   BlockManager* leaf_of(BlockType type) const;
+
+  // The admission leaf whose raw block count defines the pool's
+  // scheduler-facing capacity unit. Picks the finest-grained admission leaf
+  // (smallest block_size): KV for flat layouts, C4 for compressed layouts.
+  const LeafEntry* capacity_leaf() const;
 
   static LeafCombination classify_leaf_combination(const LeafMap& leaves);
 

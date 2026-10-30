@@ -2,6 +2,38 @@ include(cc_test)
 
 cc_test(
   NAME
+    bounded_retry_test
+  SRCS
+    bounded_retry_test.cpp
+  DEPS
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    etcd_schema_test
+  SRCS
+    etcd_schema_test.cpp
+  DEPS
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    instance_info_test
+  SRCS
+    instance_info_test.cpp
+  DEPS
+    :config
+    common
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
+    torch
+)
+
+cc_test(
+  NAME
     common_test
   CPU_ONLY
   SRCS

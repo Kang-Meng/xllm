@@ -385,6 +385,8 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .model_type(args_.model_type())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
+      .logical_kv_bytes_per_token(
+          ::xllm::logical_kv_bytes_per_token(kv_cache_cap).value_or(0))
       .instance_is_decode(options_.instance_role() == InstanceRole::DECODE)
       .enable_schedule_overlap(options_.enable_schedule_overlap());
   configure_dsv4_block_manager_options(args_,
@@ -529,6 +531,29 @@ void VLMEngine::setup_workers(const runtime::Options& options) {
     dist_manager_ = std::make_shared<DistManager>(options);
   }
   worker_clients_ = dist_manager_->get_worker_clients();
+}
+
+void VLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
+                               std::vector<std::string>& addrs,
+                               std::vector<uint16_t>& ports) {
+  // Same aggregation contract as LLMEngine::get_cache_info: one KV cache
+  // cluster endpoint per worker client, in worker rank order. The DisaggPD
+  // registration path mirrors this vector into instance_info_ so the service
+  // side can link clusters by worker; the vector must therefore be complete
+  // rather than merely non-empty.
+  cluster_ids.reserve(worker_clients_num_);
+  addrs.reserve(worker_clients_num_);
+  ports.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    uint64_t cluster_id = 0;
+    std::string addr;
+    uint16_t port = 0;
+    worker_clients_[worker_rank]->get_cache_info(cluster_id, addr, port);
+    cluster_ids.emplace_back(cluster_id);
+    addrs.emplace_back(std::move(addr));
+    ports.emplace_back(port);
+  }
 }
 
 std::vector<int64_t> VLMEngine::get_active_activation_memory() const {

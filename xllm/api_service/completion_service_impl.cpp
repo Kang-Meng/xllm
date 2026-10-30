@@ -27,12 +27,14 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/request_admission.h"
+#include "api_service/rpc_cancel_call.h"
 #include "api_service/utils.h"
 #include "completion.pb.h"
 #include "core/common/instance_name.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_timing.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/utils.h"
 
 #ifdef likely
@@ -215,11 +217,18 @@ LLMMaster* CompletionServiceImpl::get_model_master(
 
 // complete_async for brpc from xllm_service
 void CompletionServiceImpl::process_async_rpc_impl(
-    const proto::CompletionRequest* request) {
+    const proto::CompletionRequest* request,
+    brpc::Controller* controller,
+    ::google::protobuf::Closure* done) {
   const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
+  // Keep the inbound RPC open. Releasing this owner runs `done` and tells
+  // brpc the call is finished; until then a Service-side cancel is visible.
+  std::shared_ptr<RpcCancelCall> rpc_call =
+      make_rpc_cancel_call(controller, done);
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  auto callback = [master = master_](const RequestOutput& req_output) -> bool {
+  auto callback = [master = master_,
+                   rpc_call](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
     return master->handle_rpc_response(req_output);
   };
@@ -252,8 +261,8 @@ void CompletionServiceImpl::process_async_rpc_impl(
   master_->handle_request(std::move(rpc_request.prompt()),
                           std::move(prompt_tokens),
                           std::move(request_params),
-                          std::nullopt,
-                          callback);
+                          rpc_call.get(),
+                          std::move(callback));
 }
 
 // complete_async for brpc

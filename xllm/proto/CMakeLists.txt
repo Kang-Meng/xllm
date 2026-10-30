@@ -15,6 +15,8 @@ proto_library(
     rerank.proto
     models.proto
     worker.proto
+    provider.proto
+    observability.proto
     disagg_pd.proto
     xllm_service.proto
     xservice.proto

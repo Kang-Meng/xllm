@@ -18,6 +18,26 @@ endif()
 
 cc_test(
   NAME
+    native_provider_contract_test
+  SRCS
+    native_provider_contract_test.cpp
+  DEPS
+    :native_provider_contract
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    registration_lifecycle_test
+  SRCS
+    registration_lifecycle_test.cpp
+  DEPS
+    etcd-cpp-api
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     encoder_executor_test
   CPU_ONLY
   SRCS

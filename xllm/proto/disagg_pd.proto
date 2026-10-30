@@ -242,6 +242,7 @@ message DisaggStreamGeneration {
   OutputUsage usage = 5;
   bool finished = 6;
   bool finished_on_prefill_instance = 7;
+  string sender_engine_uid = 10;
 }
 
 message DisaggStreamGenerations {

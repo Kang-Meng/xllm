@@ -267,10 +267,14 @@ inline constexpr int32_t kCpIndexWriteModeSharded = 2;
 struct InstanceInfo {
   std::string name = "";
   std::string rpc_address = "";
-  std::string incarnation_id = "";
   uint64_t register_ts_ms = 0;
   // DEFAULT/PREFILL/DECODE/MIX
   std::string type = "";
+  // Physical Ascend super-pod id. Empty is a wildcard (engine opts out of cross
+  // super-node isolation). Mirrors descriptor.topology.super_node_id from the
+  // same DisaggPDConfig source so the top-level etcd/RPC channel and the
+  // provider descriptor agree.
+  std::string super_node_id = "";
   // remote kv cache info
   std::vector<uint64_t> cluster_ids;
   std::vector<std::string> addrs;
@@ -309,7 +313,6 @@ struct InstanceInfo {
     nlohmann::json json_val;
     json_val["name"] = name;
     json_val["rpc_address"] = rpc_address;
-    json_val["incarnation_id"] = incarnation_id;
     json_val["register_ts_ms"] = register_ts_ms;
     if (InstanceRole(type) == InstanceRole::DEFAULT) {
       json_val["type"] = 0;
@@ -328,22 +331,16 @@ struct InstanceInfo {
     json_val["dp_size"] = dp_size;
     json_val["kv_split_size"] = kv_split_size;
     json_val["cp_index_write_mode"] = cp_index_write_mode;
+    // Emit only when set so instances that opt out (and older readers) see no
+    // key; an empty super_node_id is a wildcard, not a value to round-trip.
+    if (!super_node_id.empty()) {
+      json_val["super_node_id"] = super_node_id;
+    }
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;
-    // XTensor mode info
-    json_val["worker_free_phy_pages"] = worker_free_phy_pages;
-    json_val["total_phy_pages"] = total_phy_pages;
-    // Serialize model_weight_segments: {model_id -> [{offset, size}, ...]}
-    nlohmann::json segments_json;
-    for (const auto& [model_id, segments] : model_weight_segments) {
-      nlohmann::json seg_array = nlohmann::json::array();
-      for (const auto& seg : segments) {
-        seg_array.push_back({{"offset", seg.offset}, {"size", seg.size}});
-      }
-      segments_json[model_id] = seg_array;
-    }
-    json_val["model_weight_segments"] = segments_json;
+    // Leave XTensor fields out of the registration JSON. The struct members
+    // remain so older readers can ignore a missing key.
     return json_val;
   }
 };

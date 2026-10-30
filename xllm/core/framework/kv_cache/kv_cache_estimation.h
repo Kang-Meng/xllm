@@ -18,6 +18,8 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -101,6 +103,12 @@ int64_t estimate_layerwise_split_block_count(
     const KVCacheCapacity& kv_cache_cap,
     int64_t available_bytes,
     int64_t additional_block_bytes);
+
+// Exact per-rank logical KV bytes of one prompt token for a standard,
+// unsplit full-attention layout. Composite, linear-attention, and otherwise
+// ambiguous layouts return nullopt instead of an estimate.
+std::optional<uint64_t> logical_kv_bytes_per_token(
+    const KVCacheCapacity& kv_cache_cap);
 
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,

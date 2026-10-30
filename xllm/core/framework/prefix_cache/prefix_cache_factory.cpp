@@ -8,8 +8,6 @@
 namespace xllm {
 
 std::unique_ptr<PrefixCache> create_prefix_cache(PrefixCache::Options options) {
-  int32_t block_size = options.block_size();
-  BlockHasherType hasher_type = options.hasher_type();
   // Two block types need the gap-tolerant probe:
   //   LINEAR -- block_size here is the KV hash stride; the checkpoint stride
   //             remains on LinearStateBlockManager.
@@ -20,9 +18,9 @@ std::unique_ptr<PrefixCache> create_prefix_cache(PrefixCache::Options options) {
   // SWA-adoption diff narrow.
   if (options.block_type() == BlockType::LINEAR ||
       options.block_type() == BlockType::SWA) {
-    return std::make_unique<LinearStatePrefixCache>(block_size, hasher_type);
+    return std::make_unique<LinearStatePrefixCache>(options);
   }
-  return std::make_unique<PrefixCache>(block_size, hasher_type);
+  return std::make_unique<PrefixCache>(options);
 }
 
 }  // namespace xllm

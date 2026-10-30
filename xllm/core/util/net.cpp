@@ -22,11 +22,14 @@ limitations under the License.
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
-#include <sstream>
+#include <optional>
+#include <string_view>
 #include <unordered_set>
 
 namespace xllm {
@@ -37,19 +40,121 @@ namespace {
 std::mutex g_port_mutex;
 std::unordered_set<int> g_allocated_port_map;
 
-std::string to_ip_addr(const sockaddr_in& addr) {
-  char ip[INET_ADDRSTRLEN]{'\0'};
-  const char* result =
-      inet_ntop(addr.sin_family, &addr.sin_addr, ip, sizeof(ip));
+std::string to_ip_addr(const sockaddr_storage& storage) {
+  char ip[INET6_ADDRSTRLEN]{'\0'};
+  const void* address = nullptr;
+  if (storage.ss_family == AF_INET) {
+    address = &reinterpret_cast<const sockaddr_in*>(&storage)->sin_addr;
+  } else if (storage.ss_family == AF_INET6) {
+    address = &reinterpret_cast<const sockaddr_in6*>(&storage)->sin6_addr;
+  } else {
+    return "";
+  }
+  const char* result = inet_ntop(storage.ss_family, address, ip, sizeof(ip));
   if (result == nullptr) {
     return "";
   }
   return std::string(ip);
 }
 
+struct HostPort {
+  std::string host;
+  uint16_t port = 0;
+};
+
+bool valid_unbracketed_host(std::string_view host) {
+  return !host.empty() &&
+         std::none_of(host.begin(), host.end(), [](unsigned char character) {
+           return character <= 0x20 || character == 0x7f || character == '[' ||
+                  character == ']' || character == ':' || character == '/';
+         });
+}
+
+bool valid_ipv6_host(std::string_view host) {
+  // Scoped addresses are interface-local and produce platform-dependent
+  // inet_pton results. They cannot be advertised safely across Engine hosts.
+  if (host.find('%') != std::string_view::npos) {
+    return false;
+  }
+  const std::string text(host);
+  in6_addr parsed{};
+  return inet_pton(AF_INET6, text.c_str(), &parsed) == 1;
+}
+
+std::optional<HostPort> try_parse_host_port(std::string_view address) {
+  if (address.empty()) {
+    return std::nullopt;
+  }
+  std::string_view host;
+  std::string_view port_text;
+  if (address.front() == '[') {
+    const size_t closing_bracket = address.find(']');
+    if (closing_bracket == std::string_view::npos || closing_bracket == 1 ||
+        closing_bracket + 2 > address.size() ||
+        address[closing_bracket + 1] != ':') {
+      return std::nullopt;
+    }
+    host = address.substr(1, closing_bracket - 1);
+    port_text = address.substr(closing_bracket + 2);
+    if (!valid_ipv6_host(host)) {
+      return std::nullopt;
+    }
+  } else {
+    const size_t separator = address.rfind(':');
+    if (separator == std::string_view::npos || separator == 0 ||
+        separator + 1 >= address.size() || address.find(':') != separator) {
+      return std::nullopt;
+    }
+    host = address.substr(0, separator);
+    port_text = address.substr(separator + 1);
+    if (!valid_unbracketed_host(host)) {
+      return std::nullopt;
+    }
+  }
+
+  uint32_t port = 0;
+  const auto parsed = std::from_chars(
+      port_text.data(), port_text.data() + port_text.size(), port);
+  if (parsed.ec != std::errc() ||
+      parsed.ptr != port_text.data() + port_text.size() || port == 0 ||
+      port > std::numeric_limits<uint16_t>::max()) {
+    return std::nullopt;
+  }
+  return HostPort{.host = std::string(host),
+                  .port = static_cast<uint16_t>(port)};
+}
+
 }  // namespace
 
-// TODO: return private ip
+std::string format_host_port(const std::string& host, int32_t port) {
+  if (host.empty() || port < 0 || port > std::numeric_limits<uint16_t>::max()) {
+    return "";
+  }
+  const bool bracketed = host.front() == '[';
+  std::string normalized_host = host;
+  if (bracketed) {
+    if (host.size() < 3 || host.back() != ']') {
+      return "";
+    }
+    normalized_host = host.substr(1, host.size() - 2);
+  } else if (host.find('[') != std::string::npos ||
+             host.find(']') != std::string::npos) {
+    return "";
+  }
+  const bool is_ipv6 = normalized_host.find(':') != std::string::npos;
+  if ((bracketed && !is_ipv6) ||
+      (is_ipv6 && !valid_ipv6_host(normalized_host)) ||
+      (!is_ipv6 && !valid_unbracketed_host(normalized_host))) {
+    return "";
+  }
+  return (is_ipv6 ? "[" + normalized_host + "]" : normalized_host) + ":" +
+         std::to_string(port);
+}
+
+bool is_valid_host_port(const std::string& address) {
+  return try_parse_host_port(address).has_value();
+}
+
 std::string get_local_ip_addr() {
   char ip[INET_ADDRSTRLEN]{'\0'};
   char hostname[256];
@@ -122,7 +227,9 @@ std::string get_route_ip(const std::string& remote_addr) {
       continue;
     }
 
-    std::string local_ip = to_ip_addr(local);
+    sockaddr_storage local_storage{};
+    std::memcpy(&local_storage, &local, sizeof(local));
+    std::string local_ip = to_ip_addr(local_storage);
     if (!local_ip.empty()) {
       return local_ip;
     }
@@ -192,10 +299,8 @@ std::pair<std::string, uint16_t> convert_uint64_to_ip_port(uint64_t input) {
 
 // input example: 127.0.0.1:18889
 std::string extract_ip(const std::string& input) {
-  std::istringstream stream(input);
-  std::string ip;
-
-  std::getline(stream, ip, ':');
+  const std::optional<HostPort> endpoint = try_parse_host_port(input);
+  std::string ip = endpoint.has_value() ? endpoint->host : input;
   if (ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "localhost") {
     ip = get_local_ip_addr();
   }
@@ -203,26 +308,17 @@ std::string extract_ip(const std::string& input) {
 }
 
 std::string extract_port(const std::string& input) {
-  std::istringstream stream(input);
-  std::string ip;
-  std::string port;
-
-  std::getline(stream, ip, ':');
-  std::getline(stream, port, ':');
-
-  return port;
+  const std::optional<HostPort> endpoint = try_parse_host_port(input);
+  return endpoint.has_value() ? std::to_string(endpoint->port) : "";
 }
 
 void parse_host_port_from_addr(const std::string& addr,
                                std::string& host,
                                int& port) {
-  CHECK(!addr.empty()) << "Address is empty";
-
-  const std::size_t colon_pos = addr.find(':');
-  CHECK_NE(colon_pos, std::string::npos) << "Invalid address format: " << addr;
-
-  host = addr.substr(0, colon_pos);
-  port = std::stoi(addr.substr(colon_pos + 1));
+  const std::optional<HostPort> endpoint = try_parse_host_port(addr);
+  CHECK(endpoint.has_value()) << "Invalid address format: " << addr;
+  host = endpoint->host;
+  port = endpoint->port;
 }
 
 }  // namespace net

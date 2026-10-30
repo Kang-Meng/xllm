@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "anthropic.pb.h"
@@ -31,6 +32,26 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+constexpr char kServiceRequestUid[] = "01234567-89ab-7cde-bf01-23456789abcd";
+
+template <typename RequestProto>
+RequestProto make_service_routed_request() {
+  RequestProto request;
+  request.set_service_request_id(kServiceRequestUid);
+  request.set_max_tokens(128);
+  if constexpr (std::is_same_v<RequestProto, proto::CompletionRequest> ||
+                std::is_same_v<RequestProto, proto::ChatRequest>) {
+    // MMChatRequest re-tokenizes locally and does not carry prompt token ids.
+    request.add_token_ids(11);
+    request.add_token_ids(22);
+  }
+
+  proto::Routing* routing = request.mutable_routing();
+  routing->set_prefill_name("prefill-1");
+  routing->set_decode_name("decode-1");
+  return request;
+}
 
 class ScopedJsonObjectOutput final {
  public:
@@ -55,6 +76,24 @@ TEST(RequestParamsTest, IncludeStopStringInOutputDefaultsToFalse) {
   EXPECT_FALSE(completion_params.include_stop_str_in_output);
   EXPECT_FALSE(chat_params.include_stop_str_in_output);
   EXPECT_FALSE(mm_chat_params.include_stop_str_in_output);
+}
+
+TEST(RequestParamsTest, CompletionAcceptsServiceRoutedCacheFields) {
+  proto::CompletionRequest request =
+      make_service_routed_request<proto::CompletionRequest>();
+  RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.service_request_id, kServiceRequestUid);
+  EXPECT_TRUE(params.verify_params([](RequestOutput) { return true; }));
+}
+
+TEST(RequestParamsTest, ChatAcceptsServiceRoutedCacheFields) {
+  proto::ChatRequest request =
+      make_service_routed_request<proto::ChatRequest>();
+  RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.service_request_id, kServiceRequestUid);
+  EXPECT_TRUE(params.verify_params([](RequestOutput) { return true; }));
 }
 
 TEST(RequestParamsTest, IncludeStopStringInOutputIsParsedFromRequests) {
@@ -367,6 +406,17 @@ TEST(RequestParamsTest, AnthropicToolChoiceDefaults) {
   request.mutable_tool_choice()->set_type("unknown");
   RequestParams unknown_params(request, "", "");
   EXPECT_EQ(unknown_params.tool_choice, "auto");
+}
+
+// MMChat keeps the service request id. Deadline, retry policy, correlation,
+// and the execution plan stay on xLLM Service.
+TEST(RequestParamsTest, MMChatAcceptsServiceRoutedCacheFields) {
+  proto::MMChatRequest request =
+      make_service_routed_request<proto::MMChatRequest>();
+  RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.service_request_id, kServiceRequestUid);
+  EXPECT_TRUE(params.verify_params([](RequestOutput) { return true; }));
 }
 
 TEST(RequestParamsTest, AnthropicToolWithoutSchemaUsesEmptyJson) {

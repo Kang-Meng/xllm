@@ -1596,7 +1596,7 @@ TEST(BatchTest, Basic) {
   EXPECT_EQ(input_params.embedding.linear_state_ids,
             std::vector<int32_t>({-1, -1, -1, -1}));
 
-#if defined(USE_NPU)
+#if defined(USE_NPU) || defined(USE_MUSA)
   const std::vector<int32_t> q_seq_lens = {9, 1, 1, 4};
 #else
   const std::vector<int32_t> q_seq_lens = {0, 9, 10, 11, 15};
@@ -1604,7 +1604,7 @@ TEST(BatchTest, Basic) {
   EXPECT_TRUE(equal(input_params.attention.device.q_seq_lens, q_seq_lens));
 
 //  seq4's kv_seq_len = q_len + num_cached_tokens (q_len<=max_allowed_tokens)
-#if defined(USE_NPU)
+#if defined(USE_NPU) || defined(USE_MUSA)
   const std::vector<int32_t> kv_seq_lens = {9, 8, 16, 8};
 #else
   const std::vector<int32_t> kv_seq_lens = {0, 9, 17, 33, 41};

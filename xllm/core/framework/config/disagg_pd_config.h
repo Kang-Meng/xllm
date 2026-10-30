@@ -51,7 +51,8 @@ class DisaggPDConfig final {
          "disagg_pd_port",
          "instance_role",
          "kv_cache_transfer_mode",
-         "transfer_listen_port"}};
+         "transfer_listen_port",
+         "super_node_id"}};
     return kOptionCategory;
   }
 
@@ -68,6 +69,12 @@ class DisaggPDConfig final {
   PROPERTY(int32_t, transfer_listen_port) = 26000;
 
   PROPERTY(bool, kv_push_dst_rotate) = false;
+
+  // Physical Ascend super-pod id this engine belongs to. Empty means the engine
+  // opts out of cross super-node isolation (wildcard). Resolved from the
+  // --super_node_id flag with a SUPER_POD_ID env fallback in initialize(); as a
+  // per-instance identity it is not sourced from the shared JSON config.
+  PROPERTY(std::string, super_node_id) = "";
 };
 
 }  // namespace xllm

@@ -1,0 +1,199 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+option go_package = "jd.com/jd-infer/xllm;xllm";
+package xllm.proto;
+
+import "provider.proto";
+
+// Request event schema version 1 carries correlation and local durations. A
+// consumer must never subtract timestamps or elapsed values from two owners.
+enum EventOwnerRole {
+  EVENT_OWNER_ROLE_UNSPECIFIED = 0;
+  EVENT_OWNER_ROLE_GATEWAY = 1;
+  EVENT_OWNER_ROLE_SERVICE = 2;
+  EVENT_OWNER_ROLE_PREFILL = 3;
+  EVENT_OWNER_ROLE_DECODE = 4;
+  EVENT_OWNER_ROLE_PROVIDER_AGENT = 5;
+  EVENT_OWNER_ROLE_AGGREGATED_ENGINE = 6;
+}
+
+enum RequestEventType {
+  REQUEST_EVENT_TYPE_UNSPECIFIED = 0;
+  REQUEST_EVENT_TYPE_INGRESS = 1;
+  REQUEST_EVENT_TYPE_ROUTE = 2;
+  REQUEST_EVENT_TYPE_P_DISPATCH = 3;
+  REQUEST_EVENT_TYPE_D_ADMISSION = 4;
+  REQUEST_EVENT_TYPE_PREFILL_QUEUE = 5;
+  REQUEST_EVENT_TYPE_PREFILL_CHUNK = 6;
+  REQUEST_EVENT_TYPE_PREFILL_FORWARD = 7;
+  REQUEST_EVENT_TYPE_KV_TRANSFER = 8;
+  REQUEST_EVENT_TYPE_FIRST_TOKEN_GENERATED = 9;
+  REQUEST_EVENT_TYPE_FIRST_TOKEN_ACK = 10;
+  REQUEST_EVENT_TYPE_FIRST_TOKEN_FLUSH = 11;
+  REQUEST_EVENT_TYPE_DECODE_STEP = 12;
+  REQUEST_EVENT_TYPE_REQUEST_TERMINAL = 13;
+  REQUEST_EVENT_TYPE_RESOURCE_RELEASE = 14;
+  REQUEST_EVENT_TYPE_METRIC_SAMPLE = 15;
+  // Service route usage accounting, including unavailable output statistics.
+  // This observation is not evidence that Engine KV transfer succeeded.
+  REQUEST_EVENT_TYPE_KV_ROUTE_OBSERVATION = 16;
+}
+
+enum EventResult {
+  EVENT_RESULT_UNSPECIFIED = 0;
+  EVENT_RESULT_STARTED = 1;
+  EVENT_RESULT_SUCCEEDED = 2;
+  EVENT_RESULT_ACCEPTED = 3;
+  EVENT_RESULT_REJECTED = 4;
+  EVENT_RESULT_FAILED = 5;
+  EVENT_RESULT_CANCELLED = 6;
+  EVENT_RESULT_DEADLINE_EXCEEDED = 7;
+}
+
+enum EventReason {
+  EVENT_REASON_NONE = 0;
+  EVENT_REASON_CAPACITY_EXHAUSTED = 1;
+  EVENT_REASON_PERMANENTLY_INFEASIBLE = 2;
+  EVENT_REASON_ATTEMPT_CONFLICT = 3;
+  EVENT_REASON_DEADLINE_EXCEEDED = 4;
+  EVENT_REASON_CANCELLED = 5;
+  EVENT_REASON_PROVIDER_ERROR = 6;
+  EVENT_REASON_TRANSPORT_ERROR = 7;
+  EVENT_REASON_STALE_STATE = 8;
+  EVENT_REASON_MODE_UNSUPPORTED = 9;
+  EVENT_REASON_INTERNAL_ERROR = 10;
+  EVENT_REASON_MISSING_TERMINAL = 11;
+}
+
+enum ErrorStage {
+  ERROR_STAGE_NONE = 0;
+  ERROR_STAGE_INGRESS = 1;
+  ERROR_STAGE_ROUTING = 2;
+  ERROR_STAGE_P_DISPATCH = 3;
+  ERROR_STAGE_D_ADMISSION = 4;
+  ERROR_STAGE_PREFILL = 5;
+  ERROR_STAGE_KV_TRANSFER = 6;
+  ERROR_STAGE_FIRST_TOKEN = 7;
+  ERROR_STAGE_DECODE = 8;
+  ERROR_STAGE_OUTPUT = 9;
+  ERROR_STAGE_RESOURCE_RELEASE = 10;
+}
+
+enum RequestMetricKind {
+  REQUEST_METRIC_KIND_UNSPECIFIED = 0;
+  REQUEST_METRIC_KIND_SERVER_TTFT = 1;
+  REQUEST_METRIC_KIND_SERVER_TPOT = 2;
+  REQUEST_METRIC_KIND_SERVER_E2E = 3;
+  REQUEST_METRIC_KIND_SERVER_ITL = 4;
+}
+
+enum MetricValidity {
+  METRIC_VALIDITY_UNSPECIFIED = 0;
+  METRIC_VALIDITY_VALID = 1;
+  METRIC_VALIDITY_NOT_APPLICABLE = 2;
+  METRIC_VALIDITY_INVALID = 3;
+}
+
+enum InvalidMetricReason {
+  INVALID_METRIC_REASON_NONE = 0;
+  INVALID_METRIC_REASON_CLOCK_REGRESSION = 1;
+  INVALID_METRIC_REASON_ZERO_TPOT = 2;
+  INVALID_METRIC_REASON_INSUFFICIENT_OUTPUT_TOKENS = 3;
+  INVALID_METRIC_REASON_MISSING_FIRST_TOKEN = 4;
+  INVALID_METRIC_REASON_MISSING_CORRELATION = 5;
+  INVALID_METRIC_REASON_CROSS_CLOCK_DOMAIN = 6;
+  INVALID_METRIC_REASON_EVENT_DROPPED = 7;
+}
+
+enum CorrelationIdSource {
+  CORRELATION_ID_SOURCE_UNSPECIFIED = 0;
+  CORRELATION_ID_SOURCE_UPSTREAM = 1;
+  CORRELATION_ID_SOURCE_SERVICE_GENERATED = 2;
+}
+
+message RequestCorrelation {
+  string global_request_id = 1;
+  string trace_id = 2;
+  string request_uid = 3;
+  optional uint64 attempt_seq = 4;
+  CorrelationIdSource global_request_id_source = 5;
+  CorrelationIdSource trace_id_source = 6;
+  // Optional caller label supplied by the gateway, preserved including any
+  // suffix. Observability only: never an authorization, tenant, cache, metric
+  // label or attempt identity. Service accepts at most 256 visible ASCII bytes.
+  string erp = 7;
+}
+
+message RuntimeProfileIdentity {
+  ProviderId provider_id = 1;
+  string runtime_version = 2;
+  string plugin_version = 3;
+  string hardware_runtime_version = 4;
+  string profile_digest = 5;
+  string model_revision = 6;
+  ExecutionMode execution_mode = 7;
+}
+
+message WorkloadShape {
+  reserved 13, 14, 16, 17;
+  reserved "shadow_prefill_ssd_hit_tokens_ub",
+      "shadow_prefill_store_hit_tokens_ub",
+      "shadow_decode_ssd_hit_tokens_ub",
+      "shadow_decode_store_hit_tokens_ub";
+  optional uint64 prompt_tokens = 1;
+  optional uint64 output_tokens = 2;
+  optional uint64 effective_max_new_tokens = 3;
+  optional uint64 kv_blocks = 4;
+  optional uint64 batch_size = 5;
+  optional uint64 predicted_prefill_hit_tokens = 6;
+  optional uint64 predicted_decode_hit_tokens = 7;
+  optional uint64 predicted_transfer_bytes = 8;
+  optional uint64 actual_prefill_hit_tokens = 9;
+  optional uint64 actual_decode_hit_tokens = 10;
+  optional uint64 skipped_transfer_bytes = 11;
+  optional uint64 shadow_prefill_host_hit_tokens_ub = 12;
+  optional uint64 shadow_decode_host_hit_tokens_ub = 15;
+}
+
+message RequestMetric {
+  RequestMetricKind kind = 1;
+  MetricValidity validity = 2;
+  InvalidMetricReason invalid_reason = 3;
+  optional uint64 duration_ns = 4;
+  string measurement_boundary = 5;
+  optional uint64 output_tokens = 6;
+}
+
+message RequestEvent {
+  uint32 schema_version = 1;
+  RequestCorrelation correlation = 2;
+  optional uint64 event_seq = 3;
+  RequestEventType event_type = 4;
+  EventOwnerRole owner_role = 5;
+  optional RuntimeProfileIdentity runtime_profile = 7;
+  optional uint64 stage_duration_ns = 8;
+  WorkloadShape workload = 9;
+  EventResult result = 10;
+  ErrorStage error_stage = 11;
+  EventReason reason = 12;
+  string build_id = 13;
+  string target_engine_uid = 14;
+  optional RequestMetric metric = 16;
+  MetricValidity stage_duration_validity = 17;
+  InvalidMetricReason stage_duration_invalid_reason = 18;
+}

@@ -18,6 +18,19 @@ cc_library(
 
 cc_library(
   NAME
+    prefix_cache_journal
+  HDRS
+    prefix_cache_journal.h
+  SRCS
+    prefix_cache_journal.cpp
+  DEPS
+    absl::flat_hash_set
+    glog::glog
+    xxHash
+)
+
+cc_library(
+  NAME
     prefix_cache
   HDRS
     prefix_cache.h
@@ -32,6 +45,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:graph>
     :request
     :block_hasher
+    :prefix_cache_journal
     :common
     glog::glog
     Boost::serialization

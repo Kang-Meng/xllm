@@ -15,28 +15,79 @@ limitations under the License.
 
 #include "core/runtime/xservice_client.h"
 
-#include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <glog/logging.h>
+#include <google/protobuf/util/json_util.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <sstream>
+#include <string_view>
 #include <unordered_map>
 
+#include "common/bounded_batch.h"
+#include "common/bounded_retry.h"
+#include "common/metrics.h"
+#include "core/common/etcd_schema.h"
 #include "core/common/public_error.h"
 #include "core/framework/config/distributed_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/prefix_cache/prefix_cache_journal.h"
+#include "core/framework/request/request_output_proto_adapter.h"
+#include "core/runtime/native_provider_runtime.h"
+#include "scheduler/continuous_scheduler.h"
 #include "util/env_var.h"
 #include "util/hash_util.h"
 #include "util/net.h"
 #include "util/uuid.h"
+#include "util/verbose_trace_logger.h"
 
 namespace xllm {
 namespace {
-static std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
-static std::string ETCD_XSERVICES_KEY_PREFIX =
-    "XLLM:SERVICE:";  // all xllm_service registration prefix
+
+inline constexpr uint32_t kKVEventContractVersion = 1;
+
+proto::KVEventKind prefix_cache_kind_to_proto(PrefixCacheEventKind kind) {
+  switch (kind) {
+    case PrefixCacheEventKind::STORED:
+      return proto::KV_EVENT_KIND_STORED;
+    case PrefixCacheEventKind::REMOVED:
+      return proto::KV_EVENT_KIND_REMOVED;
+    case PrefixCacheEventKind::CLEARED:
+      return proto::KV_EVENT_KIND_CLEARED;
+  }
+  return proto::KV_EVENT_KIND_UNSPECIFIED;
+}
+
+proto::KVEventReason prefix_cache_reason_to_proto(PrefixCacheEventKind kind) {
+  switch (kind) {
+    case PrefixCacheEventKind::STORED:
+      return proto::KV_EVENT_REASON_PREFIX_PUBLISHED;
+    case PrefixCacheEventKind::REMOVED:
+      return proto::KV_EVENT_REASON_CAPACITY_EVICTED;
+    case PrefixCacheEventKind::CLEARED:
+      return proto::KV_EVENT_REASON_CACHE_RESET;
+  }
+  return proto::KV_EVENT_REASON_UNSPECIFIED;
+}
+
+bool same_kv_identity(const proto::KVStreamIdentity& left,
+                      const proto::KVStreamIdentity& right) {
+  return left.engine().provider_id() == right.engine().provider_id() &&
+         left.engine().profile_digest() == right.engine().profile_digest() &&
+         left.engine().engine_uid() == right.engine().engine_uid() &&
+         left.model_revision() == right.model_revision();
+}
+
+}  // namespace
+namespace {
 constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
 constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
 static std::unordered_map<xllm_service::proto::InstanceType, std::string>
@@ -47,27 +98,122 @@ static std::unordered_map<xllm_service::proto::InstanceType, std::string>
         {xllm_service::proto::InstanceType::MIX, "XLLM:MIX:"},
 };
 
+struct ControlPlaneFailure {
+  std::string reason;
+  std::string detail;
+};
+
+ControlPlaneFailure control_plane_failure(
+    bool issued,
+    const brpc::Controller& controller,
+    const xllm_service::proto::Status& response) {
+  if (!issued) {
+    return {.reason = "MASTER_STUB_UNAVAILABLE",
+            .detail = "master RPC stub is unavailable"};
+  }
+  if (controller.Failed()) {
+    return {.reason = "RPC_FAILED", .detail = controller.ErrorText()};
+  }
+  return {.reason = "REMOTE_REJECTED",
+          .detail = response.status_msg().empty()
+                        ? "remote Service returned ok=false"
+                        : response.status_msg()};
+}
+
+void log_control_plane_failure(const char* lane,
+                               const std::string& master_addr,
+                               const ControlPlaneFailure& failure,
+                               const FailureObservation& observation) {
+  if (observation.action == FailureReportAction::kFirstFailure) {
+    LOG(WARNING) << "engine_control_state_change lane=" << lane
+                 << " lifecycle=DEGRADED master=" << master_addr
+                 << " reason=" << failure.reason
+                 << " retry_delay_ms=" << observation.retry_delay.count()
+                 << " detail=" << failure.detail;
+  } else if (observation.action == FailureReportAction::kPeriodicSummary) {
+    LOG(WARNING) << "engine_control_suppressed_summary lane=" << lane
+                 << " lifecycle=DEGRADED consecutive_failures="
+                 << observation.consecutive_failures
+                 << " suppressed_since_last_report="
+                 << observation.suppressed_since_last_report
+                 << " total_suppressed=" << observation.total_suppressed
+                 << " duration_ms=" << observation.duration_ms
+                 << " last_reason=" << observation.last_reason;
+  }
+}
+
+void log_control_plane_recovery(const char* lane,
+                                const std::string& master_addr,
+                                const FailureRecovery& recovery) {
+  LOG(INFO) << "engine_control_state_change lane=" << lane
+            << " lifecycle=READY master=" << master_addr
+            << " recovered_after_failures=" << recovery.consecutive_failures
+            << " suppressed=" << recovery.total_suppressed
+            << " duration_ms=" << recovery.duration_ms
+            << " last_reason=" << recovery.last_reason;
+}
+
 std::string parse_instance_name(const std::string& name) {
-  if (name.empty()) return "";
-  // Validate the format of instance name
-  // The format is `ip:port` currently.
-  auto pos = name.find(':');
+  if (name.empty()) {
+    return "";
+  }
+  const size_t pos = name.find(':');
   if (pos == std::string::npos) {
-    // only offer the port, we need to fill the ip address
-    return xllm::net::get_local_ip_addr() + ":" + name;
+    int32_t port = 0;
+    const std::string_view port_text(name);
+    const auto parsed = std::from_chars(
+        port_text.data(), port_text.data() + port_text.size(), port);
+    if (parsed.ec != std::errc() ||
+        parsed.ptr != port_text.data() + port_text.size() || port <= 0 ||
+        port > std::numeric_limits<uint16_t>::max()) {
+      return name;
+    }
+    return xllm::net::format_host_port(xllm::net::get_local_ip_addr(), port);
   }
   return name;
 }
 
 bool check_instance_name(const std::string& name) {
-  std::vector<std::string> addr = absl::StrSplit(name, ':');
-  // Now only support `ip:port` format
-  if (addr.size() != 2 || addr[0].empty() || addr[1].empty()) {
-    LOG(ERROR)
-        << "Invalid instance name format, now only support `ip:port` style.";
+  if (!xllm::net::is_valid_host_port(name)) {
+    LOG(ERROR) << "Invalid instance endpoint; expected host:port or "
+                  "[ipv6]:port.";
     return false;
   }
 
+  return true;
+}
+
+bool add_provider_descriptor_to_registration(
+    const proto::ProviderDescriptor& descriptor,
+    nlohmann::json* registration,
+    std::string* error) {
+  std::string descriptor_text;
+  google::protobuf::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
+  const google::protobuf::util::Status status =
+      google::protobuf::util::MessageToJsonString(
+          descriptor, &descriptor_text, options);
+  if (!status.ok()) {
+    if (error != nullptr) {
+      *error =
+          "Failed to encode Native Provider Descriptor: " + status.ToString();
+    }
+    return false;
+  }
+  nlohmann::json descriptor_json = nlohmann::json::parse(
+      descriptor_text, nullptr, /*allow_exceptions=*/false);
+  if (descriptor_json.is_discarded()) {
+    if (error != nullptr) {
+      *error = "Native Provider Descriptor JSON is invalid";
+    }
+    return false;
+  }
+  (*registration)["provider_id"] =
+      static_cast<int32_t>(descriptor.identity().provider_id());
+  (*registration)["provider_contract_version"] = descriptor.contract_version();
+  (*registration)["provider_profile_digest"] = descriptor.profile_digest();
+  (*registration)["backend_type"] = "xllm";
+  (*registration)["provider_descriptor"] = std::move(descriptor_json);
   return true;
 }
 
@@ -75,7 +221,7 @@ bool check_instance_name(const std::string& name) {
 
 bool XServiceClient::init(const std::string& etcd_addr,
                           const std::string& instance_name,
-                          const BlockManagerPool* block_manager_pool,
+                          BlockManagerPool* block_manager_pool,
                           const std::string& etcd_namespace) {
   if (initialize_done_) {
     LOG(INFO) << "XServiceClient is already initialized, skipping.";
@@ -87,11 +233,31 @@ bool XServiceClient::init(const std::string& etcd_addr,
     return false;
   }
 
-  instance_name_ = instance_name;
-  if (incarnation_id_.empty()) {
-    ShortUUID uuid;
-    incarnation_id_ = uuid.random();
+  const DistributedConfig& distributed_config =
+      DistributedConfig::get_instance();
+  if (!etcd_schema::valid_control_plane_shard_id(
+          distributed_config.control_plane_shard_id())) {
+    LOG(ERROR) << "Invalid control_plane_shard_id; expected 1-64 ASCII "
+                  "letters, digits, '.', '_' or '-'";
+    return false;
   }
+  master_service_key_ = etcd_schema::master_service_key_for_shard(
+      distributed_config.control_plane_shard_id());
+  xservices_key_prefix_ = etcd_schema::router_member_prefix_for_shard(
+      distributed_config.control_plane_shard_id());
+  if (!valid_registration_lease_timing(
+          distributed_config.etcd_ttl(),
+          distributed_config.heart_beat_interval())) {
+    LOG(ERROR) << "Invalid service-routing membership timing: etcd_ttl="
+               << distributed_config.etcd_ttl() << "s, heart_beat_interval="
+               << distributed_config.heart_beat_interval()
+               << "s. etcd_ttl must be at least "
+               << kMinRegistrationLeaseTtlSeconds
+               << "s and the reconcile interval must be in (0, ttl/3].";
+    return false;
+  }
+
+  instance_name_ = instance_name;
   chan_options_.max_retry = 3;
   chan_options_.timeout_ms =
       ::xllm::ServiceConfig::get_instance().rpc_channel_timeout_ms();
@@ -115,7 +281,7 @@ bool XServiceClient::init(const std::string& etcd_addr,
   }
 
   // connect master xllm_service
-  while (!etcd_client_->get_master_service(ETCD_MASTER_SERVICE_KEY,
+  while (!etcd_client_->get_master_service(master_service_key_,
                                            &master_xservice_addr_)) {
     LOG(ERROR) << "Master service not set, wait 2s!";
     sleep(2);
@@ -135,8 +301,7 @@ bool XServiceClient::init(const std::string& etcd_addr,
 
   // Get and connect to all existing xllm_service instances.
   std::vector<std::string> all_services;
-  if (etcd_client_->get_all_xservices(ETCD_XSERVICES_KEY_PREFIX,
-                                      &all_services)) {
+  if (etcd_client_->get_all_xservices(xservices_key_prefix_, &all_services)) {
     for (const auto& service_addr : all_services) {
       if (service_addr != master_xservice_addr_ &&
           check_instance_name(service_addr)) {
@@ -144,6 +309,8 @@ bool XServiceClient::init(const std::string& etcd_addr,
       }
     }
   }
+
+  block_manager_pool_ = block_manager_pool;
 
   // heartbeat thread
   heartbeat_thread_ =
@@ -156,16 +323,14 @@ bool XServiceClient::init(const std::string& etcd_addr,
                             uint64_t prefix_len) {
     handle_master_service_watch(response, prefix_len);
   };
-  etcd_client_->add_watch(ETCD_MASTER_SERVICE_KEY, master_func);
+  etcd_client_->add_watch(master_service_key_, master_func);
 
   // watch all xllm_service changes
   auto xservices_func = [this](const etcd::Response& response,
                                uint64_t prefix_len) {
     handle_xservices_watch(response, prefix_len);
   };
-  etcd_client_->add_watch(ETCD_XSERVICES_KEY_PREFIX, xservices_func);
-
-  block_manager_pool_ = block_manager_pool;
+  etcd_client_->add_watch(xservices_key_prefix_, xservices_func);
 
   initialize_done_ = true;
   return true;
@@ -177,17 +342,57 @@ void XServiceClient::set_scheduler(Scheduler* scheduler) {
 
 void XServiceClient::set_engine(Engine* engine) { engine_ = engine; }
 
-XServiceClient::~XServiceClient() {
-  exited_.store(true);
-  if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
-    heartbeat_thread_->join();
-  }
-  if (reconcile_thread_ && reconcile_thread_->joinable()) {
-    reconcile_thread_->join();
-  }
+XServiceClient::~XServiceClient() { shutdown(); }
+
+void XServiceClient::shutdown() {
+  std::call_once(shutdown_once_, [this]() {
+    LOG(INFO) << "XServiceClient background workers stopping...";
+    exited_.store(true, std::memory_order_release);
+    kv_event_wait_cv_.notify_all();
+    if (etcd_client_ != nullptr) {
+      etcd_client_->stop_watch();
+    }
+    if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
+      heartbeat_thread_->join();
+    }
+    if (reconcile_thread_ && reconcile_thread_->joinable()) {
+      reconcile_thread_->join();
+    }
+    if (kv_event_thread_ && kv_event_thread_->joinable()) {
+      kv_event_thread_->join();
+    }
+    heartbeat_thread_.reset();
+    reconcile_thread_.reset();
+    kv_event_thread_.reset();
+
+    {
+      std::lock_guard<std::mutex> lock(registration_mutex_);
+      register_done_.store(false, std::memory_order_release);
+      registration_key_.clear();
+      engine_state_builder_.reset();
+      provider_descriptor_.reset();
+    }
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      master_xservice_addr_.clear();
+      xservice_stubs_.clear();
+      xservice_channels_.clear();
+    }
+    etcd_client_.reset();
+    block_manager_pool_ = nullptr;
+    scheduler_ = nullptr;
+    engine_ = nullptr;
+    LOG(INFO) << "XServiceClient background workers stopped.";
+  });
 }
 
 std::string XServiceClient::get_instance_name() { return instance_name_; }
+
+std::optional<proto::ProviderDescriptor>
+XServiceClient::get_provider_descriptor() {
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  return provider_descriptor_;
+}
 
 bool XServiceClient::register_instance_with_retry(const std::string& key,
                                                   const std::string& value) {
@@ -208,34 +413,43 @@ bool XServiceClient::register_instance_with_retry(const std::string& key,
 
 bool XServiceClient::reconcile_registration() {
   std::string registration_key;
-  std::string registration_value;
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);
-    if (!register_done_.load() || registration_key_.empty() ||
-        registration_value_.empty()) {
+    if (!register_done_.load() || registration_key_.empty()) {
       return true;
     }
     registration_key = registration_key_;
-    registration_value = registration_value_;
   }
 
-  std::string current_value;
-  if (etcd_client_->get(registration_key, &current_value) &&
-      !current_value.empty()) {
+  const RegistrationReconcileAction action = registration_reconcile_action(
+      etcd_client_->lookup_registration(registration_key));
+  if (action == RegistrationReconcileAction::kKeepServing) {
     return true;
   }
+  if (action == RegistrationReconcileAction::kRetryLookup) {
+    LOG(WARNING) << "Could not verify instance membership in etcd; retaining "
+                    "the current registration while lookup is retried: "
+                 << registration_key;
+    return false;
+  }
 
-  LOG(WARNING) << "Detected missing instance registration in etcd, "
-                  "re-registering instance: "
-               << registration_key;
-  return register_instance_with_retry(registration_key, registration_value);
+  LOG(FATAL) << "Instance membership was lost in etcd. The current process "
+                "must stop and a fresh process must register again. key="
+             << registration_key;
+  return false;
 }
 
 void XServiceClient::reconcile_registration_loop() {
   while (!exited_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
+    const auto interval = std::chrono::milliseconds(static_cast<int64_t>(
         ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
-        1000)));
+        1000));
+    std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+    if (kv_event_wait_cv_.wait_for(
+            lock, interval, [this]() { return exited_.load(); })) {
+      break;
+    }
+    lock.unlock();
     if (!register_done_.load()) continue;
 
     if (!reconcile_registration()) {
@@ -246,7 +460,6 @@ void XServiceClient::reconcile_registration_loop() {
 
 void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   InstanceInfo registered_info = instance_info;
-  registered_info.incarnation_id = incarnation_id_;
   if (registered_info.register_ts_ms == 0) {
     registered_info.register_ts_ms =
         static_cast<uint64_t>(absl::ToUnixMillis(absl::Now()));
@@ -270,12 +483,42 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   }
 
   const std::string key = key_prefix + registered_info.name;
-  const std::string value = registered_info.serialize_to_json().dump();
+  nlohmann::json registration = registered_info.serialize_to_json();
+  std::shared_ptr<NativeEngineStateBuilder> engine_state_builder;
+  std::optional<proto::ProviderDescriptor> provider_descriptor;
+  bool journal_ready = false;
+  if (engine_ != nullptr && block_manager_pool_ != nullptr) {
+    std::string error;
+    const std::optional<NativeProviderDescriptorConfig> config =
+        collect_native_provider_descriptor_config(
+            registered_info, *engine_, *block_manager_pool_, &error);
+    if (config.has_value()) {
+      provider_descriptor = build_native_provider_descriptor(*config, &error);
+      if (!provider_descriptor.has_value() ||
+          !add_provider_descriptor_to_registration(
+              *provider_descriptor, &registration, &error)) {
+        LOG(FATAL) << "Failed to build Native V2 registration: " << error;
+        return;
+      }
+      engine_state_builder =
+          std::make_shared<NativeEngineStateBuilder>(*provider_descriptor);
+
+      // The journal is ready for the life of the process. Its drain watermark
+      // starts at 8192 and grows with the resident hash set; it does not need
+      // the block-manager capacity.
+      journal_ready = block_manager_pool_->options().enable_prefix_cache();
+    } else if (!error.empty()) {
+      LOG(FATAL) << "Failed to collect Native V2 registration: " << error;
+      return;
+    }
+  }
+  const std::string value = registration.dump();
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);
     instance_name_ = registered_info.name;
     registration_key_ = key;
-    registration_value_ = value;
+    engine_state_builder_ = std::move(engine_state_builder);
+    provider_descriptor_ = std::move(provider_descriptor);
   }
 
   if (!register_instance_with_retry(key, value)) {
@@ -284,6 +527,13 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   }
 
   register_done_.store(true);
+  // Membership is the fencing authority for KV events. Starting this sender
+  // before etcd registration succeeds lets a valid journal race the Service
+  // registry and produces a deterministic REMOTE_REJECTED first batch.
+  if (journal_ready && kv_event_thread_ == nullptr) {
+    kv_event_thread_ =
+        std::make_unique<std::thread>(&XServiceClient::kv_event_loop, this);
+  }
   LOG(INFO) << "Success register instance to etcd.";
 }
 
@@ -292,7 +542,6 @@ InstanceInfo instance_info_from_proto(
   InstanceInfo result;
   result.name = response.name();
   result.rpc_address = response.rpc_address();
-  result.incarnation_id = response.incarnation_id();
   result.register_ts_ms = response.register_ts_ms();
   if (response.type() == xllm_service::proto::InstanceType::PREFILL) {
     result.type = "PREFILL";
@@ -324,12 +573,180 @@ InstanceInfo instance_info_from_proto(
   // (or a serving master) that predates the field, and admission keeps the
   // legacy behavior for it rather than guessing a mode.
   result.cp_index_write_mode = response.cp_index_write_mode();
+  // super_node_id: empty is a wildcard (engine opts out of cross super-node
+  // isolation). Round-trip the wire value verbatim; InstanceInfo.super_node_id
+  // defaults to "" so a peer that never declared one stays a wildcard.
+  result.super_node_id = response.super_node_id();
   result.ports.reserve(static_cast<size_t>(response.ports_size()));
   for (auto& port : response.ports()) {
     result.ports.emplace_back(port);
   }
 
   return result;
+}
+
+proto::KVStreamIdentity XServiceClient::kv_stream_identity() const {
+  proto::KVStreamIdentity identity;
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  if (!provider_descriptor_.has_value()) {
+    return identity;
+  }
+  identity.mutable_engine()->set_provider_id(
+      provider_descriptor_->identity().provider_id());
+  identity.mutable_engine()->set_profile_digest(
+      provider_descriptor_->profile_digest());
+  identity.mutable_engine()->set_engine_uid(
+      provider_descriptor_->identity().engine_uid());
+  identity.set_model_revision(provider_descriptor_->model().model_revision());
+  identity.set_cache_epoch(1);
+  return identity;
+}
+
+proto::KVEventBatch XServiceClient::make_kv_event_batch(
+    const PrefixCacheEvents& events) {
+  proto::KVEventBatch message;
+  message.set_contract_version(kKVEventContractVersion);
+  *message.mutable_identity() = kv_stream_identity();
+  message.set_commit_version(events.commit_version);
+  message.set_previous_commit_version(kv_last_pushed_version_);
+  if (kv_failed_commit_version_.has_value()) {
+    message.set_failed_commit_version(*kv_failed_commit_version_);
+    message.set_failed_commit_error(kv_failed_commit_error_);
+  }
+  for (const PrefixCacheEvent& event : events.events) {
+    proto::KVEvent* proto_event = message.add_events();
+    proto_event->set_event_seq(message.events_size());
+    proto_event->set_kind(prefix_cache_kind_to_proto(event.kind));
+    proto_event->set_reason(prefix_cache_reason_to_proto(event.kind));
+    if (event.kind != PrefixCacheEventKind::CLEARED) {
+      proto_event->mutable_block()->set_block_hash(event.hash.data,
+                                                   XXH3_128BITS_HASH_VALUE_LEN);
+    }
+  }
+  kv_last_pushed_version_ = events.commit_version;
+  return message;
+}
+
+proto::KVCacheSnapshotPage XServiceClient::prefix_cache_snapshot_to_proto(
+    const PrefixCacheSnapshot& snapshot) const {
+  proto::KVCacheSnapshotPage page;
+  page.set_contract_version(kKVEventContractVersion);
+  page.set_status(proto::KV_SNAPSHOT_STATUS_OK);
+  *page.mutable_identity() = kv_stream_identity();
+  page.set_commit_version(snapshot.commit_version);
+  uint64_t bytes = 0;
+  for (const XXH3Key& hash : snapshot.hashes) {
+    proto::KVBlockEntry* entry = page.add_entries();
+    entry->set_block_hash(hash.data, XXH3_128BITS_HASH_VALUE_LEN);
+    bytes += entry->ByteSizeLong();
+  }
+  page.set_serialized_bytes(bytes);
+  return page;
+}
+
+void XServiceClient::note_kv_push_result(bool success,
+                                         uint64_t commit_version,
+                                         uint64_t service_commit_version,
+                                         const std::string& error) {
+  if (!success) {
+    if (commit_version > 0) {
+      kv_failed_commit_version_ = commit_version;
+      kv_failed_commit_error_ = error;
+    }
+    return;
+  }
+  kv_failed_commit_version_.reset();
+  kv_failed_commit_error_.clear();
+  static_cast<void>(service_commit_version);
+}
+
+void XServiceClient::kv_event_loop() {
+  constexpr size_t kMaxBatchEvents = 256;
+  constexpr std::chrono::milliseconds kIdleWait(10);
+  constexpr uint64_t kKeepaliveIntervalMs = 1000;
+  uint64_t last_successful_publish_ms = 0;
+  FailureEpisodeTracker failure_episode(
+      {.backoff = {.initial_delay = std::chrono::milliseconds(50),
+                   .maximum_delay = std::chrono::seconds(1)},
+       .summary_interval = std::chrono::seconds(30)});
+  CHECK(failure_episode.valid());
+  while (!exited_.load()) {
+    const uint64_t now_monotonic_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const PrefixCacheEvents drained =
+        PrefixCacheJournal::instance()->get_prefixcache_events(kMaxBatchEvents);
+    const bool due_keepalive =
+        drained.events.empty() && drained.commit_version > 0 &&
+        (last_successful_publish_ms == 0 ||
+         now_monotonic_ms < last_successful_publish_ms ||
+         now_monotonic_ms - last_successful_publish_ms >= kKeepaliveIntervalMs);
+    if (drained.events.empty() && !due_keepalive) {
+      std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+      kv_event_wait_cv_.wait_for(
+          lock, kIdleWait, [this]() { return exited_.load(); });
+      continue;
+    }
+
+    proto::KVEventBatch batch = make_kv_event_batch(drained);
+
+    brpc::Controller controller;
+    controller.set_timeout_ms(200);
+    xllm_service::proto::Status response;
+    std::string master_addr;
+    const bool issued = with_master_stub(
+        [&](xllm_service::proto::XllmRpcService_Stub* master_stub) {
+          master_stub->PushKVEvents(&controller, &batch, &response, nullptr);
+        },
+        &master_addr,
+        /*quiet=*/true);
+    const bool success = issued && !controller.Failed() && response.ok();
+    const ControlPlaneFailure failure =
+        control_plane_failure(issued, controller, response);
+    const uint64_t service_version =
+        response.has_kv_commit_version() ? response.kv_commit_version() : 0;
+    note_kv_push_result(
+        success, batch.commit_version(), service_version, failure.detail);
+    if (success) {
+      last_successful_publish_ms = now_monotonic_ms;
+      const std::optional<FailureRecovery> recovery =
+          failure_episode.record_success();
+      if (recovery.has_value()) {
+        COUNTER_INC(kv_event_publish_recoveries_total);
+        log_control_plane_recovery("KV_EVENT", master_addr, *recovery);
+      }
+    }
+    if (!success) {
+      COUNTER_INC(kv_event_publish_failures_total);
+      const ControlPlaneFailure failure =
+          control_plane_failure(issued, controller, response);
+      const FailureObservation observation =
+          failure_episode.record_failure(failure.reason);
+      log_control_plane_failure("KV_EVENT", master_addr, failure, observation);
+      if (observation.action == FailureReportAction::kSuppressed) {
+        COUNTER_INC(kv_event_publish_suppressed_total);
+      }
+      std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+      kv_event_wait_cv_.wait_for(
+          lock, observation.retry_delay, [this]() { return exited_.load(); });
+    }
+  }
+}
+
+proto::KVCacheSnapshotPage XServiceClient::get_kv_cache_snapshot(
+    const proto::KVCacheSnapshotRequest& request) {
+  const proto::KVStreamIdentity local = kv_stream_identity();
+  if (local.engine().engine_uid().empty() ||
+      !same_kv_identity(request.identity(), local)) {
+    proto::KVCacheSnapshotPage page;
+    page.set_contract_version(kKVEventContractVersion);
+    page.set_status(proto::KV_SNAPSHOT_STATUS_INVALID_REQUEST);
+    page.set_status_message("KV event journal is unavailable");
+    return page;
+  }
+  return prefix_cache_snapshot_to_proto(
+      PrefixCacheJournal::instance()->get_snapshot());
 }
 
 InstanceInfo XServiceClient::get_instance_info(
@@ -358,10 +775,23 @@ InstanceInfo XServiceClient::get_instance_info(
 }
 
 void XServiceClient::heartbeat() {
+  const auto heartbeat_interval = std::chrono::milliseconds(std::max<int64_t>(
+      1,
+      static_cast<int64_t>(
+          ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
+          1000)));
+  FailureEpisodeTracker failure_episode(
+      {.backoff = {.initial_delay = heartbeat_interval,
+                   .maximum_delay = heartbeat_interval},
+       .summary_interval = std::chrono::seconds(30)});
+  CHECK(failure_episode.valid());
   while (!exited_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
-        ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
-        1000)));
+    std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+    if (kv_event_wait_cv_.wait_for(
+            lock, heartbeat_interval, [this]() { return exited_.load(); })) {
+      break;
+    }
+    lock.unlock();
     if (!register_done_.load()) continue;
 
     if (block_manager_pool_ == nullptr || scheduler_ == nullptr) continue;
@@ -369,13 +799,45 @@ void XServiceClient::heartbeat() {
     brpc::Controller cntl;
     xllm_service::proto::HeartbeatRequest req;
     req.set_name(instance_name_);
-    req.set_incarnation_id(incarnation_id_);
 
     req.mutable_load_metrics()->set_gpu_cache_usage_perc(
         block_manager_pool_->get_gpu_cache_usage_perc());
 
     req.mutable_load_metrics()->set_waiting_requests_num(
         scheduler_->get_waiting_requests_num());
+
+    std::shared_ptr<NativeEngineStateBuilder> engine_state_builder;
+    {
+      std::lock_guard<std::mutex> lock(registration_mutex_);
+      engine_state_builder = engine_state_builder_;
+    }
+    if (engine_state_builder != nullptr) {
+      const std::vector<BlockCapacitySnapshot> capacity =
+          block_manager_pool_->capacity_snapshots();
+      NativeEngineStateSnapshot snapshot;
+      snapshot.kv_free_blocks.reserve(capacity.size());
+      snapshot.kv_used_blocks.reserve(capacity.size());
+      snapshot.kv_total_blocks.reserve(capacity.size());
+      for (const BlockCapacitySnapshot& value : capacity) {
+        snapshot.kv_free_blocks.emplace_back(
+            static_cast<uint64_t>(value.free_blocks));
+        snapshot.kv_used_blocks.emplace_back(
+            static_cast<uint64_t>(value.used_blocks));
+        snapshot.kv_total_blocks.emplace_back(
+            static_cast<uint64_t>(value.total_blocks));
+      }
+      // Idleness is decided by Service from waiting and running counts. The
+      // heartbeat always publishes READY; DRAINING lives only in etcd.
+      snapshot.lifecycle = proto::ENGINE_LIFECYCLE_READY;
+      std::string error;
+      const std::optional<proto::EngineState> state =
+          engine_state_builder->build(snapshot, &error);
+      if (state.has_value()) {
+        *req.mutable_engine_state() = *state;
+      } else {
+        LOG(ERROR) << "Failed to build Native EngineState: " << error;
+      }
+    }
 
     std::vector<int64_t> ttft;
     std::vector<int64_t> tbt;
@@ -390,46 +852,35 @@ void XServiceClient::heartbeat() {
       req.mutable_latency_metrics()->set_recent_max_tbt(*max_tbt);
     }
 
-    // Collect XTensor info (worker free pages, model weight segments)
-    if (engine_ != nullptr) {
-      std::vector<size_t> worker_free_phy_pages;
-      std::unordered_map<std::string, std::vector<WeightSegment>>
-          model_weight_segments;
-      engine_->get_xtensor_info(worker_free_phy_pages, model_weight_segments);
-
-      auto* xtensor_info = req.mutable_xtensor_info();
-      for (size_t free_pages : worker_free_phy_pages) {
-        xtensor_info->add_worker_free_phy_pages(free_pages);
-      }
-
-      // Report weight segments (for non-contiguous allocation support)
-      for (const auto& [model_id, segments] : model_weight_segments) {
-        auto& seg_list =
-            (*xtensor_info->mutable_model_weight_segments())[model_id];
-        for (const auto& seg : segments) {
-          auto* proto_seg = seg_list.add_segments();
-          proto_seg->set_offset(seg.offset);
-          proto_seg->set_size(seg.size);
-        }
-      }
-    }
+    // XTensor page and weight-segment fields stay unset. Scheduling does not
+    // consume them, and the registration payload must not invent values.
 
     xllm_service::proto::Status resp;
     std::string master_addr;
-    if (!with_master_stub(
-            [&](xllm_service::proto::XllmRpcService_Stub* master_stub) {
-              master_stub->Heartbeat(&cntl, &req, &resp, nullptr);
-            },
-            &master_addr)) {
-      continue;
-    }
-
-    if (cntl.Failed()) {
-      LOG(ERROR) << "Failed to send heartbeat to master xservice "
-                 << master_addr << ", error msg is: " << cntl.ErrorText();
-    } else if (!resp.ok()) {
-      LOG(ERROR) << "Failed to send heartbeat to master xservice "
-                 << master_addr;
+    const bool issued = with_master_stub(
+        [&](xllm_service::proto::XllmRpcService_Stub* master_stub) {
+          master_stub->Heartbeat(&cntl, &req, &resp, nullptr);
+        },
+        &master_addr,
+        /*quiet=*/true);
+    const bool success = issued && !cntl.Failed() && resp.ok();
+    if (success) {
+      const std::optional<FailureRecovery> recovery =
+          failure_episode.record_success();
+      if (recovery.has_value()) {
+        COUNTER_INC(engine_heartbeat_recoveries_total);
+        log_control_plane_recovery("HEARTBEAT", master_addr, *recovery);
+      }
+    } else {
+      COUNTER_INC(engine_heartbeat_failures_total);
+      const ControlPlaneFailure failure =
+          control_plane_failure(issued, cntl, resp);
+      const FailureObservation observation =
+          failure_episode.record_failure(failure.reason);
+      log_control_plane_failure("HEARTBEAT", master_addr, failure, observation);
+      if (observation.action == FailureReportAction::kSuppressed) {
+        COUNTER_INC(engine_heartbeat_suppressed_total);
+      }
     }
   }
 }
@@ -491,133 +942,58 @@ std::vector<std::string> XServiceClient::get_all_xservice_addrs() {
 
 std::vector<bool> XServiceClient::generations(
     const std::vector<RequestOutput>& outputs) {
+  // true means the owning service accepted the output. A transport failure or
+  // a rejected status is false so the baseline scheduler cancels the request.
   std::vector<bool> results(outputs.size(), false);
-  std::string master_addr;
-  {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    master_addr = master_xservice_addr_;
-  }
 
-  // group requests by target xllm_service
-  std::unordered_map<std::string, std::vector<size_t>> service_outputs_map;
-  std::unordered_map<std::string, proto::DisaggStreamGenerations>
-      service_requests_map;
+  // Keep each callback under Service's bounded Generations RPC contract.
+  // Multiple chunks for the same Service are still fired before any join, so
+  // a large scheduler step does not serialize transport latency.
+  constexpr size_t kMaxGenerationsPerRpc = 256;
+  struct PendingBatch {
+    std::string service_addr;
+    std::vector<size_t> output_indices;
+    proto::DisaggStreamGenerations gens;
+  };
+  std::vector<PendingBatch> pending_batches;
+  KeyedBoundedBatchPlanner<std::string> batch_planner(kMaxGenerationsPerRpc);
 
-  auto mark_service_failed = [&](const std::string& service_addr) {
-    auto index_it = service_outputs_map.find(service_addr);
-    if (index_it == service_outputs_map.end()) {
-      return;
-    }
-    for (size_t idx : index_it->second) {
+  auto mark_batch_failed = [&](const std::vector<size_t>& indices) {
+    for (size_t idx : indices) {
       results[idx] = false;
     }
   };
 
   for (size_t i = 0; i < outputs.size(); ++i) {
     const auto& output = outputs[i];
-    std::string target_service = master_addr;
-    if (!output.target_xservice_addr.empty()) {
-      target_service = output.target_xservice_addr;
-    }
-
-    if (target_service.empty()) {
-      LOG(ERROR) << "No target xservice address available for request_id: "
+    if (output.target_xservice_addr.empty()) {
+      LOG(ERROR) << "Reject service-routed output without its owning xservice "
+                    "address, request_id="
                  << output.request_id;
       continue;
     }
+    const std::string& target_service = output.target_xservice_addr;
 
-    service_outputs_map[target_service].push_back(i);
-
-    // construct the request to corresponding service
-    auto& gens = service_requests_map[target_service];
-    proto::DisaggStreamGeneration* req = gens.mutable_gens()->Add();
-    req->set_req_id(output.request_id);
-    req->set_service_req_id(output.service_request_id);
-    if (output.status.has_value()) {
-      auto gen_status = req->mutable_gen_status();
-      gen_status->set_status_code(
-          static_cast<int32_t>(output.status.value().code()));
-      gen_status->set_status_msg(output.status.value().message());
-      if (output.status.value().reason() != FailureReason::UNSPECIFIED) {
-        gen_status->set_failure_reason(
-            static_cast<int32_t>(output.status.value().reason()));
-      }
-      if (output.status.value().param().has_value()) {
-        gen_status->set_param(*output.status.value().param());
-      }
-      if (!output.status->ok()) {
-        const PublicHttpError error = public_error_from_status(*output.status);
-        auto* public_error = gen_status->mutable_error();
-        public_error->set_http_status_code(error.status_code);
-        public_error->set_type(error.type);
-        public_error->set_code(error.code);
-        public_error->set_message(error.message);
-        public_error->set_retryable(error.retryable);
-        if (error.param.has_value()) {
-          public_error->set_param(*error.param);
-        }
-      }
+    proto::DisaggStreamGeneration generation;
+    if (!request_output_to_proto(output, instance_name_, &generation)) {
+      LOG(ERROR) << "Failed to encode generation output for request_id: "
+                 << output.request_id;
+      continue;
     }
-    req->set_finished(output.finished);
-    req->set_finished_on_prefill_instance(output.finished_on_prefill_instance);
-    if (output.usage.has_value()) {
-      proto::OutputUsage* proto_usage = req->mutable_usage();
-      proto_usage->set_num_prompt_tokens(
-          output.usage.value().num_prompt_tokens);
-      proto_usage->set_num_generated_tokens(
-          output.usage.value().num_generated_tokens);
-      proto_usage->set_num_total_tokens(output.usage.value().num_total_tokens);
-      proto_usage->set_num_cached_tokens(
-          output.usage.value().num_cached_tokens);
+    const std::optional<size_t> batch_index =
+        batch_planner.assign(target_service);
+    if (!batch_index.has_value()) {
+      LOG(ERROR) << "Generation batch planner rejected request_id: "
+                 << output.request_id;
+      continue;
     }
-    req->mutable_outputs()->Reserve(output.outputs.size());
-    for (auto& seq_output : output.outputs) {
-      auto proto_seq_out = req->mutable_outputs()->Add();
-      proto_seq_out->set_index(seq_output.index);
-      proto_seq_out->set_text(seq_output.text);
-      if (seq_output.finish_reason.has_value()) {
-        proto_seq_out->set_finish_reason(seq_output.finish_reason.value());
-      } else {
-        proto_seq_out->set_finish_reason("");
-      }
-      proto_seq_out->mutable_token_ids()->Reserve(seq_output.token_ids.size());
-      for (const auto& value : seq_output.token_ids) {
-        *proto_seq_out->mutable_token_ids()->Add() = value;
-      }
-      if (seq_output.logprobs.has_value()) {
-        size_t logprobs_size = seq_output.logprobs.value().size();
-        proto_seq_out->mutable_logprobs()->Reserve(logprobs_size);
-        for (size_t j = 0; j < logprobs_size; ++j) {
-          auto logprob = proto_seq_out->mutable_logprobs()->Add();
-          proto::LogProbData* log_prob_data = logprob->mutable_log_prob_data();
-          log_prob_data->set_token(seq_output.logprobs.value()[j].token);
-          log_prob_data->set_token_id(seq_output.logprobs.value()[j].token_id);
-          log_prob_data->set_logprob(seq_output.logprobs.value()[j].logprob);
-          log_prob_data->set_finished_token(
-              seq_output.logprobs.value()[j].finished_token);
-          if (seq_output.logprobs.value()[j].top_logprobs.has_value()) {
-            size_t top_logprobs_size =
-                seq_output.logprobs.value()[j].top_logprobs.value().size();
-            for (size_t k = 0; k < top_logprobs_size; ++k) {
-              proto::LogProbData* top_log_prob_data =
-                  logprob->mutable_top_logprobs()->Add();
-              top_log_prob_data->set_token(
-                  seq_output.logprobs.value()[j].top_logprobs.value()[k].token);
-              top_log_prob_data->set_token_id(seq_output.logprobs.value()[j]
-                                                  .top_logprobs.value()[k]
-                                                  .token_id);
-              top_log_prob_data->set_logprob(seq_output.logprobs.value()[j]
-                                                 .top_logprobs.value()[k]
-                                                 .logprob);
-              top_log_prob_data->set_finished_token(
-                  seq_output.logprobs.value()[j]
-                      .top_logprobs.value()[k]
-                      .finished_token);
-            }
-          }
-        }
-      }
+    if (*batch_index == pending_batches.size()) {
+      pending_batches.emplace_back(
+          PendingBatch{.service_addr = target_service});
     }
+    PendingBatch& batch = pending_batches[*batch_index];
+    batch.output_indices.push_back(i);
+    *batch.gens.add_gens() = std::move(generation);
   }
 
   // Use brpc semi-synchronous RPC pattern (DoNothing + Join) instead of
@@ -629,21 +1005,19 @@ std::vector<bool> XServiceClient::generations(
     brpc::Controller cntl;
     proto::StatusSet resp;
     proto::DisaggStreamGenerations gens;
+    std::vector<size_t> output_indices;
     bool issued = false;
   };
 
-  const size_t num_services = service_requests_map.size();
-  std::vector<AsyncCallContext> contexts(num_services);
-  std::vector<std::string> service_order;
-  service_order.reserve(num_services);
+  std::vector<AsyncCallContext> contexts(pending_batches.size());
 
   // Fire all RPCs asynchronously
-  size_t idx = 0;
-  for (const auto& pair : service_requests_map) {
-    auto& ctx = contexts[idx++];
-    ctx.service_addr = pair.first;
-    ctx.gens = pair.second;
-    service_order.push_back(ctx.service_addr);
+  for (size_t index = 0; index < pending_batches.size(); ++index) {
+    PendingBatch& batch = pending_batches[index];
+    AsyncCallContext& ctx = contexts[index];
+    ctx.service_addr = std::move(batch.service_addr);
+    ctx.gens = std::move(batch.gens);
+    ctx.output_indices = std::move(batch.output_indices);
 
     if (!connect_to_xservice(ctx.service_addr)) {
       LOG(ERROR) << "Failed to connect target xservice: " << ctx.service_addr;
@@ -657,6 +1031,8 @@ std::vector<bool> XServiceClient::generations(
       continue;
     }
     ctx.issued = true;
+    ctx.cntl.set_timeout_ms(
+        ::xllm::ServiceConfig::get_instance().output_delivery_rpc_timeout_ms());
     service_stub->Generations(
         &ctx.cntl, &ctx.gens, &ctx.resp, brpc::DoNothing());
   }
@@ -669,40 +1045,75 @@ std::vector<bool> XServiceClient::generations(
   }
 
   // Process results
-  for (size_t i = 0; i < contexts.size(); ++i) {
-    const std::string& service_addr = service_order[i];
-    auto& ctx = contexts[i];
-    auto index_it = service_outputs_map.find(service_addr);
-    CHECK(index_it != service_outputs_map.end())
-        << "No output index found for service: " << service_addr;
-    const auto& indices = index_it->second;
+  for (auto& ctx : contexts) {
+    const std::string& service_addr = ctx.service_addr;
+    const std::vector<size_t>& indices = ctx.output_indices;
 
     if (!ctx.issued || ctx.cntl.Failed()) {
       if (ctx.cntl.Failed()) {
         LOG(ERROR) << "Fail to response tokens to xservice server "
                    << service_addr << ", error text: " << ctx.cntl.ErrorText();
       }
-      mark_service_failed(service_addr);
+      mark_batch_failed(indices);
       continue;
     }
 
-    CHECK_EQ(ctx.resp.all_status_size(), static_cast<int>(indices.size()))
-        << "The size of status set is not equal to the size of outputs for "
-           "service: "
-        << service_addr;
+    if (ctx.resp.all_status_size() != static_cast<int>(indices.size())) {
+      LOG(ERROR) << "Generation delivery returned "
+                 << ctx.resp.all_status_size() << " statuses for "
+                 << indices.size() << " outputs, service=" << service_addr;
+      continue;
+    }
 
     for (size_t j = 0; j < indices.size(); ++j) {
       size_t original_idx = indices[j];
-      results[original_idx] = ctx.resp.all_status(j).ok();
+      const proto::Status& status = ctx.resp.all_status(j);
+      results[original_idx] = status.ok();
+      if (!status.ok()) {
+        LOG(INFO) << "Output subscriber rejected request_id="
+                  << outputs[original_idx].request_id << ", delivery_code="
+                  << (status.has_delivery_code()
+                          ? static_cast<int>(status.delivery_code())
+                          : 0)
+                  << ", message=" << status.status_msg();
+      }
+    }
+  }
+
+  if (level_one_trace_enabled()) {
+    for (size_t index = 0; index < outputs.size(); ++index) {
+      const RequestOutput& output = outputs[index];
+      // Record first/terminal delivery boundaries and failures, not every
+      // successful token. This joins Engine ownership to Service's ACK.
+      if (!output.finished && !output.finished_on_prefill_instance &&
+          results[index]) {
+        continue;
+      }
+      const char* outcome = results[index] ? "DELIVERED" : "REJECTED";
+      std::ostringstream diagnostic;
+      diagnostic << "engine_output_delivery request_uid="
+                 << output.service_request_id
+                 << " engine_request_id=" << output.request_id
+                 << " engine_uid=" << instance_name_
+                 << " service=" << output.target_xservice_addr
+                 << " finished_on_prefill="
+                 << output.finished_on_prefill_instance
+                 << " finished=" << output.finished << " outcome=" << outcome;
+      log_level_one_trace(__FILE__, __LINE__, diagnostic.str());
     }
   }
 
   return results;
 }
 
-bool XServiceClient::connect_to_xservice(const std::string& xservice_addr) {
+bool XServiceClient::connect_to_xservice(const std::string& xservice_addr,
+                                         bool quiet) {
   if (!check_instance_name(xservice_addr)) {
-    LOG(ERROR) << "Invalid xservice address format: " << xservice_addr;
+    if (quiet) {
+      VLOG(1) << "Invalid xservice address format: " << xservice_addr;
+    } else {
+      LOG(ERROR) << "Invalid xservice address format: " << xservice_addr;
+    }
     return false;
   }
 
@@ -715,8 +1126,13 @@ bool XServiceClient::connect_to_xservice(const std::string& xservice_addr) {
 
   auto channel = std::make_unique<brpc::Channel>();
   if (channel->Init(xservice_addr.c_str(), "", &chan_options_) != 0) {
-    LOG(ERROR) << "Fail to initialize xservice channel to server "
-               << xservice_addr;
+    if (quiet) {
+      VLOG(1) << "Fail to initialize xservice channel to server "
+              << xservice_addr;
+    } else {
+      LOG(ERROR) << "Fail to initialize xservice channel to server "
+                 << xservice_addr;
+    }
     return false;
   }
 
@@ -731,7 +1147,8 @@ bool XServiceClient::connect_to_xservice(const std::string& xservice_addr) {
 
 bool XServiceClient::with_master_stub(
     const std::function<void(xllm_service::proto::XllmRpcService_Stub*)>& fn,
-    std::string* master_addr) {
+    std::string* master_addr,
+    bool quiet) {
   if (master_addr == nullptr) {
     return false;
   }
@@ -742,7 +1159,11 @@ bool XServiceClient::with_master_stub(
     *master_addr = master_xservice_addr_;
     *has_master_addr = !master_addr->empty();
     if (!*has_master_addr) {
-      LOG(ERROR) << "Master xservice address is empty";
+      if (quiet) {
+        VLOG(1) << "Master xservice address is empty";
+      } else {
+        LOG(ERROR) << "Master xservice address is empty";
+      }
       return false;
     }
 
@@ -764,8 +1185,12 @@ bool XServiceClient::with_master_stub(
   }
 
   // try re-connecting once
-  if (!connect_to_xservice(*master_addr)) {
-    LOG(ERROR) << "Failed to connect to master xservice: " << *master_addr;
+  if (!connect_to_xservice(*master_addr, quiet)) {
+    if (quiet) {
+      VLOG(1) << "Failed to connect to master xservice: " << *master_addr;
+    } else {
+      LOG(ERROR) << "Failed to connect to master xservice: " << *master_addr;
+    }
     return false;
   }
 
@@ -776,7 +1201,11 @@ bool XServiceClient::with_master_stub(
     return false;
   }
 
-  LOG(ERROR) << "No master stub available for address: " << *master_addr;
+  if (quiet) {
+    VLOG(1) << "No master stub available for address: " << *master_addr;
+  } else {
+    LOG(ERROR) << "No master stub available for address: " << *master_addr;
+  }
   return false;
 }
 
@@ -866,13 +1295,15 @@ void XServiceClient::handle_xservices_watch(const etcd::Response& response,
       }
     }
 
-    if (event_key == ETCD_MASTER_SERVICE_KEY) {
+    if (xservices_key_prefix_ == etcd_schema::kDefaultRouterMemberPrefix &&
+        (event_key == etcd_schema::kDefaultMasterServiceName ||
+         event_key == etcd_schema::kDefaultMasterServiceKey)) {
       continue;
     }
 
     if (service_addr.empty() && !event_key.empty() &&
-        event_key.rfind(ETCD_XSERVICES_KEY_PREFIX, 0) == 0) {
-      service_addr = event_key.substr(ETCD_XSERVICES_KEY_PREFIX.size());
+        event_key.rfind(xservices_key_prefix_, 0) == 0) {
+      service_addr = event_key.substr(xservices_key_prefix_.size());
     }
 
     if (service_addr.empty()) {
@@ -897,6 +1328,22 @@ void XServiceClient::handle_xservices_watch(const etcd::Response& response,
       disconnect_xservice(service_addr);
     }
   }
+}
+
+std::optional<WriterTerminationProof>
+XServiceClient::get_writer_termination_proof(const std::string& engine_uid) {
+  std::string wire;
+  if (etcd_client_ == nullptr ||
+      !etcd_client_->get(writer_termination_key(engine_uid),
+                         &wire,
+                         /*quiet_missing=*/true)) {
+    return std::nullopt;
+  }
+  auto proof = parse_writer_termination(wire);
+  if (!proof || proof->engine_uid != engine_uid) {
+    return std::nullopt;
+  }
+  return proof;
 }
 
 }  // namespace xllm

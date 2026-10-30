@@ -980,6 +980,56 @@ std::vector<bool> build_layer_cache_owned(const ModelArgs& model_args,
   return layer_cache_owned;
 }
 
+std::optional<uint64_t> logical_kv_bytes_per_token(
+    const KVCacheCapacity& kv_cache_cap) {
+  if (kv_cache_cap.block_size() <= 0 || kv_cache_cap.n_layers() <= 0 ||
+      kv_cache_cap.slot_size() <= 0 ||
+      kv_cache_cap.num_full_attention_layers() != kv_cache_cap.n_layers() ||
+      kv_cache_cap.num_linear_attention_layers() != 0 ||
+      kv_cache_cap.linear_slot_size() != 0 || kv_cache_cap.swa_count() != 0 ||
+      kv_cache_cap.c4_count() != 0 || kv_cache_cap.c128_count() != 0 ||
+      kv_cache_cap.c2_count() != 0 || kv_cache_cap.c1_count() != 0 ||
+      kv_cache_cap.scale_slot_size() < 0 ||
+      kv_cache_cap.index_slot_size() < 0 ||
+      kv_cache_cap.num_indexer_layers() < 0 ||
+      kv_cache_cap.num_indexer_layers() >
+          kv_cache_cap.num_full_attention_layers()) {
+    return std::nullopt;
+  }
+
+  const uint64_t full_attention_layers =
+      static_cast<uint64_t>(kv_cache_cap.num_full_attention_layers());
+  const uint64_t slot_bytes = static_cast<uint64_t>(kv_cache_cap.slot_size());
+  const uint64_t scale_bytes =
+      static_cast<uint64_t>(kv_cache_cap.scale_slot_size());
+  if (slot_bytes > std::numeric_limits<uint64_t>::max() - scale_bytes) {
+    return std::nullopt;
+  }
+  const uint64_t full_layer_bytes = slot_bytes + scale_bytes;
+  if (full_attention_layers >
+      std::numeric_limits<uint64_t>::max() / full_layer_bytes) {
+    return std::nullopt;
+  }
+  uint64_t bytes = full_attention_layers * full_layer_bytes;
+
+  const uint64_t indexer_layers =
+      static_cast<uint64_t>(kv_cache_cap.num_indexer_layers());
+  const uint64_t index_bytes =
+      static_cast<uint64_t>(kv_cache_cap.index_slot_size());
+  if (indexer_layers > 0) {
+    if (index_bytes == 0 ||
+        indexer_layers > std::numeric_limits<uint64_t>::max() / index_bytes) {
+      return std::nullopt;
+    }
+    const uint64_t total_index_bytes = indexer_layers * index_bytes;
+    if (bytes > std::numeric_limits<uint64_t>::max() - total_index_bytes) {
+      return std::nullopt;
+    }
+    bytes += total_index_bytes;
+  }
+  return bytes > 0 ? std::optional<uint64_t>(bytes) : std::nullopt;
+}
+
 int64_t estimate_layerwise_split_block_count(
     const ModelArgs& model_args,
     int32_t layerwise_split_size,

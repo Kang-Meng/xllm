@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -71,20 +73,22 @@ class HealthCheckManager {
 
   // Register a health check function for a worker
   void register_health_check(int worker_rank, HealthCheckFunc func) {
+    std::lock_guard<std::mutex> lock(checks_mutex_);
     health_checks_[worker_rank] = std::move(func);
   }
 
   // Start background health check thread
   void start_health_check_thread(int interval_ms = 3000) {
-    if (health_check_running_.load()) {
+    if (health_check_running_.exchange(true)) {
       return;
     }
-
-    health_check_running_.store(true);
     health_check_thread_ = std::thread([this, interval_ms]() {
       while (health_check_running_.load()) {
         check_all_workers();
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        std::unique_lock<std::mutex> lock(wait_mutex_);
+        wait_cv_.wait_for(lock,
+                          std::chrono::milliseconds(interval_ms),
+                          [this]() { return !health_check_running_.load(); });
       }
     });
   }
@@ -92,6 +96,7 @@ class HealthCheckManager {
   // Stop background health check thread
   void stop_health_check_thread() {
     health_check_running_.store(false);
+    wait_cv_.notify_all();
     if (health_check_thread_.joinable()) {
       health_check_thread_.join();
     }
@@ -104,16 +109,26 @@ class HealthCheckManager {
   DISALLOW_COPY_AND_ASSIGN(HealthCheckManager);
 
   void check_all_workers() {
-    for (const auto& [rank, check_func] : health_checks_) {
-      if (!check_func()) {
-        {
-          std::lock_guard<std::mutex> lock(reason_mutex_);
-          unhealthy_reason_ =
-              "Worker " + std::to_string(rank) + " disconnected";
-        }
-        is_healthy_.store(false, std::memory_order_release);
-        return;
-      }
+    std::unordered_map<int, HealthCheckFunc> checks;
+    {
+      std::lock_guard<std::mutex> lock(checks_mutex_);
+      checks = health_checks_;
+    }
+    std::vector<std::future<void>> results;
+    results.reserve(checks.size());
+    for (const auto& [rank, check_func] : checks) {
+      results.emplace_back(
+          std::async(std::launch::async, [this, rank, check_func]() {
+            if (!check_func()) {
+              set_unhealthy("Worker " + std::to_string(rank) + " disconnected");
+            }
+          }));
+    }
+    // Each production probe has its own finite RPC timeout. Joining every
+    // result bounds concurrency to one probe per Worker and protects callbacks'
+    // lifetime during shutdown; no detached probe outlives its Worker.
+    for (std::future<void>& result : results) {
+      result.get();
     }
   }
 
@@ -123,6 +138,9 @@ class HealthCheckManager {
   std::string unhealthy_reason_;
   std::unordered_map<int, HealthCheckFunc> health_checks_;
   std::thread health_check_thread_;
+  std::mutex checks_mutex_;
+  std::mutex wait_mutex_;
+  std::condition_variable wait_cv_;
 };
 
 }  // namespace xllm

@@ -51,6 +51,7 @@ class ServiceConfig final {
          "api_key",
          "num_request_handling_threads",
          "num_response_handling_threads",
+         "output_delivery_rpc_timeout_ms",
          "health_check_interval_ms",
          "enable_json_object_output",
          "enable_verbose_trace_log",
@@ -81,6 +82,8 @@ class ServiceConfig final {
   PROPERTY(int32_t, num_request_handling_threads) = 4;
 
   PROPERTY(int32_t, num_response_handling_threads) = 4;
+
+  PROPERTY(int32_t, output_delivery_rpc_timeout_ms) = 100;
 
   PROPERTY(int32_t, health_check_interval_ms) = 3000;
 

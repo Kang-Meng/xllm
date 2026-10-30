@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -56,7 +57,10 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_xtensor) = false;
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
-    PROPERTY(std::string, model_id);    // Model ID for multi-model support
+    // Exact logical KV bytes of one prompt token. 0 means the layout is
+    // composite or otherwise not a single full-attention byte count.
+    PROPERTY(uint64_t, logical_kv_bytes_per_token) = 0;
+    PROPERTY(std::string, model_id);  // Model ID for multi-model support
     // Model type of the owning engine (e.g. "deepseek_v41"), forwarded to
     // BlockManager::Options so build_composite_leaves can pick composite
     // behavior by explicit identity rather than inferring it from ratios.
@@ -121,7 +125,8 @@ class BlockManagerPool : public KVCacheManager {
   uint32_t num_blocks() const override;
   int32_t block_size() const override;
   void reset_prefix_cache() override;
-  std::vector<size_t> num_blocks_in_prefix_cache() const override;
+  std::vector<BlockCapacitySnapshot> capacity_snapshots() const;
+  virtual std::vector<size_t> num_blocks_in_prefix_cache() const override;
   std::vector<size_t> num_free_blocks() const override;
   std::vector<size_t> num_available_blocks() const override;
   std::vector<size_t> num_used_blocks() const override;

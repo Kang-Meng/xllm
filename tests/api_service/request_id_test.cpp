@@ -46,6 +46,7 @@ limitations under the License.
 #include "completion.pb.h"
 #include "core/common/metrics.h"
 #include "core/framework/request/request.h"
+#include "core/framework/request/request_output_proto_adapter.h"
 #include "core/runtime/xservice_client.h"
 #include "core/util/closure_guard.h"
 #include "xllm_service.pb.h"
@@ -72,29 +73,15 @@ class CountingClosure final : public google::protobuf::Closure {
   int32_t* count_;
 };
 
-class GenerationReceiver final : public xllm_service::proto::XllmRpcService {
- public:
-  void Generations(google::protobuf::RpcController* /*unused*/,
-                   const proto::DisaggStreamGenerations* request,
-                   proto::StatusSet* response,
-                   google::protobuf::Closure* done) override {
-    brpc::ClosureGuard guard(done);
-    received = *request;
-    for (int32_t index = 0; index < request->gens_size(); ++index) {
-      response->add_all_status()->set_ok(true);
-    }
-  }
-
-  proto::DisaggStreamGenerations received;
-};
-
 TEST(PublicErrorWireTest, SenderUsesSamePublicErrorAsDirectHttp) {
-  GenerationReceiver receiver;
-  brpc::Server server;
-  ASSERT_EQ(server.AddService(&receiver, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
-  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
-  const std::string address =
-      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  // Upstream drives this through XServiceClient::generations, which encodes
+  // each output with request_output_to_proto() before the brpc batch. The V2
+  // client only obtains sender_engine_uid/sender_incarnation_id through
+  // init(), which loops on a live etcd master and cannot run in a unit test.
+  // Encode with the sender-side helper directly: it is the exact per-output
+  // conversion generations() applies, so the wire fields under test --
+  // gen_status and its public_error -- are produced by the same code path,
+  // minus only the transport that serializes them unchanged.
   const std::vector<Status> statuses = {
       Status::invalid_parameter("invalid value", "temperature"),
       Status::invalid_parameter("", "temperature"),
@@ -119,19 +106,21 @@ TEST(PublicErrorWireTest, SenderUsesSamePublicErrorAsDirectHttp) {
   outputs.reserve(statuses.size() + 1);
   for (const Status& status : statuses) {
     RequestOutput output;
-    output.target_xservice_addr = address;
     output.status = status;
     outputs.emplace_back(std::move(output));
   }
   RequestOutput token;
-  token.target_xservice_addr = address;
   outputs.emplace_back(std::move(token));
-  EXPECT_EQ(XServiceClient::get_instance()->generations(outputs),
-            std::vector<bool>(outputs.size(), true));
-  ASSERT_EQ(receiver.received.gens_size(), outputs.size());
+  std::vector<proto::DisaggStreamGeneration> wire_generations;
+  wire_generations.reserve(outputs.size());
+  for (const RequestOutput& output : outputs) {
+    proto::DisaggStreamGeneration generation;
+    ASSERT_TRUE(request_output_to_proto(output, "prefill-1", &generation));
+    wire_generations.push_back(std::move(generation));
+  }
   for (size_t index = 0; index < statuses.size(); ++index) {
     const Status& status = statuses[index];
-    const auto& wire = receiver.received.gens(index).gen_status();
+    const auto& wire = wire_generations[index].gen_status();
     EXPECT_EQ(wire.status_code(), static_cast<int32_t>(status.code()));
     EXPECT_EQ(wire.status_msg(), status.message());
     EXPECT_EQ(wire.has_failure_reason(),
@@ -159,9 +148,11 @@ TEST(PublicErrorWireTest, SenderUsesSamePublicErrorAsDirectHttp) {
         nlohmann::json::parse(controller.response_attachment().to_string()),
         api_service::openai_error_payload(error));
   }
-  EXPECT_FALSE(receiver.received.gens(statuses.size()).has_gen_status());
-  server.Stop(0);
-  server.Join();
+  EXPECT_FALSE(wire_generations[statuses.size()].has_gen_status());
+  // The V2 sender identity fields ride on every generation; assert them once
+  // on the first and last wire payload.
+  EXPECT_EQ(wire_generations.front().sender_engine_uid(), "prefill-1");
+  EXPECT_EQ(wire_generations.back().sender_engine_uid(), "prefill-1");
 }
 
 template <typename CallType>

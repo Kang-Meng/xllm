@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "core/scheduler/disagg_pd_scheduler.h"
 
+#include <brpc/channel.h>
 #include <brpc/closure_guard.h>
+#include <brpc/controller.h>
 #include <brpc/server.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -26,6 +28,8 @@ limitations under the License.
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <initializer_list>
@@ -39,10 +43,12 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/public_error.h"
+#include "distributed_runtime/disagg_pd_service_impl.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/disagg_pd_config.h"
 #include "framework/config/rec_config.h"
 #include "framework/config/scheduler_config.h"
 #include "framework/config/service_config.h"
@@ -186,18 +192,35 @@ class FakeEngine final : public Engine {
                     const std::vector<uint16_t>& /*ports*/,
                     int32_t /*src_dp_size*/,
                     int32_t /*src_kv_split_size*/) override {
+    ++link_cluster_calls_;
     if (on_link_cluster) {
       on_link_cluster();
     }
-    return true;
+    return link_cluster_result_;
   }
 
-  bool unlink_cluster(const std::vector<uint64_t>& /*cluster_ids*/,
+  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                       const std::vector<std::string>& /*addrs*/,
                       const std::vector<uint16_t>& /*ports*/,
                       int32_t /*src_dp_size*/,
                       int32_t /*src_kv_split_size*/) override {
-    return true;
+    ++unlink_cluster_calls_;
+    unlinked_cluster_ids_.push_back(cluster_ids);
+    return unlink_cluster_result_;
+  }
+
+  int32_t link_cluster_calls() const { return link_cluster_calls_; }
+
+  int32_t unlink_cluster_calls() const { return unlink_cluster_calls_; }
+
+  const std::vector<std::vector<uint64_t>>& unlinked_cluster_ids() const {
+    return unlinked_cluster_ids_;
+  }
+
+  void set_link_cluster_result(bool result) { link_cluster_result_ = result; }
+
+  void set_unlink_cluster_result(bool result) {
+    unlink_cluster_result_ = result;
   }
 
   bool pull_kv_blocks(int32_t /*src_dp_size*/,
@@ -220,6 +243,11 @@ class FakeEngine final : public Engine {
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<BlockManagerPool> block_manager_;
   ModelArgs model_args_;
+  int32_t link_cluster_calls_ = 0;
+  int32_t unlink_cluster_calls_ = 0;
+  std::vector<std::vector<uint64_t>> unlinked_cluster_ids_;
+  bool link_cluster_result_ = true;
+  bool unlink_cluster_result_ = true;
 };
 
 template <typename Scheduler>
@@ -338,6 +366,45 @@ class TestDisaggPDScheduler final
 
   void update_metrics(std::vector<Sequence*>& sequences) {
     update_token_latency_metrics(sequences);
+  }
+
+  bool schedule_retry_for_test(std::shared_ptr<Request> request,
+                               std::chrono::milliseconds delay) {
+    return schedule_decode_admission_retry(std::move(request), delay);
+  }
+
+  uint64_t delayed_retry_count_for_test() const {
+    return delayed_decode_admission_retry_count_.load(
+        std::memory_order_acquire);
+  }
+
+  bool take_retry_for_test(std::chrono::steady_clock::time_point now,
+                           std::shared_ptr<Request>* request) {
+    return take_ready_decode_admission_retry(now, request);
+  }
+
+  void enqueue_online_for_test(std::shared_ptr<Request> request) {
+    prefill_request_queue_.enqueue(std::move(request));
+  }
+
+  bool take_ready_dispatch_for_test(std::chrono::steady_clock::time_point now,
+                                    std::shared_ptr<Request>* request) {
+    return try_take_ready_dispatch_request(now, request);
+  }
+
+  std::chrono::milliseconds retry_wait_for_test(
+      std::chrono::steady_clock::time_point now,
+      std::chrono::milliseconds maximum_wait) const {
+    return decode_admission_dispatch_wait(now, maximum_wait);
+  }
+
+  void start_idle_dispatch_worker_for_test() {
+    dispatch_thread_ = std::make_unique<std::thread>(
+        &DisaggPDScheduler::dispatch_requests, this);
+  }
+
+  void shutdown_background_workers_for_test() {
+    shutdown_common_background_workers();
   }
 };
 
@@ -519,7 +586,11 @@ class TestPDOOCScheduler final : public PrefillTestScheduler<PDOOCScheduler> {
   }
   void set_prefill_channel(const std::string& name,
                            proto::DisaggPDService_Stub* stub) {
-    instance_channel_map_[name] = stub;
+    // V2 stores stubs as shared_ptr; production stubs own their channel via
+    // STUB_OWNS_CHANNEL, while test stubs are stack-scoped, so wrap the
+    // borrowed pointer in a non-owning holder instead of taking ownership.
+    instance_channel_map_[name] = std::shared_ptr<proto::DisaggPDService_Stub>(
+        stub, [](proto::DisaggPDService_Stub*) {});
   }
   void set_decode_channel(const std::string& name,
                           proto::DisaggPDService_Stub* stub) {
@@ -592,6 +663,21 @@ DisaggPDScheduler::Options make_decode_options() {
   DisaggPDScheduler::Options options = make_options();
   options.instance_role(InstanceRole::DECODE);
   return options;
+}
+
+TEST(DisaggPDSchedulerTest, GracefulShutdownWakesIdleDispatchWorker) {
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/4);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  scheduler.start_idle_dispatch_worker_for_test();
+
+  const auto started = std::chrono::steady_clock::now();
+  scheduler.shutdown_background_workers_for_test();
+  EXPECT_LT(std::chrono::steady_clock::now() - started,
+            std::chrono::seconds(2));
+
+  // The production destructor is an idempotent fallback after the derived
+  // OOC scheduler has already stopped its virtual worker threads.
+  scheduler.shutdown_background_workers_for_test();
 }
 
 std::shared_ptr<Request> make_request(
@@ -992,18 +1078,10 @@ TEST(DisaggPDSchedulerTest, RelinkedDecodeRetainsOldEpochRejection) {
   old_request->state().output_func = [](const RequestOutput&) { return true; };
   scheduler.admit_prefill(old_request);
 
-  ASSERT_TRUE(scheduler.unlink_instance("decode-1",
-                                        /*cluster_ids=*/{},
-                                        /*addrs=*/{},
-                                        /*ports=*/{},
-                                        /*dp_size=*/1,
-                                        /*src_kv_split_size=*/1));
-  ASSERT_TRUE(scheduler.link_instance("decode-1",
-                                      /*cluster_ids=*/{},
-                                      /*addrs=*/{},
-                                      /*ports=*/{},
-                                      /*dp_size=*/1,
-                                      /*src_kv_split_size=*/1));
+  ASSERT_TRUE(scheduler.unlink_instance(
+      "decode-1", {}, {}, {}, /*dp_size=*/1, /*src_kv_split_size=*/1));
+  ASSERT_TRUE(scheduler.link_instance(
+      "decode-1", {}, {}, {}, /*dp_size=*/1, /*src_kv_split_size=*/1));
 
   auto new_request = make_request({21, 22}, "new-reservation");
   new_request->state().decode_address = "decode-1";
@@ -1193,7 +1271,8 @@ TEST(AsyncResponseProcessorTest,
           EXPECT_EQ(outputs[0].request_id, "still-valid");
         }
         ++callbacks;
-        return std::vector<bool>{true};
+        return std::vector<OutputDeliveryStatus>{
+            OutputDeliveryStatus::DELIVERED};
       };
   std::vector<std::shared_ptr<Request>> requests{duplicate, valid};
   processor.process_completed_requests(requests);
@@ -1283,6 +1362,180 @@ TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
   EXPECT_EQ(matched_sequence->kv_state().shared_blocks_num(BlockType::KV), 2u);
   block_manager->deallocate(matched_sequence);
   release_prefix_cache(block_manager);
+}
+
+TEST(DisaggPDSchedulerTest, DecodeAdmissionRetriesWaitWithoutBusyRequeue) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  std::shared_ptr<Request> later = make_request({1, 2});
+  std::shared_ptr<Request> earlier = make_request({3, 4});
+
+  ASSERT_TRUE(
+      scheduler.schedule_retry_for_test(later, std::chrono::milliseconds(200)));
+  ASSERT_TRUE(scheduler.schedule_retry_for_test(
+      earlier, std::chrono::milliseconds(100)));
+
+  const std::chrono::steady_clock::time_point now =
+      std::chrono::steady_clock::now();
+  EXPECT_GT(scheduler.retry_wait_for_test(now, std::chrono::seconds(1)).count(),
+            0);
+  std::shared_ptr<Request> ready;
+  EXPECT_FALSE(scheduler.take_retry_for_test(now, &ready));
+  ASSERT_TRUE(
+      scheduler.take_retry_for_test(now + std::chrono::seconds(1), &ready));
+  EXPECT_EQ(ready, earlier);
+  ASSERT_TRUE(
+      scheduler.take_retry_for_test(now + std::chrono::seconds(1), &ready));
+  EXPECT_EQ(ready, later);
+  EXPECT_FALSE(
+      scheduler.take_retry_for_test(now + std::chrono::seconds(1), &ready));
+}
+
+TEST(DisaggPDSchedulerTest, ReadyRetriesAndOnlineIngressAlternateFairly) {
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  std::vector<std::shared_ptr<Request>> retries;
+  std::vector<std::shared_ptr<Request>> online;
+  for (int32_t index = 0; index < 8; ++index) {
+    retries.push_back(make_request({100 + index}));
+    online.push_back(make_request({200 + index}));
+    ASSERT_TRUE(scheduler.schedule_retry_for_test(
+        retries.back(), std::chrono::milliseconds(1)));
+    scheduler.enqueue_online_for_test(online.back());
+  }
+
+  const std::chrono::steady_clock::time_point ready_at =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  for (int32_t index = 0; index < 8; ++index) {
+    std::shared_ptr<Request> selected;
+    ASSERT_TRUE(scheduler.take_ready_dispatch_for_test(ready_at, &selected));
+    EXPECT_EQ(selected, online[index]);
+    ASSERT_TRUE(scheduler.take_ready_dispatch_for_test(ready_at, &selected));
+    EXPECT_EQ(selected, retries[index]);
+  }
+}
+
+TEST(DisaggPDSchedulerTest, DecodeAdmissionDelayedHeapIsStrictlyBounded) {
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  constexpr size_t kExpectedCapacity = 4 * 64;
+  for (size_t index = 0; index < kExpectedCapacity; ++index) {
+    ASSERT_TRUE(scheduler.schedule_retry_for_test(
+        make_request({static_cast<int32_t>(index + 1)}),
+        std::chrono::seconds(1)));
+  }
+  EXPECT_FALSE(scheduler.schedule_retry_for_test(make_request({999}),
+                                                 std::chrono::seconds(1)));
+  EXPECT_EQ(scheduler.delayed_retry_count_for_test(), kExpectedCapacity);
+}
+
+TEST(DisaggPDSchedulerTest, RepeatedLinkAndUnlinkAreIdempotent) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  const std::vector<uint64_t> cluster_ids = {7};
+  const std::vector<std::string> addrs = {"10.0.0.1:12345"};
+  const std::vector<uint16_t> ports = {12345};
+
+  EXPECT_TRUE(scheduler.link_instance("prefill-0",
+                                      cluster_ids,
+                                      addrs,
+                                      ports,
+                                      /*dp_size=*/1,
+                                      /*src_kv_split_size=*/1));
+  EXPECT_TRUE(scheduler.link_instance("prefill-0",
+                                      cluster_ids,
+                                      addrs,
+                                      ports,
+                                      /*dp_size=*/1,
+                                      /*src_kv_split_size=*/1));
+  EXPECT_EQ(engine.link_cluster_calls(), 1);
+
+  EXPECT_TRUE(scheduler.unlink_instance("prefill-0",
+                                        cluster_ids,
+                                        addrs,
+                                        ports,
+                                        /*dp_size=*/1,
+                                        /*src_kv_split_size=*/1));
+  // The name is already gone, so a second unlink still calls the engine.
+  EXPECT_TRUE(scheduler.unlink_instance("prefill-0",
+                                        cluster_ids,
+                                        addrs,
+                                        ports,
+                                        /*dp_size=*/1,
+                                        /*src_kv_split_size=*/1));
+  EXPECT_EQ(engine.unlink_cluster_calls(), 2);
+}
+
+TEST(DisaggPDSchedulerTest, LinkUsesDeclaredEndpoints) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  // Topology is no longer rejected inside the scheduler. The declared
+  // endpoints are forwarded to link_cluster.
+  ASSERT_TRUE(scheduler.link_instance("p", {7}, {"addr"}, {1234}, 2, 1));
+  EXPECT_EQ(engine.link_cluster_calls(), 1);
+  EXPECT_TRUE(scheduler.unlink_instance("p", {7}, {"addr"}, {1234}, 2, 1));
+  EXPECT_EQ(engine.unlink_cluster_calls(), 1);
+}
+
+TEST(DisaggPDSchedulerTest, FailedLinkRemainsRetryable) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  engine.set_link_cluster_result(false);
+  ASSERT_FALSE(scheduler.link_instance(
+      "p", {7, 8}, {"addr-0", "addr-1"}, {1234, 1235}, 1, 1));
+  engine.set_unlink_cluster_result(false);
+  EXPECT_FALSE(scheduler.unlink_instance(
+      "p", {7, 8}, {"addr-0", "addr-1"}, {1234, 1235}, 1, 1));
+  ASSERT_EQ(engine.unlinked_cluster_ids().size(), 1u);
+  EXPECT_EQ(engine.unlinked_cluster_ids()[0], std::vector<uint64_t>({7, 8}));
+  engine.set_unlink_cluster_result(true);
+  EXPECT_TRUE(scheduler.unlink_instance(
+      "p", {7, 8}, {"addr-0", "addr-1"}, {1234, 1235}, 1, 1));
+  engine.set_link_cluster_result(true);
+  EXPECT_TRUE(scheduler.link_instance(
+      "p", {7, 8}, {"addr-0", "addr-1"}, {1234, 1235}, 1, 1));
+  EXPECT_TRUE(scheduler.unlink_instance(
+      "p", {7, 8}, {"addr-0", "addr-1"}, {1234, 1235}, 1, 1));
+}
+
+TEST(DisaggPDSchedulerTest, FailedLinkAndUnlinkRemainRetryable) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  const std::vector<uint64_t> cluster_ids = {7};
+  const std::vector<std::string> addrs = {"10.0.0.1:12345"};
+  const std::vector<uint16_t> ports = {12345};
+
+  engine.set_link_cluster_result(false);
+  EXPECT_FALSE(scheduler.link_instance("prefill-0",
+                                       cluster_ids,
+                                       addrs,
+                                       ports,
+                                       /*dp_size=*/1,
+                                       /*src_kv_split_size=*/1));
+  engine.set_link_cluster_result(true);
+  EXPECT_TRUE(scheduler.link_instance("prefill-0",
+                                      cluster_ids,
+                                      addrs,
+                                      ports,
+                                      /*dp_size=*/1,
+                                      /*src_kv_split_size=*/1));
+  EXPECT_EQ(engine.link_cluster_calls(), 2);
+
+  engine.set_unlink_cluster_result(false);
+  EXPECT_FALSE(scheduler.unlink_instance("prefill-0",
+                                         cluster_ids,
+                                         addrs,
+                                         ports,
+                                         /*dp_size=*/1,
+                                         /*src_kv_split_size=*/1));
+  engine.set_unlink_cluster_result(true);
+  EXPECT_TRUE(scheduler.unlink_instance("prefill-0",
+                                        cluster_ids,
+                                        addrs,
+                                        ports,
+                                        /*dp_size=*/1,
+                                        /*src_kv_split_size=*/1));
+  EXPECT_EQ(engine.unlink_cluster_calls(), 2);
 }
 
 TEST(DisaggPDSchedulerTest, CacheSkipsExistingSharedBlocks) {
@@ -1942,8 +2195,8 @@ TEST(DisaggPDSchedulerTest, StructuredOutputFieldsPreserveWireTags) {
   EXPECT_TRUE(decoded.json_object());
   EXPECT_TRUE(decoded.json_reasoning_enabled());
   EXPECT_EQ(proto::DisaggRequest::kIncludeStopStrInOutputFieldNumber, 39);
-  EXPECT_EQ(proto::DisaggRequest::kJsonObjectFieldNumber, 40);
-  EXPECT_EQ(proto::DisaggRequest::kJsonReasoningEnabledFieldNumber, 41);
+  EXPECT_EQ(proto::DisaggRequest::kJsonObjectFieldNumber, 46);
+  EXPECT_EQ(proto::DisaggRequest::kJsonReasoningEnabledFieldNumber, 47);
 }
 
 TEST(DisaggPDSchedulerTest, GenerationLatencyFieldsPreserveWireTags) {
@@ -1963,7 +2216,7 @@ TEST(DisaggPDSchedulerTest, GenerationLatencyFieldsPreserveWireTags) {
   EXPECT_DOUBLE_EQ(decoded.tokens(0).time_to_first_token_latency_seconds(),
                    2.5);
   EXPECT_EQ(proto::DisaggGenerationsRequest::kUpstreamElapsedSecondsFieldNumber,
-            21);
+            25);
   EXPECT_EQ(proto::RemoteToken::kTimeToFirstTokenLatencySecondsFieldNumber, 6);
 }
 
@@ -2272,12 +2525,8 @@ TEST_F(ReservationTest, UnlinkedDecodeReleasesAcceptedQueuedReservation) {
     return true;
   };
   prefill.admit_prefill(local);
-  ASSERT_TRUE(prefill.unlink_instance("decode-1",
-                                      /*cluster_ids=*/{},
-                                      /*addrs=*/{},
-                                      /*ports=*/{},
-                                      /*dp_size=*/1,
-                                      /*src_kv_split_size=*/1));
+  ASSERT_TRUE(prefill.unlink_instance(
+      "decode-1", {}, {}, {}, /*dp_size=*/1, /*src_kv_split_size=*/1));
   const auto batches = prefill.prepare_batch_test();
   EXPECT_TRUE(std::all_of(batches.begin(),
                           batches.end(),
@@ -2465,7 +2714,8 @@ TEST_F(ReservationTest, UnlinkClearsOnlyMatchingReservationMetrics) {
       MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
   ASSERT_NE(reservations, nullptr);
   EXPECT_DOUBLE_EQ(reservations->get_value(), 2.0);
-  EXPECT_TRUE(decode_.unlink_instance("prefill", {}, {}, {}, 1, 1));
+  EXPECT_TRUE(decode_.unlink_instance(
+      "prefill", {}, {}, {}, /*dp_size=*/1, /*src_kv_split_size=*/1));
   decode_.report_queues();
   EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));

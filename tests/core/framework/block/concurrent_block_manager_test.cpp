@@ -16,7 +16,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -97,6 +99,11 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
   seed_blocks.clear();
 
   ASSERT_EQ(manager.num_blocks_in_prefix_cache(), 1);
+  EXPECT_EQ(manager.num_evictable_blocks(), 1u);
+  BlockCapacitySnapshot capacity = manager.capacity_snapshot();
+  EXPECT_EQ(capacity.total_blocks, 4u);
+  EXPECT_EQ(capacity.free_blocks, 3u);
+  EXPECT_EQ(capacity.used_blocks, 1u);
 
   std::vector<Block> matched_blocks =
       manager.allocate_shared(token_ids, existed_blocks);
@@ -106,6 +113,12 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
     EXPECT_EQ(matched_blocks[0].id(), first_block_id);
     EXPECT_EQ(matched_blocks[1].id(), second_block_id);
   }
+  EXPECT_EQ(manager.num_evictable_blocks(), 0u)
+      << "an actively shared cached block must not be advertised as evictable";
+  capacity = manager.capacity_snapshot();
+  EXPECT_EQ(capacity.total_blocks, 4u);
+  EXPECT_EQ(capacity.free_blocks, 2u);
+  EXPECT_EQ(capacity.used_blocks, 2u);
 
   matched_blocks.clear();
   existed_blocks.clear();
@@ -115,6 +128,41 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
 
   EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 0);
   EXPECT_EQ(manager.num_free_blocks(), manager.num_total_blocks());
+}
+
+TEST(ConcurrentBlockManagerTest, DestroysNonEmptyPrefixCacheSafely) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(([]() {
+                BlockManager::Options options;
+                options.num_blocks(5).block_size(2).enable_prefix_cache(true);
+                auto manager = std::make_unique<ConcurrentBlockManagerImpl>(
+                    std::make_unique<BlockManagerImpl>(options));
+
+                std::vector<int32_t> token_ids = {11, 12, 13, 14};
+                std::vector<Block> blocks = manager->allocate(/*num_blocks=*/2);
+                CHECK_EQ(blocks.size(), 2u);
+                PrefixCache::compute_hash_keys(token_ids, blocks);
+                manager->cache(blocks);
+                blocks.clear();
+                CHECK_EQ(manager->num_blocks_in_prefix_cache(), 2u);
+
+                manager.reset();
+                std::_Exit(EXIT_SUCCESS);
+              }()),
+              ::testing::ExitedWithCode(EXIT_SUCCESS),
+              "");
+}
+
+TEST(ConcurrentBlockManagerTest, PrefixCacheDestructionHasNoFixedDelay) {
+  const auto started_at = std::chrono::steady_clock::now();
+  {
+    PrefixCache::Options cache_options;
+    cache_options.block_size(2);
+    PrefixCache cache(cache_options);
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started_at);
+  EXPECT_LT(elapsed, std::chrono::milliseconds(1500));
 }
 
 TEST(ConcurrentBlockManagerTest, AllocatesWhileBlocksReleaseConcurrently) {
@@ -261,6 +309,7 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
   seed.clear();
   seed.clear();
   ASSERT_EQ(manager->num_blocks_in_prefix_cache(), 4u);
+  ASSERT_EQ(manager->num_evictable_blocks(), 4u);
 
   constexpr int32_t kNumThreads = 4;
   constexpr int32_t kNumIterations = 50000;

@@ -20,6 +20,16 @@ add_dependencies(prefix_test brpc-static)
 
 cc_test(
   NAME
+    prefix_cache_journal_test
+  SRCS
+    prefix_cache_journal_test.cpp
+  DEPS
+    :prefix_cache_journal
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     linear_state_prefix_cache_test
   CPU_ONLY
   SRCS

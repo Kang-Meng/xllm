@@ -94,12 +94,13 @@ TEST(DeviceNameUtilsTest, PreservesGlobalRankInput) {
 }
 
 TEST(DeviceNameUtilsTest, ParseGeneratedDeviceString) {
-  const std::vector<torch::Device> devices =
-      DeviceNameUtils::parse_devices(Platform::type_str() + ":2");
+  const int32_t device_index = Platform::type_torch() == torch::kCPU ? 0 : 2;
+  const std::vector<torch::Device> devices = DeviceNameUtils::parse_devices(
+      Platform::type_str() + ":" + std::to_string(device_index));
 
   ASSERT_EQ(devices.size(), 1);
   EXPECT_EQ(devices[0].type(), Platform::type_torch());
-  EXPECT_EQ(devices[0].index(), 2);
+  EXPECT_EQ(devices[0].index(), device_index);
 }
 
 }  // namespace

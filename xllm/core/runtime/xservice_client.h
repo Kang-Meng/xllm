@@ -18,8 +18,11 @@ limitations under the License.
 #include <brpc/channel.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -27,9 +30,12 @@ limitations under the License.
 #include <vector>
 
 #include "common/etcd_client.h"
+#include "core/runtime/native_provider_contract.h"
 #include "distributed_runtime/engine.h"
+#include "distributed_runtime/writer_termination_proof.h"
 #include "forward_params.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/prefix_cache/prefix_cache_journal.h"
 #include "framework/request/request_output.h"
 #include "scheduler/scheduler.h"
 #include "xservice.pb.h"
@@ -45,13 +51,15 @@ class XServiceClient {
   ~XServiceClient();
   bool init(const std::string& etcd_addr,
             const std::string& instance_name = "",
-            const BlockManagerPool* block_manager_pool = nullptr,
+            BlockManagerPool* block_manager_pool = nullptr,
             const std::string& etcd_namespace = "");
+  void shutdown();
   void set_scheduler(Scheduler* scheduler);
   void set_engine(Engine* engine);
   bool initialize_done() { return initialize_done_; }
 
   std::string get_instance_name();
+  std::optional<proto::ProviderDescriptor> get_provider_descriptor();
   void register_instance(const InstanceInfo& instance_info);
   void heartbeat();
   InstanceInfo get_instance_info(const std::string& instance_name);
@@ -60,15 +68,22 @@ class XServiceClient {
 
   // get all xllm_service addrs
   std::vector<std::string> get_all_xservice_addrs();
+  // Untrusted durable transport only. The attempt table verifies the pinned
+  // authority signature before any ownership transition.
+  std::optional<WriterTerminationProof> get_writer_termination_proof(
+      const std::string& engine_uid);
 
   // response generation tokens to xllm service
   std::vector<bool> generations(const std::vector<RequestOutput>& outputs);
+  proto::KVCacheSnapshotPage get_kv_cache_snapshot(
+      const proto::KVCacheSnapshotRequest& request);
 
  private:
   bool register_instance_with_retry(const std::string& key,
                                     const std::string& value);
   bool reconcile_registration();
   void reconcile_registration_loop();
+  void kv_event_loop();
 
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
@@ -76,15 +91,26 @@ class XServiceClient {
                               const uint64_t& prefix_len);
 
   // connect to specific xllm_service
-  bool connect_to_xservice(const std::string& xservice_addr);
+  bool connect_to_xservice(const std::string& xservice_addr,
+                           bool quiet = false);
 
   // remove the connection to specific xllm_service
   void disconnect_xservice(const std::string& xservice_addr);
 
+  proto::KVStreamIdentity kv_stream_identity() const;
+  proto::KVEventBatch make_kv_event_batch(const PrefixCacheEvents& events);
+  proto::KVCacheSnapshotPage prefix_cache_snapshot_to_proto(
+      const PrefixCacheSnapshot& snapshot) const;
+  void note_kv_push_result(bool success,
+                           uint64_t commit_version,
+                           uint64_t service_commit_version,
+                           const std::string& error);
+
   // call rpc with current master stub atomically.
   bool with_master_stub(
       const std::function<void(xllm_service::proto::XllmRpcService_Stub*)>& fn,
-      std::string* master_addr);
+      std::string* master_addr,
+      bool quiet = false);
 
   // find stub by address, caller should hold mutex_
   xllm_service::proto::XllmRpcService_Stub* find_stub_locked(
@@ -95,13 +121,14 @@ class XServiceClient {
 
   std::atomic_bool exited_{false};
   std::atomic_bool register_done_{false};
+  std::once_flag shutdown_once_;
   bool initialize_done_ = false;
   std::string instance_name_;
-  std::string incarnation_id_;
   std::string registration_key_;
-  std::string registration_value_;
 
   std::string master_xservice_addr_;
+  std::string master_service_key_ = "XLLM:SERVICE:MASTER";
+  std::string xservices_key_prefix_ = "XLLM:SERVICE:";
   std::unordered_map<std::string, std::unique_ptr<brpc::Channel>>
       xservice_channels_;
   std::unordered_map<std::string,
@@ -109,14 +136,25 @@ class XServiceClient {
       xservice_stubs_;
   std::unique_ptr<std::thread> heartbeat_thread_;
   std::unique_ptr<std::thread> reconcile_thread_;
+  std::unique_ptr<std::thread> kv_event_thread_;
 
   std::shared_mutex mutex_;
-  std::mutex registration_mutex_;
+  mutable std::mutex registration_mutex_;
+  std::mutex kv_event_wait_mutex_;
+  std::condition_variable kv_event_wait_cv_;
+  // Only the previous push is remembered. A failed push replaces this
+  // record. A successful push clears it. The journal only supplies events
+  // and the resident version.
+  std::optional<uint64_t> kv_failed_commit_version_;
+  std::string kv_failed_commit_error_;
+  uint64_t kv_last_pushed_version_ = 0;
   brpc::ChannelOptions chan_options_;
   std::unique_ptr<EtcdClient> etcd_client_;
-  const BlockManagerPool* block_manager_pool_ = nullptr;  // not own
-  Scheduler* scheduler_ = nullptr;                        // not own
-  Engine* engine_ = nullptr;  // not own, for xtensor info
+  BlockManagerPool* block_manager_pool_ = nullptr;  // not own
+  Scheduler* scheduler_ = nullptr;                  // not own
+  Engine* engine_ = nullptr;                        // not own, for xtensor info
+  std::shared_ptr<NativeEngineStateBuilder> engine_state_builder_;
+  std::optional<proto::ProviderDescriptor> provider_descriptor_;
 };
 
 // Builds the in-process instance record from a GetInstanceInfo response.

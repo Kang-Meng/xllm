@@ -95,8 +95,25 @@ message StreamOptions{
   optional bool include_usage = 1;
 }
 
+enum GenerationDeliveryCode {
+  GENERATION_DELIVERY_CODE_UNSPECIFIED = 0;
+  GENERATION_DELIVERY_CODE_ACCEPTED = 1;
+  GENERATION_DELIVERY_CODE_INVALID_PAYLOAD = 2;
+  GENERATION_DELIVERY_CODE_UNKNOWN_REQUEST = 3;
+  GENERATION_DELIVERY_CODE_CLIENT_DISCONNECTED = 4;
+  GENERATION_DELIVERY_CODE_REQUEST_CLOSED = 5;
+  GENERATION_DELIVERY_CODE_INVALID_IDENTITY = 6;
+  GENERATION_DELIVERY_CODE_INVALID_SEQUENCE = 7;
+  GENERATION_DELIVERY_CODE_COMMIT_UNPROVEN = 8;
+  GENERATION_DELIVERY_CODE_TERMINAL_UNPROVEN = 9;
+  GENERATION_DELIVERY_CODE_AFFINITY_MISSING = 10;
+}
+
 message Status {
   bool ok = 1;
+  // Present on Generations per-item responses. Other RPCs leave it absent.
+  optional GenerationDeliveryCode delivery_code = 2;
+  string status_msg = 3;
 }
 
 message Routing {

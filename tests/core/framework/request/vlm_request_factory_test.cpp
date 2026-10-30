@@ -174,12 +174,20 @@ class VLMRequestFactoryTest : public ::testing::Test {
     // enable_chunked_prefill defaults true; keep it so the prompt length limit
     // is exactly max_position_embeddings.
     options_.enable_service_routing(false).num_speculative_tokens(0);
-    return std::make_unique<VLMRequestFactory>(processor_.get(),
-                                               chat_template_.get(),
-                                               tokenizer_.get(),
-                                               &model_args_,
-                                               &options_,
-                                               &rate_limiter_);
+    // The V2 factory takes a service-routing RpcResponseHandler as the 7th
+    // arg (production VLMMaster wires handle_rpc_responses). Routing is
+    // disabled in these tests, so the handler is never invoked; pass a stub
+    // returning DELIVERED to satisfy the OutputsFunc shape.
+    return std::make_unique<VLMRequestFactory>(
+        processor_.get(),
+        chat_template_.get(),
+        tokenizer_.get(),
+        &model_args_,
+        &options_,
+        &rate_limiter_,
+        [](const std::vector<RequestOutput>&) {
+          return std::vector<bool>{true};
+        });
   }
 
   std::unique_ptr<FakeProcessor> processor_;

@@ -161,6 +161,20 @@ cc_test(
 
 cc_test(
   NAME
+    request_output_proto_adapter_test
+  SRCS
+    request_output_proto_adapter_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/framework/request/request_output_proto_adapter.cpp
+  DEPS
+    proto::xllm_proto
+    glog::glog
+    torch
+    :common
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     dit_request_params_test
   CPU_ONLY
   SRCS

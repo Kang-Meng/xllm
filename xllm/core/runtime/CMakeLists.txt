@@ -3,6 +3,19 @@ include(cc_binary)
 
 cc_library(
   NAME
+    native_provider_contract
+  HDRS
+    native_provider_contract.h
+  SRCS
+    native_provider_contract.cpp
+  DEPS
+    OpenSSL::Crypto
+    glog::glog
+    proto::xllm_proto
+)
+
+cc_library(
+  NAME
     runtime
   HDRS
     options.h
@@ -86,6 +99,7 @@ cc_library(
     mm_embed_vlm_worker_impl.cpp
     worker_client.cpp
     xservice_client.cpp
+    native_provider_runtime.cpp
     params_utils.cpp
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
@@ -114,6 +128,7 @@ cc_library(
     :model
     :parallel_state
     :kv_cache
+    :prefix_cache_journal
     :kv_cache_estimation
     :kv_cache_transfer
     :linear_state_restore
@@ -130,6 +145,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:atb_customize>
     $<$<BOOL:${USE_NPU}>:platform_npu>
     :eplb
+    :native_provider_contract
     glog::glog
     Folly::folly
     absl::strings

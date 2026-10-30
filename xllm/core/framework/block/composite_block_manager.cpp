@@ -1189,4 +1189,37 @@ void CompositeBlockManager::reserve_xtensor_padding_blocks() {
   }
 }
 
+const CompositeBlockManager::LeafEntry* CompositeBlockManager::capacity_leaf()
+    const {
+  // Smallest block_size = finest granularity = closest to the base block the
+  // scheduler assumes. KV for normal models; C4 for DSV4.
+  const LeafEntry* chosen = nullptr;
+  for (const auto& [type, entry] : leaves_) {
+    if (!entry.participates_in_admission) {
+      continue;
+    }
+    if (chosen == nullptr ||
+        entry.leaf->block_size() < chosen->leaf->block_size()) {
+      chosen = &entry;
+    }
+  }
+  return chosen;
+}
+
+BlockCapacitySnapshot CompositeBlockManager::capacity_snapshot() const {
+  const LeafEntry* leaf = capacity_leaf();
+  if (leaf == nullptr) {
+    return {};
+  }
+  if (const auto* concurrent =
+          dynamic_cast<const ConcurrentBlockManagerImpl*>(leaf->leaf.get())) {
+    return concurrent->capacity_snapshot();
+  }
+  return BlockCapacitySnapshot{
+      .free_blocks = leaf->leaf->num_available_blocks(),
+      .used_blocks = leaf->leaf->num_used_blocks(),
+      .total_blocks = leaf->leaf->num_total_blocks(),
+  };
+}
+
 }  // namespace xllm

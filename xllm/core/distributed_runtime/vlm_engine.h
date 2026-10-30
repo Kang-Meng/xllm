@@ -50,6 +50,14 @@ class VLMEngine : public Engine {
 
   bool init(MasterStatus master_status) override;
 
+  // Collect per-worker KV cache cluster endpoints for service registration.
+  // DisaggPDScheduler::register_instance_info calls this while assembling the
+  // etcd instance record; the Engine base only NOT_IMPLEMENTED()s, so a VLM
+  // instance without this override aborts registration on the PD path.
+  void get_cache_info(std::vector<uint64_t>& cluster_ids,
+                      std::vector<std::string>& addrs,
+                      std::vector<uint16_t>& ports) override;
+
   void update_last_step_result(std::vector<Batch>& batch) override;
 
   // return the active activation memory

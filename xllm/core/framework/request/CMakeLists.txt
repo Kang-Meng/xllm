@@ -34,6 +34,7 @@ cc_library(
     rec_request_factory.h
     dit_request.h
     request_output.h
+    request_output_proto_adapter.h
     usage.h
     dit_request_output.h
     dit_request_params.h
@@ -60,6 +61,7 @@ cc_library(
     rec_request_factory.cpp
     dit_request.cpp
     request_output.cpp
+    request_output_proto_adapter.cpp
     dit_request_output.cpp
     request_params.cpp
     sample_slot.cpp

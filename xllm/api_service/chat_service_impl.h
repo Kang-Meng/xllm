@@ -42,7 +42,11 @@ class ChatServiceImpl final : public APIServiceImpl<ChatCall> {
   // brpc call_data needs to use shared_ptr
   void process_async_impl(std::shared_ptr<ChatCall> call);
 
-  void process_async_rpc_impl(const proto::ChatRequest* request);
+  // `done` stays pending until the scheduled request finishes or the Service
+  // closes the RPC. The request watches that controller and cancels itself.
+  void process_async_rpc_impl(const proto::ChatRequest* request,
+                              brpc::Controller* controller,
+                              ::google::protobuf::Closure* done);
 
   void add_model_master(const std::string& model, LLMMaster* master);
 
@@ -70,6 +74,25 @@ class MMChatServiceImpl : public APIServiceImpl<MMChatCall> {
 
   // brpc call_data needs to use shared_ptr
   void process_async_impl(std::shared_ptr<MMChatCall> call);
+
+  // Service-routed text-only ChatRequest delivered over the brpc
+  // ChatCompletions entry. A VLM Engine serves all chat traffic through the
+  // multimodal path (its HTTP handler already parses text-only bodies into
+  // MMChatRequest), so this entry wraps the string content into "text"
+  // multimodal contents and runs the same VLMMaster pipeline instead of
+  // crashing on a null ChatServiceImpl. `done` stays pending until the
+  // scheduled request finishes or the Service closes the RPC.
+  void process_async_rpc_impl(const proto::ChatRequest* request,
+                              brpc::Controller* controller,
+                              ::google::protobuf::Closure* done);
+
+  // The brpc ChatCompletions@ChatRequest overload above hides the inherited
+  // APIServiceImpl<MMChatCall>::process_async_rpc_impl(const MMChatRequest*),
+  // which stays NOT_IMPLEMENTED on VLM (all MMChatRequest HTTP traffic goes
+  // through process_async_impl). Keep the base declaration visible so name
+  // lookup on a MMChatRequest* does not silently bind to the ChatRequest
+  // overload.
+  using APIServiceImpl<MMChatCall>::process_async_rpc_impl;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(MMChatServiceImpl);

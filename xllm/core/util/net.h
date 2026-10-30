@@ -23,6 +23,8 @@ namespace net {
 
 std::string get_local_ip_addr();
 std::string get_route_ip(const std::string& remote_addr);
+std::string format_host_port(const std::string& host, int32_t port);
+bool is_valid_host_port(const std::string& address);
 int get_local_free_port();
 uint64_t convert_ip_port_to_uint64(const std::string& ip, uint16_t port);
 std::pair<std::string, uint16_t> convert_uint64_to_ip_port(uint64_t input);

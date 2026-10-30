@@ -66,6 +66,7 @@ LLMMaster::LLMMaster(const Options& options)
 
   if (options_.enable_service_routing()) {
     xservice_client_ = XServiceClient::get_instance();
+    xservice_client_->set_engine(engine_.get());
     if (!xservice_client_->init(options_.etcd_addr().value_or(""),
                                 options_.instance_name().value_or(""),
                                 engine_->block_manager_pool(),

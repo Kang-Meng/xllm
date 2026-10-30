@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/framework/config/config_utils.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/util/env_var.h"
 
 DEFINE_bool(enable_disagg_pd,
             false,
@@ -50,6 +51,10 @@ DEFINE_bool(kv_push_dst_rotate,
             "Rotate the dst-worker traversal order in push_kv_blocks per "
             "KV-split rank to spread incast across D workers.");
 
+DEFINE_string(super_node_id,
+              "",
+              "Physical Ascend super-pod id this engine belongs to; empty "
+              "opts out of cross super-node isolation (wildcard).");
 namespace xllm {
 
 void DisaggPDConfig::from_flags() {
@@ -60,6 +65,7 @@ void DisaggPDConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_cache_transfer_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(transfer_listen_port);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_push_dst_rotate);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(super_node_id);
 }
 
 void DisaggPDConfig::from_json(const JsonReader& json) {
@@ -99,6 +105,15 @@ void DisaggPDConfig::initialize() {
   from_flags();
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
+  }
+  // super_node_id resolves as: explicit non-empty --super_node_id flag wins;
+  // otherwise (flag unset, or explicitly ""), fall back to the SUPER_POD_ID env
+  // the launcher injects from the Ascend super-pod. Both empty leaves it ""
+  // (wildcard, no cross super-node isolation). Like instance_role this is a
+  // per-instance identity, so it is intentionally NOT read from the shared JSON
+  // config; only flag and env feed it.
+  if (!config::is_flag_specified("super_node_id") || super_node_id().empty()) {
+    super_node_id(util::get_optional_string_env("SUPER_POD_ID").value_or(""));
   }
 }
 

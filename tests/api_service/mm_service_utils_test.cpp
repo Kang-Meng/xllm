@@ -223,5 +223,61 @@ TEST(MMServiceUtilsTest, BuildsValidMessages) {
   EXPECT_TRUE(call->error_message().empty());
 }
 
+// Service-routed text-only brpc ChatRequest content must land in the same
+// MMContentVec-of-"text" shape the ServingMode::VLM HTTP parser produces;
+// roles, tool ids, reasoning content and tool calls ride along unchanged.
+TEST(MMServiceUtilsTest, WrapsChatRequestStringsAsTextContents) {
+  proto::ChatRequest request;
+  proto::ChatMessage* user = request.add_messages();
+  user->set_role("user");
+  user->set_content("describe the sky");
+  proto::ChatMessage* assistant = request.add_messages();
+  assistant->set_role("assistant");
+  assistant->set_content("the sky is blue");
+  assistant->set_reasoning_content("thinking about sky colors");
+  proto::ChatMessage* tool = request.add_messages();
+  tool->set_role("tool");
+  tool->set_content("sunny");
+  tool->set_tool_call_id("call-1");
+  proto::ChatMessage* assistant_tools = request.add_messages();
+  assistant_tools->set_role("assistant");
+  assistant_tools->set_content("checking the weather");
+  proto::ToolCall* tool_call = assistant_tools->add_tool_calls();
+  tool_call->set_id("call-1");
+  tool_call->set_type("function");
+  tool_call->mutable_function()->set_name("get_weather");
+  tool_call->mutable_function()->set_arguments("{\"city\": \"Beijing\"}");
+
+  std::vector<Message> messages = build_text_only_messages(request.messages());
+
+  ASSERT_EQ(messages.size(), 4u);
+
+  // Plain text: one "text" content item holding the string.
+  ASSERT_TRUE(std::holds_alternative<MMContentVec>(messages[0].content));
+  const MMContentVec& user_contents =
+      std::get<MMContentVec>(messages[0].content);
+  ASSERT_EQ(user_contents.size(), 1u);
+  EXPECT_EQ(user_contents.front().type, "text");
+  EXPECT_EQ(user_contents.front().text, "describe the sky");
+  EXPECT_EQ(messages[0].role, "user");
+  EXPECT_FALSE(messages[0].has_mm_content());
+
+  // Reasoning content preserved on the assistant turn.
+  EXPECT_EQ(messages[1].reasoning_content.value_or(""),
+            "thinking about sky colors");
+
+  // Tool response fields preserved.
+  EXPECT_EQ(messages[2].tool_call_id.value_or(""), "call-1");
+  EXPECT_EQ(messages[2].role, "tool");
+
+  // Tool calls preserved with full function payloads.
+  ASSERT_TRUE(messages[3].tool_calls.has_value());
+  ASSERT_EQ(messages[3].tool_calls->size(), 1u);
+  EXPECT_EQ(messages[3].tool_calls->front().id, "call-1");
+  EXPECT_EQ(messages[3].tool_calls->front().function.name, "get_weather");
+  EXPECT_EQ(messages[3].tool_calls->front().function.arguments,
+            "{\"city\": \"Beijing\"}");
+}
+
 }  // namespace
 }  // namespace xllm::mm_service_utils

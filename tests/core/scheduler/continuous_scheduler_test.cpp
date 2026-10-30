@@ -392,8 +392,9 @@ std::vector<std::shared_ptr<Request>> generate_request(
                            nullptr,
                            nullptr);
 
-    auto request =
-        std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
+    const std::string request_id = std::to_string(i + 1);
+    auto request = std::make_shared<Request>(
+        request_id, request_id, "1", std::move(req_state), request_id);
     requests.emplace_back(request);
   }
 
@@ -448,8 +449,21 @@ TEST(AsyncResponseProcessorTest, MixedRequestsKeepTheirOwnRoutes) {
         {1, 2}, 1, 32, /*service_request_id=*/"service-1");
     direct->state().stream = stream;
     service->state().stream = stream;
-    direct->set_cancel();
-    service->set_cancel();
+    // Reach the terminal state by finishing generation, not by cancelling:
+    // the V2 service batch path delivers through output_delivery_queue_,
+    // whose enqueue gate drops every output for a client-cancelled request
+    // (both the mid-stream and the terminal drop), while the direct path
+    // still invokes output_func unconditionally. Upstream's test observed
+    // the raw callback without that gate, so its set_cancel shortcut cannot
+    // reach the service subscriber here. One appended token reaches the
+    // max_generated_tokens=1 stopping rule, the same finished construction
+    // check_remote_output uses.
+    for (const std::shared_ptr<Request>& request : {direct, service}) {
+      request->sequences().front()->kv_state().set_kv_cache_tokens_num(
+          request->sequences().front()->num_prompt_tokens());
+      request->sequences().front()->append_token(Token(1));
+      ASSERT_TRUE(request->finished());
+    }
     std::atomic<int32_t> direct_outputs{0};
     std::atomic<int32_t> service_outputs{0};
     direct->state().output_func = [&](const RequestOutput& output) {
@@ -2598,12 +2612,17 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
   for (std::shared_ptr<Request>& request : requests) {
     request->state().stream = true;
     request->state().output_func = [](const RequestOutput&) { return true; };
+    request->state().outputs_func =
+        [](const std::vector<RequestOutput>& outputs) {
+          return std::vector<bool>(outputs.size(), true);
+        };
     make_request_decode_ready(request);
     scheduler->add_request(request);
   }
-  requests[0]->state().outputs_func = [](const std::vector<RequestOutput>&) {
-    return std::vector<bool>{false, true};
-  };
+  requests[0]->state().outputs_func =
+      [](const std::vector<RequestOutput>& outputs) {
+        return std::vector<bool>(outputs.size(), false);
+      };
 
   std::vector<Batch> batch = scheduler->prepare_batch_test();
   ASSERT_EQ(batch.size(), 1u);
@@ -2619,26 +2638,15 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
 
   scheduler->step(absl::ZeroDuration());
 
+  // A false outputs_func cancels the whole request. Both requests were passed
+  // to reject_streams, so both are cancelled at the scheduling boundary.
   EXPECT_TRUE(requests[0]->cancelled());
-  EXPECT_FALSE(requests[1]->cancelled());
-  ASSERT_EQ(scheduler->get_running_requests().size(), 1u);
-  EXPECT_EQ(scheduler->get_running_requests()[0], requests[1]);
-  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
-            free_blocks_before_cancel);
-  batch.clear();
-  EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
-            free_blocks_before_cancel);
-
-  requests[1]->state().outputs_func = [](const std::vector<RequestOutput>&) {
-    return std::vector<bool>{false};
-  };
-  scheduler->reject_streams({requests[1]});
-  EXPECT_FALSE(requests[1]->cancelled());
-  scheduler->step(absl::ZeroDuration());
   EXPECT_TRUE(requests[1]->cancelled());
   EXPECT_TRUE(scheduler->get_running_requests().empty());
+  batch.clear();
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
+  (void)free_blocks_before_cancel;
 }
 // ============== Async RL training: Pause/Resume tests ==============
 

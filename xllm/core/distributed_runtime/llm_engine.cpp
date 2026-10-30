@@ -697,6 +697,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .enable_xtensor(kv_cache_config.enable_xtensor())
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())
+      .logical_kv_bytes_per_token(
+          ::xllm::logical_kv_bytes_per_token(kv_cache_cap).value_or(0))
       .model_id(options_.model_id())
       .model_type(args_.model_type())
       .max_seqs_per_batch(options_.max_seqs_per_batch())

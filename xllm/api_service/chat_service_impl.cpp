@@ -31,6 +31,7 @@ limitations under the License.
 
 #include "api_service/mm_service_utils.h"
 #include "api_service/request_admission.h"
+#include "api_service/rpc_cancel_call.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/instance_name.h"
@@ -40,6 +41,8 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
+#include "core/framework/request/request_timing.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/binary_payload.h"
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
@@ -617,11 +620,18 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
 
 // chat_async for brpc with xllm_serice
 void ChatServiceImpl::process_async_rpc_impl(
-    const proto::ChatRequest* request) {
+    const proto::ChatRequest* request,
+    brpc::Controller* controller,
+    ::google::protobuf::Closure* done) {
   const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
+  // Keep the inbound RPC open. Releasing this owner runs `done`; until then a
+  // Service-side cancel is visible to Request::update_connection_status.
+  std::shared_ptr<RpcCancelCall> rpc_call =
+      make_rpc_cancel_call(controller, done);
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  auto callback = [master = master_](const RequestOutput& req_output) -> bool {
+  auto callback = [master = master_,
+                   rpc_call](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
     return master->handle_rpc_response(req_output);
   };
@@ -691,10 +701,9 @@ void ChatServiceImpl::process_async_rpc_impl(
   master_->handle_request(std::move(messages),
                           std::move(prompt_tokens),
                           std::move(request_params),
-                          std::nullopt,
-                          callback);
+                          rpc_call.get(),
+                          std::move(callback));
 }
-
 // chat_async for brpc
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   // Include API message preparation, not only Master/worker preprocessing.
@@ -885,6 +894,16 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
   request_params.timing = call->request_timing();
 
+  // MMChat shares the V2 service-routed disagg PD path with ChatRequest but
+  // never ships prompt tokens on the wire: the VLM Engine re-tokenizes the
+  // multimodal prompt itself, so only the Decode route and incarnation need
+  // restoring here. Dropped during the v033->main merge; without
+  // decode_address every service-routed MM request executes LOCAL mode and
+  // misses its Decode Engine.
+  if (rpc_request.has_routing()) {
+    request_params.decode_address = rpc_request.routing().decode_name();
+  }
+
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {
     include_usage = rpc_request.stream_options().include_usage();
@@ -958,6 +977,78 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
                                           is_force_reasoning,
                                           json_tools);
       });
+}
+
+// Service-routed text-only ChatRequest on the brpc ChatCompletions entry.
+// The Service routes by required api_features: multimodal requests carry
+// "multimodal_chat_completions" and arrive as MMChatRequest over HTTP
+// passthrough, while text requests carry no requirement and may still be
+// placed on a VLM Engine as the local instance (e.g. LOCAL_PREFILL_DECODE
+// sole instance). This entry mirrors ChatServiceImpl's brpc entry on the
+// VLM serving mode: admit -> RequestParams(ChatRequest) (the V2 envelope,
+// deadline and ExecutionPlan validation are identical) -> wrap string
+// content as "text" multimodal contents -> VLMMaster. The VLM Engine
+// re-tokenizes the prompt itself (same contract as the HTTP MMChat path),
+// so no prompt tokens are forwarded.
+void MMChatServiceImpl::process_async_rpc_impl(
+    const proto::ChatRequest* request,
+    brpc::Controller* controller,
+    ::google::protobuf::Closure* done) {
+  // Keep the inbound RPC open. Releasing this owner runs `done`; until then a
+  // Service-side cancel is visible to Request::update_connection_status.
+  std::shared_ptr<RpcCancelCall> rpc_call =
+      make_rpc_cancel_call(controller, done);
+  const auto& service_request_id = request->service_request_id();
+  const auto& target_xservice_addr = request->source_xservice_addr();
+  // VLMMaster has no handle_rpc_response; streaming generations return to
+  // the Service through the XServiceClient singleton, exactly what the
+  // LLMMaster variant does.
+  auto callback = [rpc_call](const RequestOutput& req_output) -> bool {
+    req_output.log_request_status();
+    XServiceClient* xservice_client = XServiceClient::get_instance();
+    if (xservice_client == nullptr) {
+      return false;
+    }
+    std::vector<bool> return_status =
+        xservice_client->generations({req_output});
+    CHECK_EQ(return_status.size(), 1);
+    return return_status[0];
+  };
+
+  CHECK(master_ != nullptr);
+  const auto& rpc_request = *request;
+  const auto& model = rpc_request.model();
+  Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (unlikely(!admission_status.ok())) {
+    callback({std::move(admission_status),
+              service_request_id,
+              target_xservice_addr});
+    return;
+  }
+
+  RequestParams request_params(rpc_request, "", "");
+
+  // Text-only content becomes one "text" multimodal content per message, the
+  // same shape the ServingMode::VLM HTTP parser produces for a text body.
+  std::vector<Message> messages =
+      mm_service_utils::build_text_only_messages(rpc_request.messages());
+
+  if (rpc_request.has_routing()) {
+    request_params.decode_address = rpc_request.routing().decode_name();
+  }
+  // Preserve parser-relevant special tokens for tool call detectors, same
+  // as the text chat path.
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    request_params.skip_special_tokens = false;
+  }
+
+  master_->handle_request(std::move(messages),
+                          std::move(request_params),
+                          BinaryPayload(),
+                          std::move(callback),
+                          /*use_prompt_as_is=*/false,
+                          rpc_call.get());
 }
 
 }  // namespace xllm

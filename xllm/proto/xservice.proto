@@ -19,11 +19,33 @@ package xllm_service.proto;
 option cc_generic_services = true;
 
 import "disagg_pd.proto";
+import "provider.proto";
 
 message Empty {}
 
+enum GenerationDeliveryCode {
+  GENERATION_DELIVERY_CODE_UNSPECIFIED = 0;
+  GENERATION_DELIVERY_CODE_ACCEPTED = 1;
+  GENERATION_DELIVERY_CODE_INVALID_PAYLOAD = 2;
+  GENERATION_DELIVERY_CODE_UNKNOWN_REQUEST = 3;
+  GENERATION_DELIVERY_CODE_CLIENT_DISCONNECTED = 4;
+  GENERATION_DELIVERY_CODE_REQUEST_CLOSED = 5;
+  GENERATION_DELIVERY_CODE_INVALID_IDENTITY = 6;
+  GENERATION_DELIVERY_CODE_INVALID_SEQUENCE = 7;
+  GENERATION_DELIVERY_CODE_COMMIT_UNPROVEN = 8;
+  GENERATION_DELIVERY_CODE_TERMINAL_UNPROVEN = 9;
+  GENERATION_DELIVERY_CODE_AFFINITY_MISSING = 10;
+}
+
 message Status {
   bool ok = 1;
+  // Present on Generations per-item responses. Other RPCs may use status_msg
+  // to preserve a bounded remote rejection reason.
+  optional GenerationDeliveryCode delivery_code = 2;
+  string status_msg = 3;
+  // Cache version the master already holds after PushKVEvents. The Engine
+  // clears a recorded publish failure once this covers that failure version.
+  optional uint64 kv_commit_version = 4;
 }
 
 message StatusCode {
@@ -47,9 +69,14 @@ message InstanceMetaInfo {
   int32 dp_size = 7;
   repeated string addrs = 8;
   repeated uint32 ports = 10;
-  string incarnation_id = 11;
   uint64 register_ts_ms = 12;
   int32 kv_split_size = 13;
+  // Physical Ascend super-pod id. Empty means the instance does not participate
+  // in cross super-node isolation (wildcard). Tag 15 is intentionally aligned
+  // with xllm-service's InstanceMetaInfo.super_node_id so the two protos stay
+  // wire-compatible; tag 14 is reserved to match the Coordinator's layout
+  // (xllm-service occupies it with backend_type).
+  string super_node_id = 15;
   // Which pages of each INDEX resource the instance writes under
   // XLLM_CP_INDEX_WRITE_MODE: 0 = unspecified (legacy instance that
   // predates the field; admission keeps the legacy behavior), 1 =
@@ -57,7 +84,11 @@ message InstanceMetaInfo {
   // natural rows), 2 = sharded (only the rank's own stripe, at the
   // group-first page). Consulted by plan_kv_split_widths: a sharded
   // source cannot serve an equal-width kv_split_size > 1 destination.
-  optional int32 cp_index_write_mode = 14;
+  // Tag 16 (not 14): tag 14 is reserved for wire-compat with the
+  // Coordinator's backend_type, tag 15 carries super_node_id, so the
+  // CP index write mode moves to 16 to keep both engine-internal KV-split
+  // admission and the Coordinator wire contract intact.
+  optional int32 cp_index_write_mode = 16;
 }
 
 message KvCacheEvent {
@@ -106,7 +137,7 @@ message HeartbeatRequest {
   LoadMetrics load_metrics = 3;
   LatencyMetrics latency_metrics = 4;
   XTensorHeartbeatInfo xtensor_info = 5;
-  string incarnation_id = 6;
+  xllm.proto.EngineState engine_state = 7;
 }
 
 message InstanceID {
@@ -118,9 +149,9 @@ message InstanceIDs {
 }
 
 service XllmRpcService {
-  rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
   rpc GetInstanceInfo(InstanceID) returns (InstanceMetaInfo) {}
   rpc Heartbeat(HeartbeatRequest) returns (Status) {}
+  rpc PushKVEvents(xllm.proto.KVEventBatch) returns (Status) {}
   rpc GetStaticDecodeList(InstanceID) returns (InstanceIDs) {}
   rpc GetStaticPrefillList(InstanceID) returns (InstanceIDs) {}
   // xllm service receive response from decode instance directly in disagg pd mode.

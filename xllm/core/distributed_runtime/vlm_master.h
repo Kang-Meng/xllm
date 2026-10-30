@@ -41,6 +41,8 @@ limitations under the License.
 
 namespace xllm {
 
+class XServiceClient;
+
 class VLMMaster : public Master {
  public:
   explicit VLMMaster(const Options& options);
@@ -57,7 +59,8 @@ class VLMMaster : public Master {
                       RequestParams sp,
                       BinaryPayload payload,
                       OutputCallback callback,
-                      bool use_prompt_as_is = false);
+                      bool use_prompt_as_is = false,
+                      std::optional<Call*> call = std::nullopt);
 
   // batch completion
   void handle_batch_request(std::vector<std::string> prompts,
@@ -90,6 +93,13 @@ class VLMMaster : public Master {
  private:
   using Task = folly::Function<void()>;
 
+  // Delivers a batch of completed request outputs back to the Service through
+  // XServiceClient::generations. Returns false per output when service routing
+  // is not initialized, mirroring LLMMaster::handle_rpc_response.
+  bool handle_rpc_response(const RequestOutput& output);
+  std::vector<bool> handle_rpc_responses(
+      const std::vector<RequestOutput>& outputs);
+
   std::unique_ptr<Scheduler> scheduler_;
 
   // model args
@@ -106,6 +116,11 @@ class VLMMaster : public Master {
 
   // builds Request aggregates from prompts/messages + multimodal data
   std::unique_ptr<VLMRequestFactory> request_factory_;
+
+  // Service-routing RPC client owned by the master (singleton handle), used to
+  // push completed Generations back to the Service. Null when service
+  // routing is disabled; see handle_rpc_responses.
+  XServiceClient* xservice_client_ = nullptr;
 
   // thread for moving forward the scheduler
   std::thread loop_thread_;

@@ -422,3 +422,17 @@ DECLARE_GAUGE(total_activation_size_in_kilobytes);
 DECLARE_MULTI_HISTOGRAM(active_kv_cache_size_in_kilobytes);
 DECLARE_MULTI_HISTOGRAM(prefill_active_activation_size_in_kilobytes);
 DECLARE_MULTI_HISTOGRAM(decode_active_activation_size_in_kilobytes);
+
+// Native control metrics. All names are intentionally label-free and
+// low-cardinality for bvar export.
+DECLARE_COUNTER(kv_event_publish_failures_total);
+DECLARE_COUNTER(kv_event_publish_suppressed_total);
+DECLARE_COUNTER(kv_event_publish_recoveries_total);
+DECLARE_COUNTER(kv_event_oversize_dropped_total);
+DECLARE_COUNTER(kv_event_resident_capacity_rejections_total);
+DECLARE_COUNTER(kv_event_resident_shard_rejections_total);
+DECLARE_GAUGE(kv_event_snapshot_available);
+DECLARE_GAUGE(kv_event_max_resident_shard_entries);
+DECLARE_COUNTER(engine_heartbeat_failures_total);
+DECLARE_COUNTER(engine_heartbeat_suppressed_total);
+DECLARE_COUNTER(engine_heartbeat_recoveries_total);

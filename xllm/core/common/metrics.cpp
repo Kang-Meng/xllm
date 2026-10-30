@@ -465,3 +465,31 @@ DEFINE_MULTI_HISTOGRAM(
     decode_active_activation_size_in_kilobytes,
     "dp_rank",
     "Active activation size in kilobytes per dp rank during decode phase");
+
+DEFINE_COUNTER(kv_event_publish_failures_total,
+               "Total failed Native KV event publish attempts");
+DEFINE_COUNTER(kv_event_publish_suppressed_total,
+               "Total repeated Native KV event publish logs suppressed");
+DEFINE_COUNTER(kv_event_publish_recoveries_total,
+               "Total Native KV event publish failure episodes recovered");
+DEFINE_COUNTER(kv_event_oversize_dropped_total,
+               "Total Native KV events dropped because one event exceeded the "
+               "publish batch byte bound");
+DEFINE_COUNTER(
+    kv_event_resident_capacity_rejections_total,
+    "Total Native KV resident mutations rejected by the journal-wide bound");
+DEFINE_COUNTER(
+    kv_event_resident_shard_rejections_total,
+    "Total Native KV resident mutations rejected by a per-shard COW bound");
+DEFINE_GAUGE(
+    kv_event_snapshot_available,
+    "Whether the Native KV event journal can serve an authoritative snapshot");
+DEFINE_GAUGE(kv_event_max_resident_shard_entries,
+             "Current cache epoch high watermark of entries in one Native KV "
+             "journal COW shard");
+DEFINE_COUNTER(engine_heartbeat_failures_total,
+               "Total failed Native Engine heartbeat attempts");
+DEFINE_COUNTER(engine_heartbeat_suppressed_total,
+               "Total repeated Native Engine heartbeat logs suppressed");
+DEFINE_COUNTER(engine_heartbeat_recoveries_total,
+               "Total Native Engine heartbeat failure episodes recovered");

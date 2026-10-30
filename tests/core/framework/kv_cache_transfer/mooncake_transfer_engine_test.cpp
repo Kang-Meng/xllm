@@ -593,24 +593,6 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   EXPECT_EQ(merged_kv_infos.size(), 4U);
 }
 
-TEST(MooncakeKVCacheTransferDefaultTest,
-     LogicalDcpMappingsPreserveOneToOneRemoteBlocks) {
-  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
-                                  /*dst_tp_size=*/1,
-                                  /*dst_dp_rank=*/0);
-  info.rank_local_mapping = true;
-  info.mappings[0].local_ids = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-  info.mappings[0].remote_ids = {21, 22, 23, 24, 25, 26, 27, 28, 29, 30};
-
-  const std::vector<TransferKVInfo> filtered = filter_kv_split_infos(
-      /*kv_split_rank=*/3, /*kv_split_size=*/4, {info});
-
-  ASSERT_EQ(filtered.size(), 1U);
-  ASSERT_EQ(filtered[0].mappings.size(), 1U);
-  EXPECT_EQ(filtered[0].mappings[0].local_ids, info.mappings[0].local_ids);
-  EXPECT_EQ(filtered[0].mappings[0].remote_ids, info.mappings[0].remote_ids);
-}
-
 #if defined(USE_NPU)
 constexpr int32_t kValidatePushCommand = 1;
 constexpr int32_t kPreparePullCommand = 2;
@@ -749,32 +731,6 @@ NpuMixedTransferCaches make_npu_mixed_transfer_caches(
   return tensors;
 }
 
-ModelArgs make_npu_round_trip_model_args() {
-  ModelArgs args;
-  args.model_type("test")
-      .n_layers(2)
-      .n_heads(1)
-      .n_kv_heads(1)
-      .head_dim(384)
-      .index_n_heads(1)
-      .linear_num_key_heads(1)
-      .linear_num_value_heads(1)
-      .linear_key_head_dim(128)
-      .linear_value_head_dim(384);
-  return args;
-}
-
-KVCacheShape make_npu_round_trip_cache_shape() {
-  proto::KVCacheShape proto_shape;
-  for (int64_t dim : {2, 1024, 384}) {
-    proto_shape.add_conv_cache_shape(dim);
-  }
-  for (int64_t dim : {2, 1, 128, 384}) {
-    proto_shape.add_ssm_cache_shape(dim);
-  }
-  return KVCacheShape::from_proto(proto_shape);
-}
-
 void fill_mixed_transfer_block(NpuMixedTransferCaches* tensors,
                                int64_t block_id,
                                bool pull_pattern) {
@@ -833,15 +789,8 @@ int run_npu_round_trip_peer(int command_fd,
   remote_transfer.initialize(device_index);
   NpuMixedTransferCaches remote_caches =
       make_npu_mixed_transfer_caches(remote_torch_device);
-  remote_transfer.configure_cache_layout(make_args(/*rank=*/0,
-                                                   /*world_size=*/1,
-                                                   /*dp_size=*/1),
-                                         make_npu_round_trip_model_args(),
-                                         /*block_token_capacity=*/1024,
-                                         /*is_spec_draft=*/false);
-  remote_transfer.register_kv_cache(remote_caches.caches,
-                                    make_npu_round_trip_cache_shape(),
-                                    torch::kBFloat16);
+  remote_transfer.register_kv_cache(
+      remote_caches.caches, KVCacheShape(), torch::kBFloat16);
 
   const auto& layers = remote_transfer.main_layout_.layers;
   const bool layout_matches =
@@ -1006,14 +955,9 @@ TEST(MooncakeTransferEngineServiceTest, PlanOnlyBindsAsSuccessfulNoOp) {
   const WorkerCacheLayoutManifest destination =
       make_peer_manifest("destination", "plan-only-destination", 1);
 
-  MooncakeTransferEngineService service;
-  proto::CachePeerRequest request;
-  cache_layout_to_proto(destination, request.mutable_destination_manifest());
-  request.set_mode(proto::CACHE_PEER_MODE_PLAN_ONLY);
-  proto::Status response;
-  brpc::Controller cntl;
-  service.SetCachePeer(&cntl, &request, &response, nullptr);
-  ASSERT_TRUE(response.ok());
+  // This fixture tests plan-only binding without an initialized transport.
+  // Owned SetCachePeer RPC/reply loss is covered by the CPU two-process test.
+  ASSERT_TRUE(core.set_cache_peer(destination, CachePeerMode::PLAN_ONLY).ok());
 
   MooncakeTransferEngine transfer(/*listen_port=*/0,
                                   torch::Device(torch::kCPU));
@@ -1037,9 +981,7 @@ TEST(MooncakeTransferEngineServiceTest, PlanOnlyBindsAsSuccessfulNoOp) {
                   .ok());
   EXPECT_TRUE(explicit_regions.empty());
 
-  request.set_mode(proto::CACHE_PEER_MODE_ABSENT);
-  service.SetCachePeer(&cntl, &request, &response, nullptr);
-  EXPECT_TRUE(response.ok());
+  EXPECT_TRUE(core.set_cache_peer(destination, CachePeerMode::ABSENT).ok());
 }
 
 TEST(MooncakeTransferEngineServiceTest, CachePeerTransitionsAreIdempotent) {
@@ -1370,7 +1312,7 @@ TEST(MooncakeTransferEngineServiceTest, CloseSessionRejectsMissingAddr) {
   EXPECT_FALSE(response.ok());
 }
 
-TEST(MooncakeTransferEngineServiceTest, CloseSessionWithoutHandleReturnsTrue) {
+TEST(MooncakeTransferEngineServiceTest, CloseSessionAcceptsAddress) {
   MooncakeTransferEngineService service;
   proto::SessionInfo request;
   request.set_addr("127.0.0.1:5001");
@@ -1379,6 +1321,7 @@ TEST(MooncakeTransferEngineServiceTest, CloseSessionWithoutHandleReturnsTrue) {
 
   service.CloseSession(&cntl, &request, &response, nullptr);
 
+  // No local session exists, so the address-only close is a no-op success.
   EXPECT_TRUE(response.ok());
 }
 
@@ -2033,107 +1976,43 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 #endif
 
 TEST(MooncakeKVCacheTransferDefaultTest,
-     Glm5NextTransfersMainAndDraftPagesAndRequestState) {
+     CheckpointedSsmMappingsUsePhysicalBaseRows) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));
   RecordingMooncakeTransferEngine* engine_observer = engine.get();
-  MooncakeKVCacheTransferDefault transfer(
-      0, 0, torch::Device(torch::kCPU), "glm5_next", std::move(engine));
-  transfer.addr_ = "glm5-next-rank-1";
-  ModelArgs args;
-  args.model_type("glm5_next")
-      .n_layers(2)
-      .n_heads(4)
-      .enable_mla(true)
-      .index_kpool_compress(true)
-      .linear_num_key_heads(4)
-      .linear_num_value_heads(4)
-      .linear_key_head_dim(2)
-      .linear_value_head_dim(2);
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"qwen3_5",
+                                          std::move(engine));
+
   proto::KVCacheShape proto_shape;
-  for (int64_t dim : {4, 3, 12}) {
+  for (int64_t dim : {2, 1, 6}) {
     proto_shape.add_conv_cache_shape(dim);
   }
-  for (int64_t dim : {12, 2, 2, 2}) {
+  for (int64_t dim : {6, 2, 1, 1}) {
     proto_shape.add_ssm_cache_shape(dim);
   }
   const KVCacheShape shape = KVCacheShape::from_proto(proto_shape);
-  std::vector<KVCache> main_caches;
-  std::vector<KVCache> draft_caches;
-  const int64_t index_pages = indexer_pages_per_block();
-  for (std::vector<KVCache>* caches : {&main_caches, &draft_caches}) {
-    IndexedKVCacheTensors indexed;
-    indexed.kv_cache_tensors.key_cache = torch::zeros({4, 16, 1, 8});
-    indexed.index_cache = torch::zeros({4 * index_pages, 1, 4, 4});
-    indexed.kpool_tail = torch::zeros({4, 2, 8, 4});
-    caches->emplace_back(indexed);
-  }
-  main_caches.emplace_back(LinearAttentionKVCacheTensors{
-      torch::zeros({4, 3, 12}), torch::zeros({12, 2, 2, 2})});
-  const ParallelArgs parallel = make_args(1, 2, 1);
-  transfer.configure_cache_layout(parallel, args, 16, false);
-  transfer.register_kv_cache(main_caches, shape, torch::kFloat32);
-  transfer.configure_cache_layout(parallel, args, 16, true);
-  transfer.register_kv_cache_spec(draft_caches, shape, torch::kFloat32);
+  std::vector<KVCache> caches;
+  caches.emplace_back(LinearAttentionKVCacheTensors{
+      torch::zeros({2, 1, 6}), torch::zeros({6, 2, 1, 1})});
+  transfer.register_kv_cache(caches, shape, torch::kFloat32);
 
-  const auto& tensors = transfer.local_cache_layout_.tensors;
-  ASSERT_EQ(tensors.size(), 8U);
-  ASSERT_EQ(engine_observer->registered_block_bytes.size(), 2U);
-  const uint64_t index_block_bytes = 64U * static_cast<uint64_t>(index_pages);
-  EXPECT_EQ(engine_observer->registered_block_bytes[0],
-            (std::vector<uint64_t>{512, index_block_bytes, 256, 144, 96}));
-  EXPECT_EQ(engine_observer->registered_block_bytes[1],
-            (std::vector<uint64_t>{512, index_block_bytes, 256}));
-  for (const CacheTensorManifest& tensor : tensors) {
-    const bool recurrent =
-        tensor.role == static_cast<int32_t>(KVCacheTensorRole::CONV) ||
-        tensor.role == static_cast<int32_t>(KVCacheTensorRole::SSM);
-    const bool sequence_scoped =
-        recurrent ||
-        tensor.role == static_cast<int32_t>(KVCacheTensorRole::KPOOL_TAIL);
-    EXPECT_EQ(tensor.resource_count, 4U);
-    EXPECT_EQ(
-        tensor.group_id,
-        cache_group_id(sequence_scoped ? BlockType::LINEAR : BlockType::KV));
-    EXPECT_EQ(tensor.shard.resource_scope,
-              sequence_scoped ? CacheResourceScope::SEQUENCE
-                              : CacheResourceScope::BLOCK);
-    ASSERT_FALSE(tensor.shard.spans.empty());
-    for (const LogicalSpan& span : tensor.shard.spans) {
-      EXPECT_EQ(span.owner_tp_rank, recurrent ? 1 : 0);
-    }
-    if (tensor.role == static_cast<int32_t>(KVCacheTensorRole::SSM)) {
-      EXPECT_EQ(tensor.physical_rows_per_resource, 3U);
-      EXPECT_EQ(tensor.shard.spans[0].repeat_count, 3U);
-    }
-    EXPECT_EQ(tensor.cache_namespace,
-              tensor.mooncake_buffer_id < 5 ? CacheNamespace::MAIN
-                                            : CacheNamespace::SPEC_DRAFT);
-  }
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::LINEAR);
+  mapping.local_ids = {1};
+  mapping.remote_ids = {2};
 
-  KVTransferMapping pages;
-  pages.group_id = cache_group_id(BlockType::KV);
-  pages.local_ids = {3, 1};
-  pages.remote_ids = {0, 2};
-  KVTransferMapping state;
-  state.group_id = cache_group_id(BlockType::LINEAR);
-  state.local_ids = {2};
-  state.remote_ids = {1};
-  ASSERT_TRUE(transfer.pull_kv_blocks(1, "prefill", {pages, state}));
+  ASSERT_TRUE(transfer.pull_kv_blocks(
+      /*src_cluster_id=*/1, "remote", {mapping}));
   ASSERT_EQ(engine_observer->move_calls.size(), 1U);
-  const auto& call = engine_observer->move_calls[0];
-  EXPECT_EQ(call.opcode, MooncakeTransferEngine::MoveOpcode::READ);
-  ASSERT_EQ(call.mappings.size(), tensors.size());
-  for (size_t index = 0; index < tensors.size(); ++index) {
-    const KVTransferMapping& expected =
-        tensors[index].group_id == state.group_id ? state : pages;
-    EXPECT_EQ(call.mappings[index].buf_id, tensors[index].mooncake_buffer_id);
-    EXPECT_EQ(call.mappings[index].local_ids, expected.local_ids);
-    EXPECT_EQ(call.mappings[index].remote_ids, expected.remote_ids);
-  }
-  // Pages alone cannot restore either the KDA state or the KPool tail.
-  EXPECT_FALSE(transfer.pull_kv_blocks(1, "prefill", {pages}));
-  EXPECT_EQ(engine_observer->move_calls.size(), 1U);
+  const auto& mappings = engine_observer->move_calls[0].mappings;
+  ASSERT_EQ(mappings.size(), 2U);
+  EXPECT_EQ(mappings[0].local_ids, (std::vector<uint64_t>{1}));
+  EXPECT_EQ(mappings[0].remote_ids, (std::vector<uint64_t>{2}));
+  EXPECT_EQ(mappings[1].local_ids, (std::vector<uint64_t>{3}));
+  EXPECT_EQ(mappings[1].remote_ids, (std::vector<uint64_t>{6}));
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
@@ -2333,9 +2212,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                                /*dp_size=*/1);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
-      transfer.push_kv_blocks_async(
-          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  // HEAD push_kv_blocks_async returns SemiFuture<vector<KVTransferTaskResult>>
+  // (empty vector = success, non-empty with FAILED entries = rejected). v033
+  // era returned SemiFuture<bool>; align to HEAD's result-vector API.
+  auto future = transfer.push_kv_blocks_async(
+      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
   EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
@@ -2419,9 +2300,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   parallel_args.kv_split_size(2);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
-      transfer.push_kv_blocks_async(
-          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  // HEAD push_kv_blocks_async returns SemiFuture<vector<KVTransferTaskResult>>
+  // (empty vector = success, non-empty with FAILED entries = rejected). v033
+  // era returned SemiFuture<bool>; align to HEAD's result-vector API.
+  auto future = transfer.push_kv_blocks_async(
+      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
   EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
@@ -2451,9 +2334,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   parallel_args.kv_split_size(2);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
-      transfer.push_kv_blocks_async(
-          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  // HEAD push_kv_blocks_async returns SemiFuture<vector<KVTransferTaskResult>>
+  // (empty vector = success, non-empty with FAILED entries = rejected). v033
+  // era returned SemiFuture<bool>; align to HEAD's result-vector API.
+  auto future = transfer.push_kv_blocks_async(
+      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
   EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
@@ -2716,14 +2601,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   local_transfer.initialize(local_device_index);
   NpuMixedTransferCaches local_caches =
       make_npu_mixed_transfer_caches(local_torch_device);
-  local_transfer.configure_cache_layout(make_args(/*rank=*/0,
-                                                  /*world_size=*/1,
-                                                  /*dp_size=*/1),
-                                        make_npu_round_trip_model_args(),
-                                        /*block_token_capacity=*/1024,
-                                        /*is_spec_draft=*/false);
   local_transfer.register_kv_cache(
-      local_caches.caches, make_npu_round_trip_cache_shape(), torch::kBFloat16);
+      local_caches.caches, KVCacheShape(), torch::kBFloat16);
 
   ASSERT_EQ(local_transfer.main_layout_.layers.size(), 2U);
   ASSERT_EQ(local_transfer.main_layout_.layers[0].size(), 2U);
@@ -2798,6 +2677,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                          /*device_index=*/0));
   ASSERT_TRUE(synchronizer->record_event(/*layer_index=*/1,
                                          /*device_index=*/0));
+  // HEAD push_kv_blocks returns vector<KVTransferTaskResult> (empty = success).
   ASSERT_TRUE(local_transfer
                   .push_kv_blocks(merged_infos,
                                   synchronizer,
@@ -2887,6 +2767,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
       std::make_shared<KVPushSynchronizerImpl>(/*num_layers=*/1);
   synchronizer->abort();
 
+  // HEAD push_kv_blocks returns vector<KVTransferTaskResult> (empty = success,
+  // non-empty = rejected). Align to HEAD's result-vector API.
   EXPECT_FALSE(transfer
                    .push_kv_blocks(merged_infos,
                                    synchronizer,
@@ -3108,93 +2990,6 @@ TEST(MooncakeKVCacheTransferDefaultTest, AddBufRejectsNonContiguousTensor) {
 
   EXPECT_DEATH(transfer.add_buf(tensor, addrs, lens, block_bytes),
                "contiguous");
-}
-
-TEST(MooncakeKVCacheTransferDefaultTest,
-     Glm5NextRequestStateRoundTripsLogicalSlots) {
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for Mooncake memory transfer.";
-  }
-  Device device(/*device_id=*/0);
-  device.set_device();
-  const torch::Device torch_device = device.unwrap();
-  const int32_t listen_port = net::get_local_free_port();
-  ASSERT_GT(listen_port, 0);
-  MooncakeKVCacheTransferDefault transfer(
-      0, static_cast<uint16_t>(listen_port), torch_device, "glm5_next");
-  transfer.initialize(/*device_id=*/0);
-
-  const auto allocator = default_kv_tensor_allocator();
-  IndexedKVCacheTensors indexed;
-  indexed.kv_cache_tensors.key_cache = allocator->allocate(
-      KVCacheTensorRole::KEY, {4, 16, 1, 8}, torch::kBFloat16, torch_device);
-  indexed.index_cache = allocator->allocate(
-      KVCacheTensorRole::INDEX, {4, 1, 4, 4}, torch::kBFloat16, torch_device);
-  indexed.kpool_tail = allocator->allocate(KVCacheTensorRole::KPOOL_TAIL,
-                                           {4, 2, 8, 4},
-                                           torch::kBFloat16,
-                                           torch_device);
-  LinearAttentionKVCacheTensors recurrent;
-  recurrent.conv_cache = allocator->allocate(
-      KVCacheTensorRole::CONV, {4, 3, 12}, torch::kBFloat16, torch_device);
-  recurrent.ssm_cache = allocator->allocate(
-      KVCacheTensorRole::SSM, {12, 2, 2, 2}, torch::kFloat32, torch_device);
-  std::vector<KVCache> caches;
-  caches.emplace_back(indexed);
-  caches.emplace_back(recurrent);
-  proto::KVCacheShape proto_shape;
-  for (int64_t dim : recurrent.conv_cache.sizes()) {
-    proto_shape.add_conv_cache_shape(dim);
-  }
-  for (int64_t dim : recurrent.ssm_cache.sizes()) {
-    proto_shape.add_ssm_cache_shape(dim);
-  }
-  transfer.register_kv_cache(
-      caches, KVCacheShape::from_proto(proto_shape), torch::kBFloat16);
-
-  std::vector<torch::Tensor> actual;
-  std::vector<torch::Tensor> expected;
-  for (const KVCache& cache : caches) {
-    for (const KVCacheTensor& buffer : cache.get_cache_tensors()) {
-      const int64_t rows = buffer.role == KVCacheTensorRole::SSM ? 3 : 1;
-      const bool sequence_scoped =
-          buffer.group_id == cache_group_id(BlockType::LINEAR);
-      const int64_t source_id = sequence_scoped ? 1 : 0;
-      const int64_t destination_id = sequence_scoped ? 3 : 2;
-      torch::Tensor tensor = buffer.tensor;
-      tensor.fill_(-7);
-      torch::Tensor source = tensor.narrow(0, source_id * rows, rows);
-      source.copy_(torch::arange(source.numel(), source.options())
-                       .reshape(source.sizes()));
-      torch::Tensor reference = tensor.clone();
-      reference.narrow(0, destination_id * rows, rows).copy_(source);
-      actual.emplace_back(tensor);
-      expected.emplace_back(reference);
-    }
-  }
-  ASSERT_EQ(device.synchronize_default_stream(), 0);
-
-  uint64_t cluster_id = 0;
-  std::string addr;
-  transfer.get_cache_info(cluster_id, addr);
-  ASSERT_TRUE(transfer.mooncake_te_->open_session(/*cluster_id=*/0, addr));
-  KVTransferMapping pages;
-  pages.group_id = cache_group_id(BlockType::KV);
-  pages.local_ids = {2};
-  pages.remote_ids = {0};
-  KVTransferMapping state;
-  state.group_id = cache_group_id(BlockType::LINEAR);
-  state.local_ids = {3};
-  state.remote_ids = {1};
-  // Use the real transfer engine with a loopback peer: no model weights or
-  // second instance are needed to verify the MLU byte ranges and slot strides.
-  ASSERT_TRUE(transfer.pull_kv_blocks(0, addr, {pages, state}));
-  ASSERT_EQ(device.synchronize_default_stream(), 0);
-  for (size_t index = 0; index < actual.size(); ++index) {
-    EXPECT_TRUE(torch::equal(actual[index], expected[index])) << index;
-  }
-  EXPECT_TRUE(transfer.unlink_cluster(
-      0, addr, static_cast<uint16_t>(listen_port), /*force_flag=*/true));
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,

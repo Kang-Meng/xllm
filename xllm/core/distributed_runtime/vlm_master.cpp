@@ -146,11 +146,19 @@ VLMMaster::VLMMaster(const Options& options)
   model_args_ = engine_->model_args();
 
   if (options_.enable_service_routing()) {
-    XServiceClient* xservice_client = XServiceClient::get_instance();
-    if (!xservice_client->init(options_.etcd_addr().value_or(""),
-                               options_.instance_name().value_or(""),
-                               engine_->block_manager_pool(),
-                               options_.etcd_namespace().value_or(""))) {
+    xservice_client_ = XServiceClient::get_instance();
+    // set_engine must precede init(): xservice_client.cpp:466 gates
+    // provider_descriptor construction on (engine_ != nullptr). Without it the
+    // registration JSON omits provider_descriptor and the service walks the
+    // legacy register_instance path (instance_mgr.cpp:5535) that never upserts
+    // engine_registry_, leaving engine_members=0 and readyz 503. LLMMaster
+    // (llm_master.cpp:69-76) sets the engine; the VLM path omitted it, so
+    // VLM+DisaggPD instances registered without a V2 descriptor.
+    xservice_client_->set_engine(engine_.get());
+    if (!xservice_client_->init(options_.etcd_addr().value_or(""),
+                                options_.instance_name().value_or(""),
+                                engine_->block_manager_pool(),
+                                options_.etcd_namespace().value_or(""))) {
       LOG(FATAL) << "XServiceClient init fail!";
       return;
     }
@@ -201,12 +209,16 @@ VLMMaster::VLMMaster(const Options& options)
                                            options_.max_processor_cache_items(),
                                            engine_->tokenizer_args());
 
-  request_factory_ = std::make_unique<VLMRequestFactory>(processor_.get(),
-                                                         chat_template_.get(),
-                                                         tokenizer_.get(),
-                                                         &model_args_,
-                                                         &options_,
-                                                         get_rate_limiter());
+  request_factory_ = std::make_unique<VLMRequestFactory>(
+      processor_.get(),
+      chat_template_.get(),
+      tokenizer_.get(),
+      &model_args_,
+      &options_,
+      get_rate_limiter(),
+      [this](const std::vector<RequestOutput>& outputs) {
+        return handle_rpc_responses(outputs);
+      });
 
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/options_.num_request_handling_threads(),
@@ -301,7 +313,8 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                                RequestParams sp,
                                BinaryPayload payload,
                                OutputCallback callback,
-                               bool use_prompt_as_is) {
+                               bool use_prompt_as_is,
+                               std::optional<Call*> call) {
   // Offline-only guard: fail loudly on the caller thread (pybind surfaces
   // the exception to the Python caller) before any scheduling side effect.
   if (use_prompt_as_is && !join_message_texts(messages).has_value()) {
@@ -321,6 +334,7 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                          sp = std::move(sp),
                          payload = std::move(payload),
                          use_prompt_as_is,
+                         call,
                          callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
     ScopeGuard timing_guard([timing = sp.timing] {
@@ -351,7 +365,8 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                                             sp,
                                             std::move(payload),
                                             callback,
-                                            use_prompt_as_is);
+                                            use_prompt_as_is,
+                                            call);
     if (!request) {
       return;
     }
@@ -486,6 +501,24 @@ void VLMMaster::generate() {
   running_.store(true, std::memory_order_relaxed);
   scheduler_->generate();
   running_.store(false, std::memory_order_relaxed);
+}
+
+bool VLMMaster::handle_rpc_response(const RequestOutput& output) {
+  // response to xllm service to avoid the redirect cost.
+  if (xservice_client_ == nullptr) return false;
+  auto return_status = xservice_client_->generations({output});
+  CHECK_EQ(return_status.size(), 1)
+      << "return size of generations is not equal to 1";
+  return return_status[0];
+}
+
+std::vector<bool> VLMMaster::handle_rpc_responses(
+    const std::vector<RequestOutput>& outputs) {
+  // response to xllm service to avoid the redirect cost.
+  if (xservice_client_ == nullptr) {
+    return std::vector<bool>(outputs.size(), false);
+  }
+  return xservice_client_->generations(outputs);
 }
 
 }  // namespace xllm
