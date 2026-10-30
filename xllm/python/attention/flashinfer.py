@@ -92,12 +92,20 @@ class FlashInferBackend(AttentionBackend):
             "NHD",
         )
 
+        self._prefill_bidir_wrapper: flashinfer.BatchPrefillWithRaggedKVCacheWrapper | None = None
         self._kv_caches: list[LayerCache] = []
         self._metadata: AttentionMetadata | None = None
         self._active_decode_wrapper = self._decode_wrapper
         self._graph_decode_wrappers: dict[int, flashinfer.BatchDecodeWithPagedKVCacheWrapper] = {}
         self._graph_decode_buffer_ptrs: dict[int, tuple[int, int, int]] = {}
         self._planned_graph_batches: set[int] = set()
+
+    def enable_prefix_bidir(self, device: torch.device) -> None:
+        if self._prefill_bidir_wrapper is None:
+            self._prefill_bidir_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device),
+                "NHD",
+            )
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         if not kv_caches:
@@ -145,6 +153,8 @@ class FlashInferBackend(AttentionBackend):
         window_left = self.sliding_window - 1 if self.sliding_window > 0 else -1
 
         if metadata.is_prefill:
+            if self._prefill_bidir_wrapper is not None:
+                self._validate_prefix_bidir(metadata)
             self._prefill_ragged_wrapper.plan(
                 metadata.q_cu_seq_lens,
                 metadata.kv_cu_seq_lens,
@@ -156,6 +166,18 @@ class FlashInferBackend(AttentionBackend):
                 window_left=window_left,
                 q_data_type=self.dtype,
             )
+            if self._prefill_bidir_wrapper is not None:
+                self._prefill_bidir_wrapper.plan(
+                    metadata.q_cu_seq_lens,
+                    metadata.kv_cu_seq_lens,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    causal=False,
+                    sm_scale=self.scale,
+                    window_left=window_left,
+                    q_data_type=self.dtype,
+                )
         elif metadata.is_chunked_prefill:
             self._prefill_paged_wrapper.plan(
                 metadata.qo_indptr,
@@ -173,6 +195,39 @@ class FlashInferBackend(AttentionBackend):
             )
         else:
             self._prepare_decode(metadata, graph_mode, window_left)
+
+    @staticmethod
+    def _validate_prefix_bidir(metadata: AttentionMetadata) -> None:
+        if (
+            not metadata.is_prefill
+            or metadata.is_chunked_prefill
+            or metadata.is_mixed
+            or metadata.is_spec_verify
+        ):
+            raise ValueError("bidirectional prompt attention requires a pure, non-speculative full prefill")
+        q_lens_host = metadata.q_seq_lens_host
+        if q_lens_host is None:
+            raise ValueError("bidirectional prompt attention requires host query lengths")
+        q_cu_lens = q_lens_host.tolist()
+        kv_cu_lens = metadata.kv_seq_lens_host_values
+        if (
+            len(q_cu_lens) < 2
+            or q_cu_lens[0] != 0
+            or kv_cu_lens is None
+            or len(q_cu_lens) != len(kv_cu_lens)
+            or kv_cu_lens[0] != 0
+        ):
+            raise ValueError(
+                "bidirectional prompt attention requires every request to start at zero with q_len == kv_len"
+            )
+        kv_lens = [end - start for start, end in zip(kv_cu_lens, kv_cu_lens[1:])]
+        if any(
+            q_cu_lens[i + 1] - q_cu_lens[i] != length or length <= 0
+            for i, length in enumerate(kv_lens)
+        ):
+            raise ValueError(
+                "bidirectional prompt attention requires every request to start at zero with q_len == kv_len"
+            )
 
     def _prepare_decode(
         self,
@@ -274,6 +329,13 @@ class FlashInferBackend(AttentionBackend):
         if metadata is None:
             raise RuntimeError("FlashInferBackend.prepare() was not called")
 
+        if not layer.causal:
+            if metadata.is_prefill:
+                if self._prefill_bidir_wrapper is None:
+                    raise RuntimeError("bidirectional prompt attention was not enabled before prepare")
+            elif metadata.is_chunked_prefill or metadata.is_mixed or metadata.is_spec_verify:
+                raise ValueError("bidirectional prompt attention does not support chunked, mixed or speculative prefill")
+
         layer_cache = self._kv_caches[layer.layer_id]
         k_cache, v_cache = layer_cache.key, layer_cache.value
         if k_cache is None or v_cache is None:
@@ -285,7 +347,12 @@ class FlashInferBackend(AttentionBackend):
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         if metadata.is_prefill:
-            output = self._prefill_ragged_wrapper.run(q_3d, k_3d, v_3d)
+            if layer.causal:
+                output = self._prefill_ragged_wrapper.run(q_3d, k_3d, v_3d)
+            else:
+                bidir_wrapper = self._prefill_bidir_wrapper
+                assert bidir_wrapper is not None
+                output = bidir_wrapper.run(q_3d, k_3d, v_3d)
         elif metadata.is_chunked_prefill:
             output = self._prefill_paged_wrapper.run(q_3d, (k_cache, v_cache))
         else:

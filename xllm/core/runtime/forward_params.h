@@ -192,6 +192,7 @@ inline bool add_sampling_to_plan(const SamplingParameters& source,
          plan.add(source.temperatures, &target.temperatures) &&
          plan.add(source.top_p, &target.top_p) &&
          plan.add(source.top_k, &target.top_k) &&
+         plan.add(source.logprob_token_ids, &target.logprob_token_ids) &&
          plan.add(source.unique_token_ids, &target.unique_token_ids) &&
          plan.add(source.unique_token_counts, &target.unique_token_counts) &&
          plan.add(source.unique_token_ids_lens,

@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 #include "core/common/global_flags.h"
@@ -209,9 +210,16 @@ RequestParams::RequestParams(const proto::CompletionRequest& request,
   if (request.has_top_k()) {
     top_k = request.top_k();
   }
-  if (request.has_logprobs()) {
+  completion_logprobs_requested = request.has_logprobs();
+  if (completion_logprobs_requested) {
     logprobs = true;
     top_logprobs = request.logprobs();
+  }
+  if (request.logprob_token_ids_size() > 0) {
+    logprob_token_ids.assign(request.logprob_token_ids().begin(),
+                             request.logprob_token_ids().end());
+    logprobs = true;
+    top_logprobs = static_cast<int64_t>(logprob_token_ids.size());
   }
   if (request.has_skip_special_tokens()) {
     skip_special_tokens = request.skip_special_tokens();
@@ -231,6 +239,7 @@ RequestParams::RequestParams(const proto::CompletionRequest& request,
                                           request.stop_token_ids().end());
   }
   if (request.has_stream()) {
+    completion_stream_requested = request.stream();
     const size_t best_of_value = best_of.value_or(n);
     if (request.stream() && best_of_value == n) {
       streaming = true;
@@ -608,6 +617,44 @@ bool RequestParams::verify_params(OutputCallback callback) const {
   if (!response_format_error.empty()) {
     return reject_parameter("response_format", response_format_error);
   }
+  if (!logprob_token_ids.empty()) {
+    if (logprob_token_ids.size() > 256) {
+      return reject_parameter("logprob_token_ids",
+                              "logprob_token_ids must contain at most 256 IDs");
+    }
+    std::unordered_set<int32_t> unique_ids;
+    unique_ids.reserve(logprob_token_ids.size());
+    for (int32_t token_id : logprob_token_ids) {
+      if (token_id < 0 || !unique_ids.insert(token_id).second) {
+        return reject_parameter(
+            "logprob_token_ids",
+            "logprob_token_ids must be nonnegative and unique");
+      }
+    }
+    if (completion_logprobs_requested) {
+      return reject_parameter(
+          "logprobs", "logprobs cannot be combined with logprob_token_ids");
+    }
+    if (completion_stream_requested) {
+      return reject_parameter("stream",
+                              "logprob_token_ids requires stream=false");
+    }
+    if (max_tokens != 1) {
+      return reject_parameter("max_tokens",
+                              "logprob_token_ids requires max_tokens=1");
+    }
+    if (beam_width > 1 || num_return_sequences > 1) {
+      return reject_parameter("beam_width",
+                              "logprob_token_ids does not support beam search");
+    }
+    if (n != 1) {
+      return reject_parameter("n", "logprob_token_ids requires n=1");
+    }
+    if (best_of.has_value() && best_of.value() > 1) {
+      return reject_parameter("best_of",
+                              "logprob_token_ids requires best_of<=1");
+    }
+  }
   if (n == 0) {
     return reject_parameter("n", "n should be greater than 0");
   }
@@ -698,6 +745,7 @@ RequestSamplingParam RequestParams::to_sampling_param(size_t best_of) const {
   sampling_param.top_k = top_k;
   sampling_param.logprobs = logprobs;
   sampling_param.top_logprobs = top_logprobs;
+  sampling_param.logprob_token_ids = logprob_token_ids;
   sampling_param.is_embeddings = is_embeddings;
   if (best_of > n) {
     // enable logprobs for best_of to generate sequence logprob

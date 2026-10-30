@@ -2,6 +2,33 @@ include(cc_test)
 
 cc_test(
   NAME
+    npu_attention_test
+  CPU_ONLY
+  SRCS
+    attention_test.cpp
+  DEPS
+    :npu_torch_layers
+    :kv_cache
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+target_link_libraries(npu_attention_test
+                      PRIVATE
+                      ascendcl
+                      hccl
+                      c_sec
+                      nnopbase
+                      atb)
+
+target_link_options(npu_attention_test PRIVATE
+  "-Wl,--whole-archive"
+  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+  "-Wl,--no-whole-archive")
+
+cc_test(
+  NAME
     qwen3_5_gated_delta_net_indices_test
   CPU_ONLY
   SRCS

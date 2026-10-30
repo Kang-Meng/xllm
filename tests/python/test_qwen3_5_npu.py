@@ -114,6 +114,15 @@ def test_npu_decoder_factory_selects_privateuseone_backend() -> None:
     assert NpuQwen3_5DecoderLayer.normalization_cls is NpuGemmaRMSNorm
 
 
+@pytest.mark.parametrize("mode, causal", [("causal", True), ("bidirectional", False)])
+def test_jev_prompt_attention_only_changes_npu_full_attention(mode: str, causal: bool) -> None:
+    cfg = _config(jev_prompt_attention=mode)
+    layer = NpuQwen3_5Attention(cfg, 0, torch.float32, torch.device("cpu"), MagicMock())
+
+    assert layer.attn.causal is causal
+    assert cfg.jev_prompt_attention == mode
+
+
 def test_npu_gemma_rms_norm_uses_fused_residual_operator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -224,6 +224,14 @@ DECLARE_COUNTER(prefix_cache_prompt_tokens_total);
 DECLARE_COUNTER(prefix_cache_hit_tokens_total);
 DECLARE_COUNTER(allocate_blocks_latency_seconds);
 
+// Failed private-write allocation attempts, not failed requests.
+DECLARE_COUNTER(linear_prefill_private_write_alloc_failures);
+DECLARE_COUNTER(linear_decode_private_write_alloc_failures);
+DECLARE_COUNTER(linear_decode_swap_private_write_alloc_failures);
+
+// Decode attempts rejected for shared current-write state, not capacity.
+DECLARE_COUNTER(linear_decode_shared_write_slot_failures);
+
 // latency of detokenization operations in seconds
 DECLARE_COUNTER(detokenization_latency_seconds_stream);
 DECLARE_COUNTER(detokenization_latency_seconds_non_stream);

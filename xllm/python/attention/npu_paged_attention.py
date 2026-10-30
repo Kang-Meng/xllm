@@ -15,7 +15,8 @@
 """NPU attention backend using Fused-Infer-Attention (FIA).
 
 Registers as the PrivateUse1 (NPU) backend for the Python model executor.
-Prefill uses FIA TND with causal mask; decode uses FIA TND with block_table.
+Prefill uses FIA TND; Jev full-attention can use a bidirectional prefix.
+Decode uses FIA TND with block_table.
 """
 
 from __future__ import annotations
@@ -300,6 +301,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._num_kv_blocks: int | None = None
         self._page_size: int | None = None
         self._metadata: AttentionMetadata | None = None
+        self._prefix_bidir_enabled = False
         self._graph_workspace: torch.Tensor | None = None
         self._graph_outputs: dict[int, torch.Tensor] = {}
         self._graph_lses: dict[int, torch.Tensor] = {}
@@ -345,6 +347,30 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1).to(torch.int8).contiguous().to(device)
         )
+
+    def enable_prefix_bidir(self) -> None:
+        if self._is_mla or self._use_xfia_decode:
+            raise NotImplementedError("bidirectional prompt attention requires the dense NPU text backend")
+        self._prefix_bidir_enabled = True
+
+    @staticmethod
+    def _validate_prefix_bidir(metadata: AttentionMetadata) -> None:
+        if not metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed or metadata.is_spec_verify:
+            raise ValueError("bidirectional prompt attention requires a pure, non-speculative full prefill")
+        q_cu_lens = metadata.q_cu_seq_lens_host_values
+        if q_cu_lens is None or len(q_cu_lens) == 0:
+            raise ValueError("bidirectional prompt attention requires non-empty host cumulative query lengths")
+        if q_cu_lens[0] != 0:
+            q_cu_lens = [0, *q_cu_lens]
+        kv_lens = metadata.kv_seq_lens_host_values
+        if (
+            not q_cu_lens
+            or q_cu_lens[0] != 0
+            or kv_lens is None
+            or len(q_cu_lens) != len(kv_lens) + 1
+            or any(q_cu_lens[i + 1] - q_cu_lens[i] != length or length <= 0 for i, length in enumerate(kv_lens))
+        ):
+            raise ValueError("bidirectional prompt attention requires every request to start at zero with q_len == kv_len")
 
     def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
         if self._kv_caches or self._metadata is not None:
@@ -507,6 +533,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         *,
         graph_mode: bool = False,
     ) -> None:
+        if self._prefix_bidir_enabled and (metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed):
+            self._validate_prefix_bidir(metadata)
         self._metadata = metadata
         if self._device_only_decode_inputs and _is_dflash_proposal(metadata):
             if metadata.is_prefill:
@@ -831,6 +859,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     ) -> torch.Tensor:
         metadata = self._metadata
         assert metadata is not None
+        if not layer.causal and self._prefix_bidir_enabled and (
+            metadata.is_chunked_prefill or metadata.is_mixed or metadata.is_spec_verify
+        ):
+            raise ValueError("bidirectional prompt attention does not support chunked, mixed or speculative prefill")
 
         layer_id = layer.layer_id
         layer_cache = self._kv_caches[layer_id]
@@ -2257,18 +2289,22 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         atten_mask = self._causal_mask if causal else None
         sparse_mode = _SPARSE_MODE_RIGHT_DOWN_CAUSAL if causal else _SPARSE_MODE_NONE
         window_args: dict[str, int] = {}
-        if attention_window is not None:
+        prefix_bidir = self._prefix_bidir_enabled and not causal
+        if prefix_bidir:
+            window_args = {"pre_tokens": 2147483647, "next_tokens": 2147483647}
+        elif attention_window is not None:
             atten_mask = self._causal_mask
             sparse_mode = _SPARSE_MODE_BAND
             window_args["pre_tokens"], window_args["next_tokens"] = attention_window
 
+        # Full bidirectional prefill uses current Q/K/V and still writes the paged cache for decode.
         # Prefix-cache hit (or chunked prefill with prior context): part of the
         # KV already lives in the paged cache, so this forward only carries the
         # new tokens (q_len < kv_len). Attend over the full paged KV via
         # block_table, mirroring _decode. Without this, the new query tokens
         # would only see their own KV (actual_seq_lengths_kv == q_len) and never
         # the cached prefix, diverging from a full recompute.
-        if metadata.block_table is not None:
+        if metadata.block_table is not None and not prefix_bidir:
             block_size = k_cache.size(1)
             k_flat = k_cache.view(k_cache.size(0), block_size, -1)
             v_flat = v_cache.view(v_cache.size(0), block_size, -1)

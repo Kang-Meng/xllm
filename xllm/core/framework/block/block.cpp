@@ -50,7 +50,7 @@ const char* block_type_label(BlockType type) {
 Block::Block(int32_t id, BlockManager* manager) : id_(id), manager_(manager) {
   // A block with no manager is an id holder. It has no shared refcount.
   if (manager_ != nullptr) {
-    ref_count_ = new std::atomic<uint32_t>(1);
+    ref_count_ = new RefCounts;
     size_ = manager_->block_size();
   }
 }
@@ -58,14 +58,21 @@ Block::Block(int32_t id, BlockManager* manager) : id_(id), manager_(manager) {
 Block::~Block() { release(); }
 
 // copy constructor
-Block::Block(const Block& other)
+Block::Block(const Block& other) : Block(other, other.inflight_) {}
+
+Block::Block(const Block& other, bool inflight)
     : id_(other.id_),
       size_(other.size_),
       ref_count_(other.manager_ == nullptr ? nullptr : other.ref_count_),
+      inflight_(inflight),
       manager_(other.manager_) {
   memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
   inc_ref_count();
+}
+
+Block Block::retain_for_inflight() const {
+  return Block(*this, /*inflight=*/true);
 }
 
 // copy assignment
@@ -80,6 +87,7 @@ Block& Block::operator=(const Block& other) {
     // only manager-less block that still owns one, and copying it must not
     // alias that counter.
     ref_count_ = manager_ == nullptr ? nullptr : other.ref_count_;
+    inflight_ = other.inflight_;
 
     memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
@@ -92,6 +100,7 @@ Block::Block(Block&& other) noexcept
     : id_(other.id_),
       size_(other.size_),
       ref_count_(other.ref_count_),
+      inflight_(other.inflight_),
       manager_(other.manager_) {
   memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
@@ -110,6 +119,7 @@ Block& Block::operator=(Block&& other) noexcept {
     size_ = other.size_;
     manager_ = other.manager_;
     ref_count_ = other.ref_count_;
+    inflight_ = other.inflight_;
 
     memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
@@ -127,7 +137,10 @@ void Block::inc_ref_count() {
   if (ref_count_ == nullptr || manager_ == nullptr) {
     return;
   }
-  manager_->incr_ref_count(ref_count_);
+  manager_->incr_ref_count(&ref_count_->total);
+  if (!inflight_) {
+    ref_count_->owners.fetch_add(1, std::memory_order_acq_rel);
+  }
 }
 
 void Block::dec_ref_count() {
@@ -135,8 +148,11 @@ void Block::dec_ref_count() {
   if (ref_count_ == nullptr || manager_ == nullptr) {
     return;
   }
+  if (!inflight_) {
+    ref_count_->owners.fetch_sub(1, std::memory_order_acq_rel);
+  }
   // The manager fetch_subs. previous == 1 means this alias was the last one.
-  const uint32_t previous = manager_->dec_ref_count(ref_count_);
+  const uint32_t previous = manager_->dec_ref_count(&ref_count_->total);
   if (previous == 1) {
     delete ref_count_;
     ref_count_ = nullptr;

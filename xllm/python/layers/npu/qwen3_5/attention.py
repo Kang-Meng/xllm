@@ -124,6 +124,7 @@ class NpuQwen3_5Attention(nn.Module):
             self.head_dim**-0.5,
             0,
             layer_id,
+            causal=getattr(cfg, "jev_prompt_attention", "causal") != "bidirectional",
         )
 
     def _finish_loading(self) -> None:

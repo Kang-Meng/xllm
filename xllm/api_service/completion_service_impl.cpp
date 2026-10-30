@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "api_service/request_admission.h"
 #include "api_service/utils.h"
@@ -45,7 +46,8 @@ limitations under the License.
 namespace xllm {
 namespace {
 void set_logprobs(proto::Choice* choice,
-                  const std::optional<std::vector<LogProb>>& logprobs) {
+                  const std::optional<std::vector<LogProb>>& logprobs,
+                  const std::vector<int32_t>& query_ids = {}) {
   if (!logprobs.has_value() || logprobs.value().empty()) {
     return;
   }
@@ -55,6 +57,13 @@ void set_logprobs(proto::Choice* choice,
     proto_logprobs->add_tokens(logprob.token);
     proto_logprobs->add_token_ids(logprob.token_id);
     proto_logprobs->add_token_logprobs(logprob.logprob);
+  }
+  if (!query_ids.empty()) {
+    const auto& queried = *logprobs->front().top_logprobs;
+    for (const auto& entry : queried) {
+      proto_logprobs->add_queried_token_ids(entry.token_id);
+      proto_logprobs->add_queried_token_logprobs(entry.logprob);
+    }
   }
 }
 
@@ -131,7 +140,8 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
                                 const std::string& request_id,
                                 int64_t created_time,
                                 const std::string& model,
-                                const RequestOutput& req_output) {
+                                const RequestOutput& req_output,
+                                const std::vector<int32_t>& query_ids) {
   auto& response = call->response();
   response.set_object("text_completion");
   response.set_id(request_id);
@@ -140,10 +150,25 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
 
   response.mutable_choices()->Reserve(req_output.outputs.size());
   for (const auto& output : req_output.outputs) {
+    if (!query_ids.empty()) {
+      if (!output.logprobs.has_value() || output.logprobs->size() != 1 ||
+          !output.logprobs->front().top_logprobs.has_value() ||
+          output.logprobs->front().top_logprobs->size() != query_ids.size()) {
+        return call->finish_with_error(
+            Status(StatusCode::UNKNOWN, "Missing requested token logprobs"));
+      }
+      const auto& queried = *output.logprobs->front().top_logprobs;
+      for (size_t i = 0; i < query_ids.size(); ++i) {
+        if (queried[i].token_id != query_ids[i]) {
+          return call->finish_with_error(Status(
+              StatusCode::UNKNOWN, "Requested token logprobs out of order"));
+        }
+      }
+    }
     auto* choice = response.add_choices();
     choice->set_index(output.index);
     choice->set_text(output.text);
-    set_logprobs(choice, output.logprobs);
+    set_logprobs(choice, output.logprobs, query_ids);
     if (output.finish_reason.has_value()) {
       choice->set_finish_reason(output.finish_reason.value());
     }
@@ -263,6 +288,8 @@ void CompletionServiceImpl::process_async_impl(
 
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;
+  std::vector<int32_t> query_ids(rpc_request.logprob_token_ids().begin(),
+                                 rpc_request.logprob_token_ids().end());
   // schedule the request
   master->handle_request(
       std::move(rpc_request.prompt()),
@@ -274,6 +301,7 @@ void CompletionServiceImpl::process_async_impl(
        master = master,
        stream = std::move(saved_streaming),
        include_usage = include_usage,
+       query_ids = std::move(query_ids),
        request_id = std::move(saved_request_id),
        created_time = absl::ToUnixSeconds(absl::Now())](
           const RequestOutput& req_output) -> bool {
@@ -292,7 +320,7 @@ void CompletionServiceImpl::process_async_impl(
         // NOTE: maybe need to refactor along with service, currently for
         // non-stream request in prefill instance, we send a virtual response
         return send_result_to_client_brpc(
-            call, request_id, created_time, model, req_output);
+            call, request_id, created_time, model, req_output, query_ids);
       });
 }
 

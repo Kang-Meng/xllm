@@ -150,6 +150,10 @@ struct RequestParams {
   // number of top log probabilities to return. default = 0.
   int64_t top_logprobs = 0;
 
+  std::vector<int32_t> logprob_token_ids;
+  bool completion_stream_requested = false;
+  bool completion_logprobs_requested = false;
+
   // whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
 

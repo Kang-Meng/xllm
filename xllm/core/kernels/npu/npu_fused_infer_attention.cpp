@@ -85,7 +85,7 @@ std::vector<c10::SymInt> to_sym_ints(const std::vector<int64_t>& values) {
   return sym_ints;
 }
 
-torch::Tensor ascend950_packed_causal_attention(
+torch::Tensor ascend950_packed_attention(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
@@ -93,7 +93,8 @@ torch::Tensor ascend950_packed_causal_attention(
     const std::vector<int64_t>& actual_seq_lengths_kv,
     int64_t num_heads,
     int64_t num_key_value_heads,
-    double scale) {
+    double scale,
+    bool is_causal) {
   CHECK_EQ(actual_seq_lengths.size(), actual_seq_lengths_kv.size())
       << "query and key/value sequence counts must match";
 
@@ -128,7 +129,7 @@ torch::Tensor ascend950_packed_causal_attention(
                                             value_4d,
                                             /*attn_mask=*/std::nullopt,
                                             /*dropout_p=*/0.0,
-                                            /*is_causal=*/true,
+                                            /*is_causal=*/is_causal,
                                             /*scale=*/scale)
             .squeeze(0)
             .permute({1, 0, 2});
@@ -564,14 +565,15 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
   if (is_ascend950() && input_layout == "TND" && !block_table.has_value()) {
     CHECK(!softmax_lse_flag)
         << "Ascend950 torch attention fallback does not return softmax_lse";
-    output = ascend950_packed_causal_attention(query,
-                                               key,
-                                               value,
-                                               actual_seq_lengths,
-                                               actual_seq_lengths_kv,
-                                               num_heads,
-                                               num_key_value_heads,
-                                               scale);
+    output = ascend950_packed_attention(query,
+                                        key,
+                                        value,
+                                        actual_seq_lengths,
+                                        actual_seq_lengths_kv,
+                                        num_heads,
+                                        num_key_value_heads,
+                                        scale,
+                                        is_causal);
     return {output, softmax_lse};
   }
 

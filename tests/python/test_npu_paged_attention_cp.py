@@ -749,6 +749,7 @@ def _shard_prepared_backend(nope_cache: torch.Tensor, metadata: SimpleNamespace)
     layout all come from the production preparation path.
     """
     backend = object.__new__(NpuPagedAttentionBackend)
+    backend._prefix_bidir_enabled = False
     backend.device = torch.device("cpu")
     backend._is_mla = True
     backend._uses_sparse_mla = True

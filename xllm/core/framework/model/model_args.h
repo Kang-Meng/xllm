@@ -302,6 +302,7 @@ struct ModelArgs {
   PROPERTY(int32_t, shared_expert_intermediate_size) = 0;
   PROPERTY(float, partial_rotary_factor) = 0.0f;
   PROPERTY(std::vector<std::string>, layer_types) = {};
+  PROPERTY(std::string, jev_prompt_attention) = "causal";
 
   // Vision model's dropout
   PROPERTY(float, mm_dropout) = 0.0f;

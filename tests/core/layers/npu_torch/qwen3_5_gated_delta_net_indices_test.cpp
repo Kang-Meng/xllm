@@ -175,8 +175,8 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsSlotOutOfBounds) {
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsDuplicateNonzeroSlot) {
   AttentionMetadata metadata;
   EXPECT_DEATH(get_or_build_prefill_indices(
-                   metadata, {3, 3}, {1, 0}, {}, 1, kNumSlots, kDevice),
-               "write slots must be unique");
+                   metadata, {3, 3}, {1, 0}, {2, 3}, 1, kNumSlots, kDevice),
+               "first_row=0 row=1 write=3 first_read=2 read=3");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsReadSizeMismatch) {

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -36,6 +37,9 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+namespace {
+constexpr char kJevPromptSuffix[] = "<think>\n\n</think>\n\n";
+}  // namespace
 
 LLMRequestFactory::LLMRequestFactory(const Tokenizer* tokenizer,
                                      const ChatTemplate* chat_template,
@@ -163,7 +167,8 @@ RequestSamplingParam LLMRequestFactory::build_sampling_param(
       sp.response_format == ResponseFormatType::JSON_OBJECT;
   // Enforces the beam-search logprob requirements; see
   // RequestSamplingParam::enable_beam_search.
-  sampling_param.enable_beam_search(sp.beam_width);
+  sampling_param.enable_beam_search(sp.logprob_token_ids.empty() ? sp.beam_width
+                                                                 : 0);
   // sampling_param.do_sample = sp.do_sample;
   return sampling_param;
 }
@@ -278,6 +283,16 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
 
+  if (!sp.logprob_token_ids.empty() &&
+      ModelConfig::get_instance().enable_qwen3_reranker()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "logprob_token_ids is not supported when "
+                        "enable_qwen3_reranker is enabled",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
+    return nullptr;
+  }
+
   const int32_t max_context_len = model_args_->max_position_embeddings();
 
   std::optional<std::vector<int>> encoded = encode_and_validate_prompt(
@@ -286,6 +301,36 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   std::vector<int> local_prompt_tokens = std::move(encoded.value());
+
+  if (model_args_->jev_prompt_attention() == "bidirectional") {
+    if (sp.streaming || sp.completion_stream_requested || sp.max_tokens != 1 ||
+        sp.n != 1 || sp.best_of.value_or(1) != 1 || sp.is_sample_request ||
+        sp.add_special_tokens || sp.logprob_token_ids.empty()) {
+      CALLBACK_WITH_ERROR(
+          StatusCode::INVALID_ARGUMENT,
+          "Bidirectional Jev requires a non-streaming single-step completion "
+          "with logprob_token_ids, max_tokens=1 and add_special_tokens=false",
+          sp.service_request_id,
+          sp.source_xservice_addr);
+      return nullptr;
+    }
+    std::vector<int> suffix_tokens;
+    if (!tokenizer_->encode(kJevPromptSuffix,
+                            &suffix_tokens,
+                            /*add_special_tokens=*/false) ||
+        suffix_tokens.empty() ||
+        local_prompt_tokens.size() < suffix_tokens.size() ||
+        !std::equal(suffix_tokens.rbegin(),
+                    suffix_tokens.rend(),
+                    local_prompt_tokens.rbegin())) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Bidirectional Jev prompt does not match the "
+                          "required token suffix",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+  }
 
   uint32_t max_tokens = sp.max_tokens;
   if (max_tokens == 0) {
@@ -307,6 +352,21 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                     options_->num_speculative_tokens() + /*bouns_token*/ 1;
   if (options_->enable_schedule_overlap()) {
     capacity += options_->num_speculative_tokens() + 1;
+  }
+
+  if (!sp.logprob_token_ids.empty()) {
+    const int64_t vocab_size = model_args_->vocab_size();
+    for (int32_t token_id : sp.logprob_token_ids) {
+      if (vocab_size <= 0 || token_id < 0 || token_id >= vocab_size) {
+        CALLBACK_WITH_ERROR(
+            StatusCode::INVALID_ARGUMENT,
+            "logprob_token_ids contains an out-of-vocabulary ID: " +
+                std::to_string(token_id),
+            sp.service_request_id,
+            sp.source_xservice_addr);
+        return nullptr;
+      }
+    }
   }
 
   const size_t best_of = sp.best_of.value_or(sp.n);
@@ -399,6 +459,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   // twice.
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
+
+  if (model_args_->jev_prompt_attention() == "bidirectional") {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Bidirectional Jev only supports completions requests",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
+    return nullptr;
+  }
 
   Timer timer;
 

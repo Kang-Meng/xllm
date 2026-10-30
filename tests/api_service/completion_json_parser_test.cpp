@@ -43,6 +43,14 @@ TEST(PreprocessCompletionPromptTest, StringPromptPassThroughUnchanged) {
   EXPECT_EQ(result, input);
 }
 
+TEST(PreprocessCompletionPromptTest, TokenLookupPassesThroughUnchanged) {
+  const std::string input =
+      R"({"prompt":"[decision]:","max_tokens":1,"logprob_token_ids":[7,2]})";
+  auto [status, result] = preprocess_completion_prompt(input);
+  ASSERT_TRUE(status.ok()) << status.message();
+  EXPECT_EQ(result, input);
+}
+
 // Missing prompt passes through unchanged.
 TEST(PreprocessCompletionPromptTest, MissingPromptPassThroughUnchanged) {
   std::string input = R"({"max_tokens": 8})";

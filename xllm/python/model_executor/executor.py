@@ -360,6 +360,8 @@ class ModelExecutor:
             acl_graph_enabled=graph_backend == "aclgraph",
         )
 
+        self._configure_bidirectional_prompt_attention(config, device)
+
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
         # Context-Parallel: shard prefill sequences across the CP group. Decode
@@ -468,6 +470,27 @@ class ModelExecutor:
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
             self.inductor_runner.bind_execution_metadata_builders(execution_metadata_builders)
+
+    def _configure_bidirectional_prompt_attention(self, config: dict, device: torch.device) -> None:
+        if not _is_qwen3_5_model_type(str(config.get("model_type", ""))):
+            return
+        if config.get("jev_prompt_attention") != "bidirectional":
+            return
+
+        if device.type == "cuda":
+            from xllm.python.attention.flashinfer import FlashInferBackend
+
+            if not isinstance(self.attention_backend, FlashInferBackend):
+                raise NotImplementedError("bidirectional prompt attention requires the CUDA FlashInfer backend")
+            self.attention_backend.enable_prefix_bidir(device)
+        elif device.type in ("npu", "privateuseone"):
+            from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+            if not isinstance(self.attention_backend, NpuPagedAttentionBackend):
+                raise NotImplementedError("bidirectional prompt attention requires the NPU paged backend")
+            self.attention_backend.enable_prefix_bidir()
+        else:
+            raise NotImplementedError("bidirectional prompt attention requires CUDA or NPU")
 
     def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
         return self.model.supports_device_only_decode_inputs(kv_page_size)

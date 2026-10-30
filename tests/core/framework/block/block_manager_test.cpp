@@ -293,6 +293,219 @@ TEST(BlockManagerTest, Basic) {
   }
 }
 
+TEST(BlockManagerTest, InflightRetentionPreservesLogicalOwnership) {
+  BlockManager::Options options;
+  options.num_blocks(2).block_size(4).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+
+  std::vector<Block> allocated = manager.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(allocated.size(), 1u);
+  const Block& owner = allocated.front();
+  EXPECT_EQ(owner.ref_count(), 1u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_FALSE(owner.is_shared());
+  EXPECT_FALSE(owner.has_multiple_owners());
+
+  {
+    const Block inflight = owner.retain_for_inflight();
+    EXPECT_EQ(inflight.id(), owner.id());
+    EXPECT_EQ(inflight.size(), owner.size());
+    EXPECT_EQ(inflight.manager(), &manager);
+    EXPECT_EQ(owner.ref_count(), 2u);
+    EXPECT_EQ(inflight.ref_count(), 2u);
+    EXPECT_TRUE(owner.is_shared());
+    EXPECT_TRUE(inflight.is_shared());
+    EXPECT_EQ(owner.owner_count(), 1u);
+    EXPECT_EQ(inflight.owner_count(), 1u);
+    EXPECT_FALSE(owner.has_multiple_owners());
+    EXPECT_FALSE(inflight.has_multiple_owners());
+
+    {
+      Block second_owner = owner;
+      EXPECT_EQ(owner.ref_count(), 3u);
+      EXPECT_EQ(owner.owner_count(), 2u);
+      EXPECT_EQ(second_owner.owner_count(), 2u);
+      EXPECT_TRUE(owner.has_multiple_owners());
+      EXPECT_TRUE(second_owner.has_multiple_owners());
+      EXPECT_TRUE(inflight.has_multiple_owners());
+
+      Block moved_owner = std::move(second_owner);
+      EXPECT_EQ(moved_owner.ref_count(), 3u);
+      EXPECT_EQ(moved_owner.owner_count(), 2u);
+      EXPECT_FALSE(second_owner.is_valid());
+      second_owner = std::move(moved_owner);
+      EXPECT_EQ(second_owner.ref_count(), 3u);
+      EXPECT_EQ(second_owner.owner_count(), 2u);
+      EXPECT_FALSE(moved_owner.is_valid());
+    }
+    EXPECT_EQ(owner.ref_count(), 2u);
+    EXPECT_EQ(owner.owner_count(), 1u);
+    EXPECT_FALSE(owner.has_multiple_owners());
+  }
+  EXPECT_EQ(owner.ref_count(), 1u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_FALSE(owner.is_shared());
+}
+
+TEST(BlockManagerTest, InflightCopiesAndMovesPreserveReferenceKind) {
+  BlockManager::Options options;
+  options.num_blocks(2).block_size(4).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+
+  std::vector<Block> allocated = manager.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(allocated.size(), 1u);
+  const Block& owner = allocated.front();
+  {
+    Block inflight = owner.retain_for_inflight();
+    Block copied = inflight;
+    EXPECT_EQ(owner.ref_count(), 3u);
+    EXPECT_EQ(owner.owner_count(), 1u);
+
+    Block moved = std::move(copied);
+    EXPECT_EQ(moved.id(), owner.id());
+    EXPECT_EQ(moved.ref_count(), 3u);
+    EXPECT_EQ(moved.owner_count(), 1u);
+    EXPECT_FALSE(copied.is_valid());
+    EXPECT_EQ(copied.ref_count(), 0u);
+    EXPECT_EQ(copied.owner_count(), 0u);
+
+    Block& same_alias = moved;
+    moved = same_alias;
+    EXPECT_EQ(moved.ref_count(), 3u);
+    EXPECT_EQ(moved.owner_count(), 1u);
+    moved = std::move(same_alias);
+    EXPECT_TRUE(moved.is_valid());
+    EXPECT_EQ(moved.ref_count(), 3u);
+    EXPECT_EQ(moved.owner_count(), 1u);
+
+    const Block retained_again = moved.retain_for_inflight();
+    EXPECT_EQ(retained_again.ref_count(), 4u);
+    EXPECT_EQ(retained_again.owner_count(), 1u);
+    EXPECT_FALSE(retained_again.has_multiple_owners());
+  }
+  EXPECT_EQ(owner.ref_count(), 1u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+}
+
+TEST(BlockManagerTest, InflightAssignmentsTransferReferenceKind) {
+  BlockManager::Options options;
+  options.num_blocks(3).block_size(4).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+
+  std::vector<Block> allocated = manager.allocate(/*num_blocks=*/2);
+  ASSERT_EQ(allocated.size(), 2u);
+  const Block& owner = allocated.front();
+  Block target = std::move(allocated.back());
+  Block inflight = owner.retain_for_inflight();
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+
+  target = inflight;
+  EXPECT_EQ(target.id(), owner.id());
+  EXPECT_EQ(owner.ref_count(), 3u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_FALSE(target.has_multiple_owners());
+  EXPECT_EQ(manager.num_free_blocks(), 1u);
+
+  target = owner;
+  EXPECT_EQ(owner.ref_count(), 3u);
+  EXPECT_EQ(owner.owner_count(), 2u);
+  EXPECT_TRUE(target.has_multiple_owners());
+
+  target = std::move(inflight);
+  EXPECT_EQ(owner.ref_count(), 2u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_FALSE(target.has_multiple_owners());
+  EXPECT_FALSE(inflight.is_valid());
+  EXPECT_EQ(inflight.ref_count(), 0u);
+  EXPECT_EQ(inflight.owner_count(), 0u);
+
+  std::vector<Block> more = manager.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(more.size(), 1u);
+  Block move_target = std::move(more.front());
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+  move_target = std::move(target);
+  EXPECT_EQ(move_target.id(), owner.id());
+  EXPECT_EQ(owner.ref_count(), 2u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+  EXPECT_FALSE(target.is_valid());
+  EXPECT_EQ(target.ref_count(), 0u);
+  EXPECT_EQ(target.owner_count(), 0u);
+  EXPECT_EQ(manager.num_free_blocks(), 1u);
+
+  move_target = Block();
+  EXPECT_EQ(owner.ref_count(), 1u);
+  EXPECT_EQ(owner.owner_count(), 1u);
+}
+
+TEST(BlockManagerTest, InflightReleaseDefersReclamation) {
+  BlockManager::Options options;
+  options.num_blocks(2).block_size(4).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+
+  std::vector<Block> allocated = manager.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(allocated.size(), 1u);
+  const int32_t block_id = allocated.front().id();
+  Block inflight = allocated.front().retain_for_inflight();
+  allocated.clear();
+  EXPECT_TRUE(inflight.is_valid());
+  EXPECT_EQ(inflight.id(), block_id);
+  EXPECT_EQ(inflight.ref_count(), 1u);
+  EXPECT_EQ(inflight.owner_count(), 0u);
+  EXPECT_FALSE(inflight.is_shared());
+  EXPECT_FALSE(inflight.has_multiple_owners());
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+  EXPECT_TRUE(manager.allocate(/*num_blocks=*/1).empty());
+
+  Block last_inflight = inflight.retain_for_inflight();
+  EXPECT_EQ(last_inflight.ref_count(), 2u);
+  EXPECT_EQ(last_inflight.owner_count(), 0u);
+  inflight = Block();
+  EXPECT_EQ(last_inflight.ref_count(), 1u);
+  EXPECT_EQ(last_inflight.owner_count(), 0u);
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+
+  last_inflight = Block();
+  EXPECT_EQ(manager.num_free_blocks(), 1u);
+  std::vector<Block> recycled = manager.allocate(/*num_blocks=*/1);
+  ASSERT_EQ(recycled.size(), 1u);
+  EXPECT_EQ(recycled.front().id(), block_id);
+  EXPECT_EQ(recycled.front().ref_count(), 1u);
+  EXPECT_EQ(recycled.front().owner_count(), 1u);
+  recycled.clear();
+  EXPECT_EQ(manager.num_free_blocks(), 1u);
+}
+
+TEST(BlockManagerTest, InflightManagerlessAliasesHaveNoCounters) {
+  for (const Block& block : {Block(),
+                             Block(/*id=*/7, /*allocator=*/nullptr),
+                             Block(/*id=*/0, /*allocator=*/nullptr)}) {
+    Block inflight = block.retain_for_inflight();
+    EXPECT_EQ(inflight.id(), block.id());
+    EXPECT_EQ(inflight.is_valid(), block.is_valid());
+    EXPECT_EQ(inflight.manager(), nullptr);
+    EXPECT_EQ(inflight.ref_count(), 0u);
+    EXPECT_EQ(inflight.owner_count(), 0u);
+    EXPECT_FALSE(inflight.is_shared());
+    EXPECT_FALSE(inflight.has_multiple_owners());
+
+    Block copied = inflight;
+    Block moved = std::move(copied);
+    EXPECT_FALSE(copied.is_valid());
+    EXPECT_EQ(copied.owner_count(), 0u);
+    copied = moved;
+    inflight = std::move(copied);
+    const Block retained_again = inflight.retain_for_inflight();
+    EXPECT_EQ(retained_again.id(), block.id());
+    EXPECT_EQ(retained_again.ref_count(), 0u);
+    EXPECT_EQ(retained_again.owner_count(), 0u);
+    EXPECT_FALSE(retained_again.is_shared());
+    EXPECT_FALSE(retained_again.has_multiple_owners());
+    EXPECT_EQ(moved.ref_count(), 0u);
+    EXPECT_EQ(moved.owner_count(), 0u);
+  }
+}
+
 TEST_F(BlockManagerPoolTest, SequenceKeepsFixtureOwnedRequestState) {
   Sequence sequence = make_sequence(0, {1, 2, 3});
   ASSERT_EQ(sequence.sampling_param(), &sampling_param_);
@@ -1207,15 +1420,16 @@ TEST_F(BlockManagerPoolTest, PrefixMountSurvivesAllocationFailureAndRetry) {
   Sequence consumer = make_sequence(1, {1, 2, 3, 4, 5, 6, 7, 8, 9});
   pool.allocate_shared(&consumer);
   ASSERT_EQ(consumer.kv_cache_tokens_num(), 8u);
-  // The mounted source stays the only LINEAR slot. One occupied slot leaves
-  // no free slot for a second write, and prefill keeps the source in place.
-  EXPECT_TRUE(pool.allocate(&consumer, 9));
+  // Allocation fails without a private write slot, but the mounted shared
+  // read source must remain available for retry.
+  EXPECT_FALSE(pool.allocate(&consumer, 9));
+  EXPECT_EQ(consumer.kv_cache_tokens_num(), 8u);
+  EXPECT_EQ(consumer.kv_state().num_blocks(BlockType::KV), 2u);
   ASSERT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(consumer.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
   pool.allocate_shared(&consumer);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
-  occupied.clear();
   occupied.clear();
   // The freed slot is the write slot. The mounted source stays in front.
   ASSERT_TRUE(pool.allocate(&consumer, 9));

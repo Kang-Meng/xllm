@@ -111,7 +111,8 @@ void LogprobState::generate_output_tokens_logprobs(
     const Tokenizer& tokenizer,
     std::optional<std::vector<LogProb>>& out_logprobs,
     bool skip_special_tokens,
-    const std::vector<int32_t>& tokens) {
+    const std::vector<int32_t>& tokens,
+    bool include_empty_token) {
   if (start_idx < num_prompt_tokens_) {
     start_idx = num_prompt_tokens_;
   }
@@ -124,7 +125,7 @@ void LogprobState::generate_output_tokens_logprobs(
     const int32_t token_id = tokens[i];
     auto token =
         tokenizer.decode(std::vector<int32_t>{token_id}, skip_special_tokens);
-    if (token.empty()) {
+    if (token.empty() && !include_empty_token) {
       continue;
     }
 

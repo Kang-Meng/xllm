@@ -110,7 +110,8 @@ class FakeEngine : public Engine {
              int32_t block_size,
              bool enable_prefix_cache = false,
              bool enable_linear_attention = false,
-             InstanceRole instance_role = InstanceRole::DEFAULT)
+             InstanceRole instance_role = InstanceRole::DEFAULT,
+             std::optional<int32_t> linear_state_num_slots = std::nullopt)
       : prefix_cache_config_(
             KVCacheConfig::get_instance().enable_prefix_cache(),
             enable_prefix_cache) {
@@ -122,9 +123,9 @@ class FakeEngine : public Engine {
     opt.instance_is_decode(instance_role == InstanceRole::DECODE);
     if (enable_linear_attention) {
       model_args_.layer_types({"linear_attention"});
-      // The unified linear-state slot pool needs a positive physical capacity;
-      // size it generously so tests never hit slot pressure.
-      opt.linear_state_num_slots_ = num_blocks + 2;
+      // Default to generous capacity unless a test exercises slot pressure.
+      opt.linear_state_num_slots_ =
+          linear_state_num_slots.value_or(num_blocks + 2);
     }
     runtime::Options options;
     options.enable_prefix_cache(enable_prefix_cache)
@@ -2042,6 +2043,248 @@ TEST(ContinuousSchedulerTest,
       0u);
 
   (void)engine.release();
+}
+
+TEST(ContinuousSchedulerTest,
+     LinearPrivateWriteExhaustionDefersUntilSlotsAreReleased) {
+  ScopedConfigValue<double> memory_threshold(
+      SchedulerConfig::get_instance()
+          .prefill_scheduling_memory_usage_threshold(),
+      2.0);
+  ScopedConfigValue<bool> mix_batch(
+      SchedulerConfig::get_instance().enable_mix_batch(), false);
+  // Four physical LINEAR slots leave three usable slots after padding.
+  FakeEngine engine(/*num_blocks=*/32,
+                    /*block_size=*/4,
+                    /*enable_prefix_cache=*/false,
+                    /*enable_linear_attention=*/true,
+                    InstanceRole::DEFAULT,
+                    /*linear_state_num_slots=*/4);
+  ContinuousScheduler::Options options =
+      create_scheduler_options(/*max_tokens_per_batch=*/16,
+                               /*max_seqs_per_batch=*/2,
+                               /*num_speculative_tokens=*/0,
+                               /*max_tokens_per_chunk_for_prefill=*/4,
+                               /*dp_size=*/1);
+  options.enable_chunked_prefill(true).enable_schedule_overlap(false);
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  auto scheduled_request = generate_request_with_prompt_tokens(
+      {1, 2, 3, 4, 5, 6, 7, 8, 9}, /*max_tokens=*/1, /*max_context_len=*/32);
+  auto deferred_request =
+      generate_request_with_prompt_tokens({11, 12, 13, 14, 15, 16, 17, 18, 19},
+                                          /*max_tokens=*/1,
+                                          /*max_context_len=*/32);
+  scheduled_request->state().output_func = [](const RequestOutput&) {
+    return true;
+  };
+  deferred_request->state().output_func = [&](const RequestOutput& output) {
+    ++callback_count;
+    callback_status = output.status;
+    return true;
+  };
+  TestContinuousScheduler scheduler(&engine, options);
+  Sequence* scheduled_sequence = scheduled_request->sequences().front().get();
+  Sequence* deferred_sequence = deferred_request->sequences().front().get();
+  const double failures_before =
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value();
+  ASSERT_TRUE(scheduler.add_request(scheduled_request));
+  ASSERT_TRUE(scheduler.add_request(deferred_request));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches.front().size(), 2u);
+  EXPECT_EQ(batches.front()[0], scheduled_sequence);
+  EXPECT_EQ(batches.front()[1], deferred_sequence);
+  ASSERT_EQ(scheduled_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::KV), 1u);
+  const int32_t scheduled_source =
+      scheduled_sequence->get_linear_state_slot_id();
+  const int32_t deferred_source = deferred_sequence->get_linear_state_slot_id();
+  EXPECT_NE(scheduled_source, deferred_source);
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      0.0);
+  set_chunk_kv(scheduled_request, /*kv_tokens=*/4);
+  set_chunk_kv(deferred_request, /*kv_tokens=*/4);
+
+  // A takes the last private write slot. B must retain its completed source
+  // without growing KV blocks or failing while this batch can still run A.
+  batches.clear();
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches.front().size(), 1u);
+  EXPECT_EQ(batches.front()[0], scheduled_sequence);
+  ASSERT_EQ(scheduled_sequence->kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(
+      scheduled_sequence->kv_state().blocks(BlockType::LINEAR).front().id(),
+      scheduled_source);
+  EXPECT_NE(scheduled_sequence->get_linear_state_slot_id(), scheduled_source);
+  EXPECT_NE(scheduled_sequence->get_linear_state_slot_id(), deferred_source);
+  EXPECT_EQ(scheduled_sequence->kv_state().num_blocks(BlockType::KV), 2u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(deferred_sequence->get_linear_state_slot_id(), deferred_source);
+  EXPECT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::KV), 1u);
+  EXPECT_EQ(deferred_sequence->kv_cache_tokens_num(), 4u);
+  EXPECT_FALSE(deferred_request->finished());
+  EXPECT_FALSE(deferred_request->cancelled());
+  EXPECT_EQ(callback_count, 0);
+  EXPECT_FALSE(callback_status.has_value());
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      1.0);
+
+  scheduled_request->set_cancel();
+  batches.clear();
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches.front().size(), 1u);
+  EXPECT_EQ(batches.front()[0], deferred_sequence);
+  EXPECT_FALSE(scheduled_sequence->has_any_blocks());
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::LINEAR), 2u);
+  const Slice<Block> retried_blocks =
+      deferred_sequence->kv_state().blocks(BlockType::LINEAR);
+  EXPECT_EQ(retried_blocks.front().id(), deferred_source);
+  EXPECT_NE(retried_blocks.back().id(), deferred_source);
+  EXPECT_FALSE(retried_blocks.back().has_multiple_owners());
+  EXPECT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::KV), 2u);
+  EXPECT_EQ(deferred_sequence->kv_cache_tokens_num(), 4u);
+  EXPECT_EQ(callback_count, 0);
+  EXPECT_FALSE(callback_status.has_value());
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      1.0);
+
+  deferred_request->set_cancel();
+  batches.clear();
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  EXPECT_TRUE(batches.front().empty());
+  EXPECT_FALSE(deferred_sequence->has_any_blocks());
+}
+
+TEST(ContinuousSchedulerTest,
+     LinearPrivateWriteExhaustionFailsIdleRetryExactlyOnce) {
+  ScopedConfigValue<double> memory_threshold(
+      SchedulerConfig::get_instance()
+          .prefill_scheduling_memory_usage_threshold(),
+      2.0);
+  ScopedConfigValue<bool> mix_batch(
+      SchedulerConfig::get_instance().enable_mix_batch(), false);
+  FakeEngine engine(/*num_blocks=*/32,
+                    /*block_size=*/4,
+                    /*enable_prefix_cache=*/false,
+                    /*enable_linear_attention=*/true,
+                    InstanceRole::DEFAULT,
+                    /*linear_state_num_slots=*/4);
+  ContinuousScheduler::Options options =
+      create_scheduler_options(/*max_tokens_per_batch=*/16,
+                               /*max_seqs_per_batch=*/2,
+                               /*num_speculative_tokens=*/0,
+                               /*max_tokens_per_chunk_for_prefill=*/4,
+                               /*dp_size=*/1);
+  options.enable_chunked_prefill(true).enable_schedule_overlap(false);
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  auto scheduled_request = generate_request_with_prompt_tokens(
+      {1, 2, 3, 4, 5, 6, 7, 8, 9}, /*max_tokens=*/1, /*max_context_len=*/32);
+  auto deferred_request =
+      generate_request_with_prompt_tokens({11, 12, 13, 14, 15, 16, 17, 18, 19},
+                                          /*max_tokens=*/1,
+                                          /*max_context_len=*/32);
+  scheduled_request->state().output_func = [](const RequestOutput&) {
+    return true;
+  };
+  deferred_request->state().output_func = [&](const RequestOutput& output) {
+    ++callback_count;
+    callback_status = output.status;
+    return true;
+  };
+  TestContinuousScheduler scheduler(&engine, options);
+  Sequence* scheduled_sequence = scheduled_request->sequences().front().get();
+  Sequence* deferred_sequence = deferred_request->sequences().front().get();
+  const double failures_before =
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value();
+  ASSERT_TRUE(scheduler.add_request(scheduled_request));
+  ASSERT_TRUE(scheduler.add_request(deferred_request));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches.front().size(), 2u);
+  EXPECT_EQ(batches.front()[0], scheduled_sequence);
+  EXPECT_EQ(batches.front()[1], deferred_sequence);
+  ASSERT_EQ(scheduled_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::KV), 1u);
+  const int32_t deferred_source = deferred_sequence->get_linear_state_slot_id();
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      0.0);
+  set_chunk_kv(scheduled_request, /*kv_tokens=*/4);
+  set_chunk_kv(deferred_request, /*kv_tokens=*/4);
+
+  batches.clear();
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches.front().size(), 1u);
+  EXPECT_EQ(batches.front()[0], scheduled_sequence);
+  ASSERT_EQ(scheduled_sequence->kv_state().num_blocks(BlockType::LINEAR), 2u);
+  ASSERT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(deferred_sequence->get_linear_state_slot_id(), deferred_source);
+  EXPECT_EQ(deferred_sequence->kv_state().num_blocks(BlockType::KV), 1u);
+  EXPECT_EQ(deferred_sequence->kv_cache_tokens_num(), 4u);
+  EXPECT_FALSE(deferred_request->finished());
+  EXPECT_FALSE(deferred_request->cancelled());
+  EXPECT_EQ(callback_count, 0);
+  EXPECT_FALSE(callback_status.has_value());
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      1.0);
+
+  // Keep A's real slots occupied after cancellation, so B's idle retry still
+  // cannot allocate a private destination. Owners must die before the engine.
+  const Slice<Block> scheduled_blocks =
+      scheduled_sequence->kv_state().blocks(BlockType::LINEAR);
+  std::vector<Block> held_slots(scheduled_blocks.begin(),
+                                scheduled_blocks.end());
+  scheduled_request->set_cancel();
+  batches.clear();
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  EXPECT_TRUE(batches.front().empty());
+  EXPECT_FALSE(scheduled_sequence->has_any_blocks());
+  EXPECT_FALSE(deferred_sequence->has_any_blocks());
+  EXPECT_TRUE(scheduler.get_running_requests().empty());
+  EXPECT_EQ(scheduler.get_waiting_requests_num(), 0u);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      2.0);
+
+  batches = scheduler.prepare_batch_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(batches.size(), 1u);
+  EXPECT_TRUE(batches.front().empty());
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_DOUBLE_EQ(
+      COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
+          failures_before,
+      2.0);
+  held_slots.clear();
 }
 
 TEST(ContinuousSchedulerTest,

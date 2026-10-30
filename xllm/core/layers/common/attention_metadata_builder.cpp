@@ -516,6 +516,7 @@ AttentionMetadata build_attention_metadata(
     // above carry the cumulative representation.
     attn_metadata.q_seq_lens_vec = {1};
     attn_metadata.kv_seq_lens_vec = {1};
+    attn_metadata.q_cu_seq_lens_host_vec = {0, 1};
 #else
     attn_metadata.q_seq_lens_vec = {0, 1};
     attn_metadata.kv_seq_lens_vec = {0, 1};

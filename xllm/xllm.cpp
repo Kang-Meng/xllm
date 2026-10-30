@@ -74,6 +74,87 @@ static std::atomic<uint32_t> signal_received{0};
 
 namespace {
 
+void validate_jev_config(const ModelArgs& model_args) {
+  const ModelConfig& model_config = ModelConfig::get_instance();
+  const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
+  const SchedulerConfig& scheduler_config = SchedulerConfig::get_instance();
+  const SpeculativeConfig& speculative_config =
+      SpeculativeConfig::get_instance();
+  const DisaggPDConfig& disagg_pd_config = DisaggPDConfig::get_instance();
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+
+  if ((model_args.model_type() == "qwen3_5_text" ||
+       model_args.model_type() == "qwen3_5_moe_text") &&
+      model_args.jev_prompt_attention() == "bidirectional") {
+    CHECK(!model_config.enable_qwen3_reranker())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_qwen3_reranker=false; current value="
+        << model_config.enable_qwen3_reranker();
+#if !defined(USE_CUDA) && !defined(USE_NPU)
+    LOG(FATAL)
+        << "Bidirectional Jev prompt attention requires a CUDA or NPU build.";
+#endif
+    bool supported_impl =
+        ModelConfig::is_python_model_impl(model_config.model_impl());
+#if defined(USE_NPU) && !defined(USE_CUDA)
+    supported_impl = supported_impl || model_config.model_impl().empty() ||
+                     model_config.model_impl() == "native";
+#endif
+    CHECK_EQ(model_config.backend(), "llm")
+        << "Bidirectional Jev prompt attention requires --backend=llm.";
+    CHECK(supported_impl)
+        << "Bidirectional Jev prompt attention requires --model_impl=python "
+           "(or native/default on NPU); current model_impl='"
+        << model_config.model_impl() << "'.";
+    CHECK(!kv_cache_config.enable_prefix_cache())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_prefix_cache=false; current value="
+        << kv_cache_config.enable_prefix_cache();
+    CHECK(!kv_cache_config.enable_in_batch_prefix_cache())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_in_batch_prefix_cache=false; current value="
+        << kv_cache_config.enable_in_batch_prefix_cache();
+    CHECK(!scheduler_config.enable_chunked_prefill())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_chunked_prefill=false; current value="
+        << scheduler_config.enable_chunked_prefill();
+    CHECK_NE(scheduler_config.priority_strategy(), "multi_slo_and_prio")
+        << "Bidirectional Jev prompt attention requires a --priority_strategy "
+           "other than multi_slo_and_prio, which forces chunked prefill.";
+    CHECK(!scheduler_config.enable_mix_batch())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_mix_batch=false; current value="
+        << scheduler_config.enable_mix_batch();
+    CHECK(!scheduler_config.enable_schedule_overlap())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_schedule_overlap=false; current value="
+        << scheduler_config.enable_schedule_overlap();
+    CHECK(speculative_config.draft_model().empty())
+        << "Bidirectional Jev prompt attention does not support speculative "
+           "decoding; clear --draft_model. Current draft_model='"
+        << speculative_config.draft_model() << "'.";
+    CHECK_EQ(speculative_config.num_speculative_tokens(), 0)
+        << "Bidirectional Jev prompt attention requires "
+           "--num_speculative_tokens=0.";
+    CHECK(!disagg_pd_config.enable_disagg_pd())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_disagg_pd=false; current value="
+        << disagg_pd_config.enable_disagg_pd();
+    CHECK(!disagg_pd_config.enable_pd_ooc())
+        << "Bidirectional Jev prompt attention requires "
+           "--enable_pd_ooc=false; current value="
+        << disagg_pd_config.enable_pd_ooc();
+    CHECK_EQ(disagg_pd_config.instance_role(), "DEFAULT")
+        << "Bidirectional Jev prompt attention requires "
+           "--instance_role=DEFAULT.";
+    CHECK_EQ(parallel_config.cp_size(), 1)
+        << "Bidirectional Jev prompt attention requires --cp_size=1.";
+    CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+        << "Bidirectional Jev prompt attention does not support KV-sharded "
+           "attention; configure parallelism so kv_split_size_effective=1.";
+  }
+}
+
 void initialize_configs() {
   BeamSearchConfig::get_instance().initialize();
   DisaggPDConfig::get_instance().initialize();
@@ -340,6 +421,8 @@ void validate_config(const std::string& model_type) {
     CHECK(model_args_loader(model_config_json, &model_args))
         << "Failed to load model args for model type " << resolved_model_type;
   }
+
+  validate_jev_config(model_args);
 
   if (kv_cache_store_config.enable_kvcache_store()) {
     CHECK(kv_cache_config.enable_prefix_cache())

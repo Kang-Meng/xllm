@@ -24,6 +24,9 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/platform/device.h"
+#if defined(USE_NPU)
+#include "core/layers/npu_torch/fused_infer_attention_utils.h"
+#endif
 
 namespace xllm::layer {
 namespace {
@@ -276,6 +279,7 @@ TEST(AttentionMetadataBuilderTest, MaterializesColdMaskForDummyShard) {
 #if defined(USE_NPU)
   EXPECT_EQ(metadata.q_seq_lens_vec, std::vector<int32_t>({1}));
   EXPECT_EQ(metadata.kv_seq_lens_vec, std::vector<int32_t>({1}));
+  EXPECT_EQ(metadata.q_cu_seq_lens_host_vec, std::vector<int64_t>({0, 1}));
 #else
   EXPECT_EQ(metadata.q_seq_lens_vec, std::vector<int32_t>({0, 1}));
   EXPECT_EQ(metadata.kv_seq_lens_vec, std::vector<int32_t>({0, 1}));
@@ -294,6 +298,56 @@ TEST(AttentionMetadataBuilderTest, MaterializesColdMaskForDummyShard) {
 }
 
 #if defined(USE_NPU)
+TEST(AttentionMetadataBuilderTest,
+     MaterializesHostQueryGeometryForDummyPrefill) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  params.meta.num_sequences = 0;
+  params.meta.q_max_seq_len = 0;
+  params.meta.kv_max_seq_len = 0;
+  params.execution_batch.num_tokens = 1;
+
+  AttentionMetadata metadata =
+      AttentionMetadataBuilder::build(params,
+                                      /*enable_mla=*/false,
+                                      /*attn_mask=*/{},
+                                      torch::Device(torch::kCPU));
+
+  ASSERT_TRUE(metadata.is_dummy);
+  ASSERT_TRUE(metadata.is_prefill);
+  EXPECT_EQ(metadata.q_cu_seq_lens_host_vec, std::vector<int64_t>({0, 1}));
+  EXPECT_EQ(metadata.kv_seq_lens_vec, std::vector<int32_t>({1}));
+  EXPECT_TRUE(torch::equal(
+      metadata.q_cu_seq_lens,
+      torch::tensor(metadata.q_cu_seq_lens_host_vec, torch::kInt32)));
+}
+
+TEST(AttentionMetadataBuilderTest, JevNativeRequiresCompletePromptPerRequest) {
+  AttentionMetadata metadata;
+  metadata.is_prefill = true;
+  metadata.is_chunked_prefill = false;
+  metadata.is_dummy = false;
+  metadata.prefill_without_cache = false;
+  metadata.q_cu_seq_lens_host_vec = {2, 5};
+  metadata.kv_cu_seq_lens_host_vec = {2, 5};
+  EXPECT_FALSE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+
+  metadata.q_cu_seq_lens_host_vec = {0, 2, 5};
+  EXPECT_FALSE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+
+  metadata.kv_cu_seq_lens_host_vec = {2, 6};
+  EXPECT_TRUE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+  metadata.kv_cu_seq_lens_host_vec = {2, 5};
+  metadata.is_chunked_prefill = true;
+  EXPECT_TRUE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+  metadata.is_chunked_prefill = false;
+  metadata.is_spec_verify = true;
+  EXPECT_TRUE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+  metadata.is_spec_verify = false;
+  metadata.prefill_without_cache = true;
+  EXPECT_TRUE(detail::validate_jev_full_prefill(metadata, 5).has_value());
+}
+
 TEST(AttentionMetadataBuilderTest, PreservesMaterializedDummyQueryGeometry) {
   Device device(0);
   device.set_device();

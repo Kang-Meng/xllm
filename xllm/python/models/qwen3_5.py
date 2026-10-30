@@ -95,14 +95,19 @@ class Qwen3_5Config:
     eplv2_comm_mode: str = "auto"
     eplv2_mc2_max_tokens_per_rank: int = 512
     layers_to_capture: tuple[int, ...] = ()
+    jev_prompt_attention: str = "causal"
 
     @classmethod
-    def from_dict(cls, d: dict) -> Qwen3_5Config:
+    def from_dict(cls, d: dict[str, Any]) -> Qwen3_5Config:
         def pick(*keys: str, default: Any = None) -> Any:
             for key in keys:
                 if key in d and d[key] is not None:
                     return d[key]
             return default
+
+        jev_prompt_attention = d.get("jev_prompt_attention", "causal")
+        if jev_prompt_attention not in ("causal", "bidirectional"):
+            raise ValueError("jev_prompt_attention must be causal or bidirectional")
 
         n_layers = int(pick("n_layers", "num_hidden_layers", default=0))
         interval = int(pick("full_attention_interval", default=4))
@@ -215,6 +220,7 @@ class Qwen3_5Config:
             eplv2_comm_mode=eplv2_mode,
             eplv2_mc2_max_tokens_per_rank=eplv2_token_limit,
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
+            jev_prompt_attention=jev_prompt_attention,
         )
 
     @classmethod

@@ -95,6 +95,35 @@ TEST_F(BatchInflightBlocksTest, CopiesAndMovesKeepBlocksUntilLastBatchRetires) {
   }
 }
 
+TEST_F(BatchInflightBlocksTest, LinearKeepaliveDoesNotCreateLogicalSharing) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(4).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_sequence(4);
+  sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(2));
+  Batch batch(&sequence);
+  Batch copied = batch;
+  const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+  for (const Block& block : blocks) {
+    EXPECT_EQ(block.ref_count(), 3u);
+    EXPECT_EQ(block.owner_count(), 1u);
+    EXPECT_FALSE(block.has_multiple_owners());
+  }
+
+  Block shared_source = blocks.front();
+  EXPECT_TRUE(blocks.front().has_multiple_owners());
+  EXPECT_FALSE(blocks.back().has_multiple_owners());
+  shared_source = Block();
+  EXPECT_FALSE(blocks.front().has_multiple_owners());
+
+  sequence.reset();
+  EXPECT_EQ(manager.num_used_blocks(), 2u);
+  batch = Batch();
+  EXPECT_EQ(manager.num_used_blocks(), 2u);
+  copied = Batch();
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+}
+
 TEST_F(BatchInflightBlocksTest, IndependentBatchesReleaseTheirOwnReferences) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4).enable_prefix_cache(false);

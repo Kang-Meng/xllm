@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -427,9 +428,53 @@ ForwardInput BatchInputBuilder::build_forward_input(
     uint32_t num_decoding_tokens,
     uint32_t min_decoding_batch_size) {
   process_sequences();
+  log_duplicate_linear_write_slots();
   padding_decode_batch_size(num_decoding_tokens, min_decoding_batch_size);
 
   return state_to_forward_input();
+}
+
+void BatchInputBuilder::log_duplicate_linear_write_slots() const {
+  if (!args_ || !has_linear_attention_layers(*args_)) {
+    return;
+  }
+  std::unordered_map<int32_t, size_t> first_row_by_slot;
+  for (size_t row = 0; row < state_.linear_state_ids.size(); ++row) {
+    const int32_t write_slot = state_.linear_state_ids[row];
+    if (write_slot < 0 || write_slot == kPaddingLinearStateId) {
+      continue;
+    }
+    const auto [first, inserted] = first_row_by_slot.emplace(write_slot, row);
+    if (inserted) {
+      continue;
+    }
+    const size_t first_row = first->second;
+    const Sequence* first_sequence = sequences_[first_row];
+    const Sequence* sequence = sequences_[row];
+    const Slice<Block> first_blocks =
+        first_sequence->kv_state().blocks(BlockType::LINEAR);
+    const Slice<Block> blocks = sequence->kv_state().blocks(BlockType::LINEAR);
+    LOG(ERROR)
+        << "Duplicate LINEAR write slot before forward: batch=" << batch_id_
+        << " write=" << write_slot << " first_row=" << first_row
+        << " first_request=" << first_sequence->request_id()
+        << " first_seq=" << first_sequence->seq_id()
+        << " first_read=" << state_.linear_state_read_ids[first_row]
+        << " first_blocks=" << first_blocks.size() << " first_read_refs="
+        << (first_blocks.empty() ? 0 : first_blocks.front().ref_count())
+        << " first_write_refs="
+        << (first_blocks.empty() ? 0 : first_blocks.back().ref_count())
+        << " first_cached_tokens=" << first_sequence->kv_cache_tokens_num()
+        << " first_prefill=" << first_sequence->is_prefill_stage()
+        << " row=" << row << " request=" << sequence->request_id()
+        << " seq=" << sequence->seq_id()
+        << " read=" << state_.linear_state_read_ids[row]
+        << " blocks=" << blocks.size()
+        << " read_refs=" << (blocks.empty() ? 0 : blocks.front().ref_count())
+        << " write_refs=" << (blocks.empty() ? 0 : blocks.back().ref_count())
+        << " cached_tokens=" << sequence->kv_cache_tokens_num()
+        << " prefill=" << sequence->is_prefill_stage();
+  }
 }
 
 void BatchInputBuilder::process_sequences() {

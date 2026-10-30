@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/common/metrics.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/request/sequence.h"
 
@@ -268,12 +269,13 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
 
   std::vector<Block> allocated = block_allocator()->allocate(1);
   if (allocated.empty()) {
-    if (blocks->empty()) {
-      VLOG(1)
-          << "LinearStateBlockManager::allocate_prefill: no blocks to allocate";
-      return std::nullopt;
-    }
-    return std::vector<Block>{};
+    COUNTER_INC(linear_prefill_private_write_alloc_failures);
+    LOG_EVERY_N(WARNING, 100)
+        << "LINEAR prefill has no private write slot: request_id="
+        << seq->request_id() << " seq_id=" << seq->seq_id()
+        << " read_slot=" << (blocks->empty() ? -1 : blocks->back().id())
+        << " free_slots=" << num_free_blocks();
+    return std::nullopt;
   }
 
   // The block that remains is the completed read source. Publish it only when
@@ -305,6 +307,40 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
     KVCacheState& kv_state) {
   std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
   CHECK_LE(blocks->size(), 2u);
+  if (blocks->size() == 1 && blocks->back().has_multiple_owners()) {
+    std::vector<Block> private_write = block_allocator()->allocate(1);
+    if (private_write.empty()) {
+      COUNTER_INC(linear_decode_private_write_alloc_failures);
+      return std::nullopt;
+    }
+    return private_write;
+  }
+  if (blocks->size() == 2 && blocks->back().has_multiple_owners()) {
+    COUNTER_INC(linear_decode_shared_write_slot_failures);
+    LOG_EVERY_N(WARNING, 100)
+        << "LINEAR decode has shared current write slot: request="
+        << seq->request_id() << " seq=" << seq->seq_id()
+        << " slot=" << blocks->back().id();
+    return std::nullopt;
+  }
+
+  auto privatize_read_before_swap = [&]() {
+    if (!blocks->front().has_multiple_owners()) {
+      return true;
+    }
+    std::vector<Block> private_write = block_allocator()->allocate(1);
+    if (private_write.empty()) {
+      COUNTER_INC(linear_decode_swap_private_write_alloc_failures);
+      LOG_EVERY_N(WARNING, 100)
+          << "LINEAR decode cannot privatize write slot: request="
+          << seq->request_id() << " seq=" << seq->seq_id()
+          << " shared_read=" << blocks->front().id()
+          << " free_slots=" << num_free_blocks();
+      return false;
+    }
+    blocks->front() = std::move(private_write.front());
+    return true;
+  };
 
   const size_t checkpoint_stride = block_size();
   const bool completed_checkpoint =
@@ -320,6 +356,9 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
         // the previous step into the back block, so swap that block to the
         // front before collect moves it.
         if (!options_.enable_schedule_overlap()) {
+          if (!privatize_read_before_swap()) {
+            return std::nullopt;
+          }
           std::iter_swap(blocks->begin(), blocks->begin() + 1);
         }
         return std::vector<Block>{};
@@ -331,6 +370,9 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
       // step reads the slot written by the preceding step. This is also
       // what makes overlap allocation safe: the old read slot cannot be
       // returned to the global pool while its in-flight step may still use it.
+      if (!privatize_read_before_swap()) {
+        return std::nullopt;
+      }
       std::iter_swap(blocks->begin(), blocks->begin() + 1);
       return std::vector<Block>{};
     }
@@ -350,11 +392,26 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
       cached_tokens + static_cast<size_t>(options_.num_speculative_tokens()) +
       1;
   if (!crosses_checkpoint(cached_tokens, predicted_tokens, checkpoint_stride)) {
+    if (blocks->back().has_multiple_owners()) {
+      LOG(ERROR) << "LINEAR decode reuses shared write slot: request="
+                 << seq->request_id() << " seq=" << seq->seq_id()
+                 << " write=" << blocks->back().id()
+                 << " refs=" << blocks->back().ref_count()
+                 << " cached_tokens=" << cached_tokens
+                 << " predicted_tokens=" << predicted_tokens;
+    }
     return std::vector<Block>{};
   }
 
   std::vector<Block> allocated = block_allocator()->allocate(1);
   if (allocated.empty()) {
+    if (blocks->back().has_multiple_owners()) {
+      LOG(ERROR) << "LINEAR decode exhausted with shared write slot: request="
+                 << seq->request_id() << " seq=" << seq->seq_id()
+                 << " write=" << blocks->back().id()
+                 << " refs=" << blocks->back().ref_count()
+                 << " free_slots=" << num_free_blocks();
+    }
     // The extra slot only preserves a checkpoint for the future offload path;
     // recurrent decode itself supports reading and writing the live slot in
     // place. Under pressure, keep decoding instead of turning an optional

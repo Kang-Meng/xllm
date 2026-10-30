@@ -998,7 +998,7 @@ std::vector<Block> Sequence::get_inflight_blocks() const {
          ++block_index) {
       const Block& block = blocks[block_index];
       if (block.is_valid() && block.manager() != nullptr) {
-        retained.emplace_back(block);
+        retained.emplace_back(block.retain_for_inflight());
       }
     }
   }
@@ -1214,7 +1214,8 @@ void Sequence::generate_output_tokens_logprobs(
       tokenizer,
       out_logprobs,
       sequence_params_.skip_special_tokens,
-      tokens_);
+      tokens_,
+      !sequence_params_.sampling_param->logprob_token_ids.empty());
 }
 
 Slice<int32_t> Sequence::get_generated_tokens() const {

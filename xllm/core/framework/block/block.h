@@ -173,12 +173,29 @@ class Block final {
   // Shared refcount. 0 when the block was moved from, or when it has no
   // manager. A manager-less block does not own a counter.
   uint32_t ref_count() const {
-    return ref_count_ == nullptr ? 0
-                                 : ref_count_->load(std::memory_order_acquire);
+    return ref_count_ == nullptr
+               ? 0
+               : ref_count_->total.load(std::memory_order_acquire);
   }
 
   // check if the block is shared
   bool is_shared() const { return ref_count() > 1; }
+
+  // Inflight references keep the block alive without adding a logical owner.
+  Block retain_for_inflight() const;
+
+  // Owners and total are updated independently, not as a joint snapshot.
+  // Only total controls reclamation; this query does not synchronize access.
+  uint32_t owner_count() const {
+    return ref_count_ == nullptr
+               ? 0
+               : ref_count_->owners.load(std::memory_order_acquire);
+  }
+
+  // This is not a lock or an exclusive-write grant. Callers making write
+  // decisions must serialize ownership changes and access through the existing
+  // scheduler/manager synchronization protocol, not this atomic observation.
+  bool has_multiple_owners() const { return owner_count() > 1; }
 
   // Valid when this alias still owns an id. A manager-less block can be valid
   // without a refcount. Move clears the id.
@@ -207,6 +224,19 @@ class Block final {
   }
 
  private:
+  struct RefCounts {
+    // All references, including inflight keepalives. Reclaim only at zero.
+    // Creating an inflight reference increments total but not owners.
+    std::atomic<uint32_t> total{1};
+    // State owners, excluding inflight keepalives. LINEAR allocation uses
+    // multiple owners to decide write isolation; this count never reclaims.
+    // With owners == 0 and total > 0, only keepalives remain and the block
+    // must stay allocated until those references are released.
+    std::atomic<uint32_t> owners{1};
+  };
+
+  Block(const Block& other, bool inflight);
+
   // Asks the manager to fetch_add the shared count. A null manager has no
   // shared counter and returns without touching one.
   void inc_ref_count();
@@ -230,7 +260,9 @@ class Block final {
 
   // reference count, shared across Block aliases of the same physical block.
   // Atomic because aliases are copied and destroyed across threads.
-  std::atomic<uint32_t>* ref_count_ = nullptr;
+  RefCounts* ref_count_ = nullptr;
+
+  bool inflight_ = false;
 
   // manager that manages this block
   BlockManager* manager_ = nullptr;

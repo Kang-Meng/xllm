@@ -190,6 +190,24 @@ void SamplingParameters::init(
     do_sample.push_back(sample ? 1 : 0);
   }
   this->sample_idxes = torch::tensor(sample_idxes, int_tensor_options);
+  int64_t max_queried_ids = 0;
+  for (int32_t idx : sample_idxes) {
+    max_queried_ids = std::max<int64_t>(
+        max_queried_ids, req_sampling_params[idx]->logprob_token_ids.size());
+  }
+  if (max_queried_ids > 0) {
+    std::vector<int32_t> ids(sample_idxes.size() * max_queried_ids, -1);
+    for (size_t row = 0; row < sample_idxes.size(); ++row) {
+      const auto& requested =
+          req_sampling_params[sample_idxes[row]]->logprob_token_ids;
+      std::copy(requested.begin(),
+                requested.end(),
+                ids.begin() + row * max_queried_ids);
+    }
+    this->logprob_token_ids =
+        torch::tensor(ids, int_tensor_options)
+            .view({static_cast<int64_t>(sample_idxes.size()), max_queried_ids});
+  }
   this->do_sample = torch::tensor(do_sample, bool_tensor_options);
   this->logprobs = logprobs;
   this->max_top_logprobs = max_top_logprobs;
@@ -252,6 +270,7 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
                             ? safe_to(sample_idxes, device).contiguous()
                             : sample_idxes;
   params.do_sample = safe_to(do_sample, device, true);
+  params.logprob_token_ids = safe_to(logprob_token_ids, device, true);
   params.acc_logprob = safe_to(acc_logprob, device, true);
   params.all_random_sample = all_random_sample;
   params.all_greedy_sample = all_greedy_sample;
@@ -266,6 +285,11 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
 }
 
 void SamplingParameters::concat(const SamplingParameters& param) {
+  const int64_t original_sample_rows =
+      this->sample_idxes.defined() ? this->sample_idxes.numel() : 0;
+  const int64_t original_selected_rows =
+      this->selected_token_idxes.defined() ? this->selected_token_idxes.numel()
+                                           : 0;
   // selected_token_idxes and sample_idxes are accumulated variable across
   // all sequences in the batch, so the offset of first
   // SamplingParameters is added to the second SamplingParameters
@@ -276,12 +300,12 @@ void SamplingParameters::concat(const SamplingParameters& param) {
                           this->selected_token_idxes[-1] + torch::tensor(1))
                        : param.selected_token_idxes),
                   0);
-  this->sample_idxes = safe_concat(
-      this->sample_idxes,
-      (param.sample_idxes.defined()
-           ? (param.sample_idxes + this->sample_idxes[-1] + torch::tensor(1))
-           : param.sample_idxes),
-      0);
+  this->sample_idxes =
+      safe_concat(this->sample_idxes,
+                  (param.sample_idxes.defined()
+                       ? (param.sample_idxes + original_selected_rows)
+                       : param.sample_idxes),
+                  0);
   this->frequency_penalties =
       safe_concat(this->frequency_penalties, param.frequency_penalties, 0);
   this->repetition_penalties =
@@ -296,6 +320,28 @@ void SamplingParameters::concat(const SamplingParameters& param) {
   this->unique_token_ids_lens =
       safe_concat(this->unique_token_ids_lens, param.unique_token_ids_lens, 0);
   this->do_sample = safe_concat(this->do_sample, param.do_sample, 0);
+  if (this->logprob_token_ids.defined() || param.logprob_token_ids.defined()) {
+    const int64_t width = std::max(
+        this->logprob_token_ids.defined() ? this->logprob_token_ids.size(1) : 0,
+        param.logprob_token_ids.defined() ? param.logprob_token_ids.size(1)
+                                          : 0);
+    const auto pad_ids = [width](const torch::Tensor& ids,
+                                 int64_t rows,
+                                 const torch::TensorOptions& options) {
+      torch::Tensor padded = torch::full({rows, width}, -1, options);
+      if (ids.defined()) {
+        padded.slice(/*dim=*/1, /*start=*/0, /*end=*/ids.size(1)).copy_(ids);
+      }
+      return padded;
+    };
+    const torch::TensorOptions options =
+        this->logprob_token_ids.defined() ? this->logprob_token_ids.options()
+                                          : param.logprob_token_ids.options();
+    this->logprob_token_ids = torch::cat(
+        {pad_ids(this->logprob_token_ids, original_sample_rows, options),
+         pad_ids(param.logprob_token_ids, param.sample_idxes.numel(), options)},
+        /*dim=*/0);
+  }
   this->acc_logprob = safe_concat(this->acc_logprob, param.acc_logprob, 0);
   if (this->filter_mask.defined() && param.filter_mask.defined()) {
     this->filter_mask = torch::cat({this->filter_mask, param.filter_mask}, 0);

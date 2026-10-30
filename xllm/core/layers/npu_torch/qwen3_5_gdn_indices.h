@@ -29,7 +29,9 @@ namespace qwen3_5_gdn_internal {
 
 void check_live_slots(const std::vector<int32_t>& live_slots,
                       int64_t batch_size,
-                      int64_t num_slots);
+                      int64_t num_slots,
+                      const std::vector<int32_t>* read_slots = nullptr,
+                      const std::vector<int64_t>* validity_mask = nullptr);
 
 torch::Tensor slots_to_device(const std::vector<int32_t>& slots,
                               const torch::Device& device);

@@ -2664,6 +2664,7 @@ inline void deserialize_forward_input_payload(
     read_tensor(context, sampling_params.temperatures, stream);
     read_tensor(context, sampling_params.top_p, stream);
     read_tensor(context, sampling_params.top_k, stream);
+    read_tensor(context, sampling_params.logprob_token_ids, stream);
     read_tensor(context, sampling_params.unique_token_ids, stream);
     read_tensor(context, sampling_params.unique_token_counts, stream);
     read_tensor(context, sampling_params.unique_token_ids_lens, stream);
@@ -3162,6 +3163,7 @@ inline void serialize_forward_input_sections(
     write_tensor(context, sampling_params.temperatures);
     write_tensor(context, sampling_params.top_p);
     write_tensor(context, sampling_params.top_k);
+    write_tensor(context, sampling_params.logprob_token_ids);
     write_tensor(context, sampling_params.unique_token_ids);
     write_tensor(context, sampling_params.unique_token_counts);
     write_tensor(context, sampling_params.unique_token_ids_lens);

@@ -61,7 +61,8 @@ class LogprobState {
       const Tokenizer& tokenizer,
       std::optional<std::vector<LogProb>>& out_logprobs,
       bool skip_special_tokens,
-      const std::vector<int32_t>& tokens);
+      const std::vector<int32_t>& tokens,
+      bool include_empty_token = false);
 
   void update_logprob(size_t index, const Token& token, int64_t num_top_tokens);
 

@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -130,6 +132,229 @@ def _make_moe_layer(cfg: Qwen3_5Config, device: torch.device | None = None) -> F
 
 def test_cuda_decoder_factory_selects_cuda_backend() -> None:
     assert get_qwen3_5_decoder_layer_class("cuda") is CudaQwen3_5DecoderLayer
+
+
+@pytest.mark.parametrize("mode, causal", [("causal", True), ("bidirectional", False)])
+def test_jev_prompt_attention_only_changes_full_attention(mode: str, causal: bool) -> None:
+    cfg = _config(jev_prompt_attention=mode)
+    layer = CudaQwen3_5Attention(cfg, 0, torch.float32, torch.device("cpu"), MagicMock())
+
+    assert layer.attn.causal is causal
+    assert cfg.jev_prompt_attention == mode
+
+
+def test_jev_prompt_attention_rejects_invalid_mode() -> None:
+    with pytest.raises(ValueError, match="jev_prompt_attention"):
+        _config(jev_prompt_attention="invalid")
+    with pytest.raises(ValueError, match="jev_prompt_attention"):
+        _config(jev_prompt_attention=None)
+    assert _config().jev_prompt_attention == "causal"
+
+
+@pytest.fixture
+def _jev_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[types.ModuleType, list[MagicMock], MagicMock]:
+    ragged_wrappers: list[MagicMock] = []
+
+    def _make_ragged(*_args: object, **_kwargs: object) -> MagicMock:
+        wrapper = MagicMock()
+        wrapper.run.return_value = torch.zeros(2, 2, 4)
+        ragged_wrappers.append(wrapper)
+        return wrapper
+
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.BatchPrefillWithRaggedKVCacheWrapper = _make_ragged
+    fake_flashinfer.BatchPrefillWithPagedKVCacheWrapper = MagicMock(return_value=MagicMock())
+    decode_wrapper = MagicMock()
+    decode_wrapper.run.return_value = torch.zeros(2, 2, 4)
+    fake_flashinfer.BatchDecodeWithPagedKVCacheWrapper = MagicMock(return_value=decode_wrapper)
+    fake_decode = types.ModuleType("flashinfer.decode")
+    fake_decode.fast_decode_plan = MagicMock()
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.decode", fake_decode)
+    spec = importlib.util.spec_from_file_location(
+        "_test_jev_flashinfer", _PYTHON_ROOT / "attention" / "flashinfer.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_WORKSPACE_SIZE", 16)
+    monkeypatch.setattr(kernels, "reshape_paged_cache", MagicMock(), raising=False)
+    return module, ragged_wrappers, decode_wrapper
+
+
+def test_jev_flashinfer_prefill_plan_dispatch_and_decode(
+    _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
+) -> None:
+    module, ragged_wrappers, decode_wrapper = _jev_flashinfer
+    backend = module.FlashInferBackend(2, 2, 4, 0.5, 0, torch.device("cpu"), torch.float32)
+    assert len(ragged_wrappers) == 1
+    backend.enable_prefix_bidir(torch.device("cpu"))
+    assert len(ragged_wrappers) == 2
+    cache = SimpleNamespace(key=torch.zeros(1, 2, 2, 4), value=torch.zeros(1, 2, 2, 4))
+    backend.bind_kv_caches([cache])
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor([0, 2], dtype=torch.int32),
+        kv_seq_lens_host_values=[0, 2],
+        q_cu_seq_lens=torch.tensor([0, 2], dtype=torch.int32),
+        kv_cu_seq_lens=torch.tensor([0, 2], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        paged_kv_indices=torch.tensor([0], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([2], dtype=torch.int32),
+    )
+    backend.prepare(metadata)
+    assert ragged_wrappers[0].plan.call_args.kwargs["causal"] is True
+    assert ragged_wrappers[1].plan.call_args.kwargs["causal"] is False
+    qkv = torch.zeros(2, 8)
+    bidir_layer = SimpleNamespace(layer_id=0, num_heads=2, num_kv_heads=2, head_dim=4, causal=False)
+    causal_layer = SimpleNamespace(layer_id=0, num_heads=2, num_kv_heads=2, head_dim=4, causal=True)
+    backend.execute(qkv, qkv, qkv, bidir_layer)
+    backend.execute(qkv, qkv, qkv, causal_layer)
+    ragged_wrappers[0].run.assert_called_once()
+    ragged_wrappers[1].run.assert_called_once()
+
+    metadata.q_seq_lens_host = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(ValueError, match="q_len == kv_len"):
+        backend.prepare(metadata)
+    assert ragged_wrappers[0].plan.call_count == 1
+    assert ragged_wrappers[1].plan.call_count == 1
+    metadata.q_seq_lens_host = torch.tensor([0, 2], dtype=torch.int32)
+    metadata.is_mixed = True
+    with pytest.raises(ValueError, match="pure"):
+        backend.prepare(metadata)
+    metadata.is_mixed = False
+    backend.prepare(metadata)
+    metadata.is_prefill = False
+    metadata.is_chunked_prefill = True
+    with pytest.raises(ValueError, match="chunked"):
+        backend.execute(qkv, qkv, qkv, bidir_layer)
+    metadata.is_chunked_prefill = False
+    backend.prepare(metadata)
+    backend.execute(qkv, qkv, qkv, bidir_layer)
+    decode_wrapper.run.assert_called_once()
+
+
+@pytest.mark.parametrize("cu_lens", [[0, 2], [0, 1], [0, 2, 5], [0, 1, 4, 6]])
+def test_jev_flashinfer_accepts_cuda_cumulative_prefill_lengths(
+    _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
+    cu_lens: list[int],
+) -> None:
+    module, ragged_wrappers, _ = _jev_flashinfer
+    backend = module.FlashInferBackend(2, 2, 4, 0.5, 0, torch.device("cpu"), torch.float32)
+    backend.enable_prefix_bidir(torch.device("cpu"))
+    backend.bind_kv_caches(
+        [SimpleNamespace(key=torch.zeros(1, 2, 2, 4), value=torch.zeros(1, 2, 2, 4))]
+    )
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor(cu_lens, dtype=torch.int32),
+        kv_seq_lens_host_values=cu_lens,
+        q_cu_seq_lens=torch.tensor(cu_lens, dtype=torch.int32),
+        kv_cu_seq_lens=torch.tensor(cu_lens, dtype=torch.int32),
+    )
+
+    backend.prepare(metadata)
+
+    for wrapper, causal in zip(ragged_wrappers, [True, False]):
+        wrapper.plan.assert_called_once()
+        args = wrapper.plan.call_args.args
+        assert args[0] is metadata.q_cu_seq_lens
+        assert args[1] is metadata.kv_cu_seq_lens
+        assert wrapper.plan.call_args.kwargs["causal"] is causal
+
+
+@pytest.mark.parametrize(
+    "q_cu_lens, kv_cu_lens",
+    [
+        pytest.param([0, 2], [0, 3], id="cached-prefix"),
+        pytest.param([0, 2, 5], [0, 2, 6], id="second-request-prefix"),
+        pytest.param([0, 2, 5], [0, 3, 5], id="same-total-different-request-lengths"),
+        pytest.param([0, 3], [0, 2], id="query-longer-than-kv"),
+        pytest.param([], [], id="empty"),
+        pytest.param([0], [0], id="no-requests"),
+        pytest.param([0, 0], [0, 0], id="zero-length-request"),
+        pytest.param([0, 2, 2], [0, 2, 2], id="zero-length-second-request"),
+        pytest.param([0, 3, 2], [0, 3, 2], id="decreasing-lengths"),
+        pytest.param([1, 3], [0, 2], id="missing-query-leading-zero"),
+        pytest.param([0, 2], [1, 3], id="missing-kv-leading-zero"),
+        pytest.param([2], [2], id="per-request-lengths"),
+        pytest.param([0, 2], [0, 2, 5], id="extra-kv-request"),
+        pytest.param([0, 2, 5], [0, 2], id="extra-query-request"),
+        pytest.param([0, 2], None, id="missing-kv-lengths"),
+    ],
+)
+def test_jev_flashinfer_rejects_invalid_cuda_prefix_lengths(
+    _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
+    q_cu_lens: list[int],
+    kv_cu_lens: list[int] | None,
+) -> None:
+    module, _, _ = _jev_flashinfer
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor(q_cu_lens, dtype=torch.int32),
+        kv_seq_lens_host_values=kv_cu_lens,
+    )
+
+    with pytest.raises(ValueError, match="q_len == kv_len"):
+        module.FlashInferBackend._validate_prefix_bidir(metadata)
+
+
+@pytest.mark.parametrize(
+    "mode, value",
+    [
+        ("is_prefill", False),
+        ("is_chunked_prefill", True),
+        ("is_mixed", True),
+        ("is_spec_verify", True),
+    ],
+)
+def test_jev_flashinfer_rejects_non_full_prefix_prefill(
+    _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
+    mode: str,
+    value: bool,
+) -> None:
+    module, _, _ = _jev_flashinfer
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor([0, 2], dtype=torch.int32),
+        kv_seq_lens_host_values=[0, 2],
+    )
+    setattr(metadata, mode, value)
+
+    with pytest.raises(ValueError, match="pure, non-speculative full prefill"):
+        module.FlashInferBackend._validate_prefix_bidir(metadata)
+
+
+def test_jev_flashinfer_requires_cuda_host_query_lengths(
+    _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
+) -> None:
+    module, _, _ = _jev_flashinfer
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=None,
+        kv_seq_lens_host_values=[0, 2],
+    )
+
+    with pytest.raises(ValueError, match="host query lengths"):
+        module.FlashInferBackend._validate_prefix_bidir(metadata)
 
 
 def test_cuda_gdn_loads_native_conv_weight_layout(monkeypatch) -> None:

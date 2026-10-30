@@ -1152,6 +1152,48 @@ TEST_F(NpuXllmOpsTest, Qwen35_27B_TP4_FullAttentionMatchesReference) {
              .item<float>();
 }
 
+TEST_F(NpuXllmOpsTest, FusedInferAttentionPackedBidirectionalPrefill) {
+  py::gil_scoped_acquire gil;
+
+  constexpr int64_t kQueryHeads = 2;
+  constexpr int64_t kKvHeads = 1;
+  constexpr int64_t kHeadDim = 256;
+  const auto cpu_bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+  const torch::Tensor query = torch::zeros({5, kQueryHeads, kHeadDim}, cpu_bf16)
+                                  .to(torch::kPrivateUse1);
+  const torch::Tensor key =
+      torch::zeros({5, kKvHeads, kHeadDim}, cpu_bf16).to(torch::kPrivateUse1);
+  const torch::Tensor value = torch::tensor({1, 3, 5, 7, 9}, cpu_bf16)
+                                  .view({5, 1, 1})
+                                  .expand({5, kKvHeads, kHeadDim})
+                                  .contiguous()
+                                  .to(torch::kPrivateUse1);
+
+  const auto [actual, softmax_lse] =
+      xllm::kernel::npu::npu_fused_infer_attention(
+          query,
+          key,
+          value,
+          /*atten_mask=*/std::nullopt,
+          /*block_table=*/std::nullopt,
+          /*actual_seq_lengths=*/{2, 5},
+          /*actual_seq_lengths_kv=*/{2, 5},
+          kQueryHeads,
+          kKvHeads,
+          /*scale=*/1.0 / 16.0,
+          /*block_size=*/0,
+          /*sparse_mode=*/0,
+          /*input_layout=*/"TND",
+          /*softmax_lse_flag=*/false,
+          /*is_causal=*/false);
+  const torch::Tensor expected = torch::tensor({2, 2, 7, 7, 7}, cpu_bf16)
+                                     .view({5, 1, 1})
+                                     .expand({5, kQueryHeads, kHeadDim});
+
+  EXPECT_EQ(softmax_lse.numel(), 0);
+  EXPECT_TRUE(torch::equal(actual.cpu(), expected));
+}
+
 TEST_F(NpuXllmOpsTest, Qwen35_27B_TP4_KvCacheCrosses128TokenBoundary) {
   py::gil_scoped_acquire gil;
   if (!is_ascend950_device()) {

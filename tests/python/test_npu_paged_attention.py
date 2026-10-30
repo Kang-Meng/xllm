@@ -443,6 +443,91 @@ def test_target_spec_verify_chunk_does_not_use_xfia(monkeypatch: pytest.MonkeyPa
     torch.testing.assert_close(backend._block_table_i32, table)
 
 
+def test_jev_prefix_bidir_uses_full_window_and_keeps_decode_causal(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        scale=0.5,
+        sliding_window=0,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    backend.enable_prefix_bidir()
+    cache = torch.empty(2, 128, 1, 4)
+    backend.bind_kv_caches([LayerCache(key=cache, value=torch.empty_like(cache))])
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        kv_seq_lens=None,
+        kv_seq_lens_host_values=[2, 3],
+        q_cu_seq_lens_host_values=[2, 5],
+        q_cu_seq_lens=torch.tensor([2, 5], dtype=torch.int32),
+        slot_mapping=torch.arange(5),
+    )
+    backend.prepare(metadata)
+    module = sys.modules["xllm.python.attention.npu_paged_attention"]
+    cache_write = []
+    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(cp_context=None))
+    monkeypatch.setattr(module.kernels, "reshape_paged_cache", lambda *args: cache_write.append(args), raising=False)
+    calls = []
+
+    def fused_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: object):
+        calls.append((key, kwargs))
+        return query.clone(), None
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", fused_attention, raising=False)
+    query = torch.randn(5, 2, 4)
+    key = torch.randn(5, 1, 4)
+    bidir_layer = SimpleNamespace(layer_id=0, causal=False, attention_window=None)
+    causal_layer = SimpleNamespace(layer_id=0, causal=True, attention_window=None)
+    torch.testing.assert_close(backend.execute(query, key, key, bidir_layer), query.flatten(1))
+    assert len(cache_write) == 1
+    assert calls[0][0].shape == key.shape
+    assert calls[0][1]["actual_seq_lengths"] == [2, 5]
+    assert calls[0][1]["actual_seq_lengths_kv"] == [2, 5]
+    assert calls[0][1]["atten_mask"] is None
+    assert calls[0][1]["sparse_mode"] == 0
+    assert calls[0][1]["pre_tokens"] == calls[0][1]["next_tokens"] == 2147483647
+    assert "block_table" not in calls[0][1]
+
+    backend.execute(query, key, key, causal_layer)
+    assert calls[1][1]["atten_mask"] is backend._causal_mask
+    assert calls[1][1]["sparse_mode"] == 3
+    assert "block_table" in calls[1][1]
+
+    metadata.is_prefill = False
+    metadata.block_table = None
+    backend.prepare(metadata)
+    monkeypatch.setattr(backend, "_decode", lambda *args: query.flatten(1))
+    torch.testing.assert_close(backend.execute(query, key, key, bidir_layer), query.flatten(1))
+
+
+@pytest.mark.parametrize("bad_q,bad_kv", [([0, 2, 4], [2, 3]), ([1, 2, 5], [2, 3])])
+def test_jev_prefix_bidir_rejects_partial_prefill_before_cache_write(bad_q: list[int], bad_kv: list[int]) -> None:
+    backend = NpuPagedAttentionBackend(2, 1, 4, 0.5, 0, False, torch.device("cpu"), torch.float32)
+    backend.enable_prefix_bidir()
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_cu_seq_lens_host_values=bad_q,
+        kv_seq_lens_host_values=bad_kv,
+    )
+    with pytest.raises(ValueError, match="q_len == kv_len"):
+        backend.prepare(metadata)
+    assert backend._metadata is None
+    metadata.q_cu_seq_lens_host_values = [0, 2, 5]
+    metadata.is_chunked_prefill = True
+    with pytest.raises(ValueError, match="pure"):
+        backend.prepare(metadata)
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("is_spec_verify", [False, None])
 def test_xfia_matching_prompt_chunk_keeps_causal_prefill(

@@ -139,4 +139,33 @@ TEST(SamplingParamsTest, ConcatPadsUnconstrainedRows) {
   EXPECT_EQ(constrained.filter_mask.index({1, 1}).item<float>(), 0.0F);
 }
 
+TEST(SamplingParamsTest, TokenLookupFollowsSampleRowsAndConcatPadding) {
+  RequestSamplingParam queried;
+  queried.logprobs = true;
+  queried.top_logprobs = 2;
+  queried.logprob_token_ids = {5, 1};
+  RequestSamplingParam ordinary;
+  ordinary.logprobs = true;
+  ordinary.top_logprobs = 3;
+  SamplingParameters first;
+  first.init({&ordinary, &queried, &ordinary}, {0, 1, 2}, {1, 0}, {}, {}, {});
+  ASSERT_TRUE(first.logprob_token_ids.defined());
+  EXPECT_TRUE(torch::equal(first.logprob_token_ids,
+                           torch::tensor({{5, 1}, {-1, -1}}, torch::kInt)));
+
+  RequestSamplingParam short_query = queried;
+  short_query.logprob_token_ids = {2};
+  SamplingParameters second;
+  second.init({&short_query}, {0}, {0}, {}, {}, {});
+  first.concat(second);
+  EXPECT_TRUE(
+      torch::equal(first.sample_idxes, torch::tensor({1, 0, 3}, torch::kInt)));
+  ASSERT_EQ(first.logprob_token_ids.sizes(), torch::IntArrayRef({3, 2}));
+  EXPECT_TRUE(
+      torch::equal(first.logprob_token_ids,
+                   torch::tensor({{5, 1}, {-1, -1}, {2, -1}}, torch::kInt)));
+  SamplingParameters moved = first.to(torch::kCPU, torch::kFloat32);
+  EXPECT_TRUE(torch::equal(moved.logprob_token_ids, first.logprob_token_ids));
+}
+
 }  // namespace xllm

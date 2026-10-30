@@ -151,7 +151,11 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                 args.sliding_window(),
                 /*enable_fia_decode=*/
                 should_enable_qwen3_5_fia_decode(args.model_type()),
-                /*dcp_group=*/parallel_args.dcp_group_));
+                /*dcp_group=*/parallel_args.dcp_group_,
+                /*bidirectional_prompt=*/
+                (args.model_type() == "qwen3_5_text" ||
+                 args.model_type() == "qwen3_5_moe_text") &&
+                    args.jev_prompt_attention() == "bidirectional"));
 
   // 7. Fused split_qkv_rmsnorm_mrope kernel setup
   rotary_dim_ = static_cast<int64_t>(head_dim_ * args.partial_rotary_factor());

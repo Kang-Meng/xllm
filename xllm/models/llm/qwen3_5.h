@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -189,6 +190,19 @@ TORCH_MODULE(Qwen3_5ForCausalLM);
           std::unordered_set<int32_t>({args->eos_token_id(), 248046}));        \
   LOAD_ARG_TEXT_OR_ROOT(mamba_ssm_dtype, "mamba_ssm_dtype", "float32")
 
+inline void load_qwen3_5_jev_prompt_attention(const JsonReader& json,
+                                              ModelArgs* args) {
+  const nlohmann::json* jev_mode = json.resolve("jev_prompt_attention");
+  if (jev_mode != nullptr) {
+    CHECK(jev_mode->is_string())
+        << "jev_prompt_attention must be causal or bidirectional";
+    args->jev_prompt_attention() = jev_mode->get<std::string>();
+  }
+  const std::string& mode = args->jev_prompt_attention();
+  CHECK(mode == "causal" || mode == "bidirectional")
+      << "Unsupported jev_prompt_attention: " << mode;
+}
+
 #define LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE(default_model_type)    \
   SET_ARG(model_type, default_model_type);                      \
   LOAD_ARG_OR(dtype, "text_config.dtype", "bfloat16");          \
@@ -203,6 +217,7 @@ REGISTER_CAUSAL_MODEL(qwen3_5_text, Qwen3_5ForCausalLM);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_text");
+  load_qwen3_5_jev_prompt_attention(json, args);
   LOAD_QWEN3_5_NEXT_COMPAT_ARGS(/*moe_intermediate_size=*/0,
                                 /*num_experts=*/0,
                                 /*num_experts_per_tok=*/0,
@@ -216,6 +231,7 @@ REGISTER_CAUSAL_MODEL(qwen3_5_moe_text, Qwen3_5ForCausalLM);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_moe_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_moe_text");
+  load_qwen3_5_jev_prompt_attention(json, args);
   LOAD_QWEN3_5_NEXT_COMPAT_ARGS(/*moe_intermediate_size=*/512,
                                 /*num_experts=*/512,
                                 /*num_experts_per_tok=*/10,

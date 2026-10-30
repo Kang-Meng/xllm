@@ -26,6 +26,7 @@ limitations under the License.
 #include "common/rate_limiter.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
+#include "core/framework/config/model_config.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request_output.h"
@@ -120,9 +121,17 @@ OutputCallback make_capture_callback(CallbackCapture* capture) {
 class LLMRequestFactoryTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    ModelConfig& model_config = ModelConfig::get_instance();
+    original_enable_qwen3_reranker_ = model_config.enable_qwen3_reranker();
+    model_config.enable_qwen3_reranker(false);
     // Simulate the caller (service entry) having acquired a rate-limit slot.
     rate_limiter_.is_limited();
     ASSERT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  }
+
+  void TearDown() override {
+    ModelConfig::get_instance().enable_qwen3_reranker(
+        original_enable_qwen3_reranker_);
   }
 
   std::unique_ptr<LLMRequestFactory> make_factory(
@@ -152,7 +161,176 @@ class LLMRequestFactoryTest : public ::testing::Test {
   ModelArgs model_args_;
   Options options_;
   RateLimiter rate_limiter_;
+  bool original_enable_qwen3_reranker_ = false;
 };
+
+TEST_F(LLMRequestFactoryTest, RerankerRejectsLogprobTokenIdsBeforeEncoding) {
+  auto factory = make_factory();
+  ModelConfig::get_instance().enable_qwen3_reranker(true);
+  RequestParams sp;
+  sp.logprob_token_ids = {1};
+  sp.service_request_id = "reranker-completion";
+  sp.source_xservice_addr = "source-service";
+  CallbackCapture capture;
+
+  auto request = factory->create(/*prompt=*/"FAIL",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(capture.status->message().find("enable_qwen3_reranker"),
+            std::string::npos);
+  EXPECT_EQ(capture.service_request_id, sp.service_request_id);
+  EXPECT_EQ(capture.target_xservice_addr, sp.source_xservice_addr);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, RerankerRejectsChatLogprobTokenIds) {
+  auto factory = make_factory();
+  ModelConfig::get_instance().enable_qwen3_reranker(true);
+  RequestParams sp;
+  sp.logprob_token_ids = {1};
+  CallbackCapture capture;
+
+  auto request = factory->create(/*messages=*/std::vector<Message>{},
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(capture.status->message().find("enable_qwen3_reranker"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, RerankerAcceptsRequestsWithoutLogprobTokenIds) {
+  auto factory = make_factory();
+  ModelConfig::get_instance().enable_qwen3_reranker(true);
+  RequestParams sp;
+  sp.max_tokens = 1;
+  CallbackCapture capture;
+
+  auto request = factory->create(/*prompt=*/"rerank this prompt",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+}
+
+TEST_F(LLMRequestFactoryTest, JevRejectsMissingLogprobTokenIds) {
+  auto factory = make_factory();
+  model_args_.jev_prompt_attention("bidirectional");
+  RequestParams sp;
+  sp.max_tokens = 1;
+  CallbackCapture capture;
+
+  auto request = factory->create(/*prompt=*/"answer<think>\n\n</think>\n\n",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, JevRejectsStreamingEvenWhenBestOfDisablesIt) {
+  auto factory = make_factory();
+  model_args_.jev_prompt_attention("bidirectional");
+  RequestParams sp;
+  sp.max_tokens = 1;
+  sp.best_of = 2;
+  sp.completion_stream_requested = true;
+  sp.logprob_token_ids = {1};
+  CallbackCapture capture;
+
+  auto request = factory->create(/*prompt=*/"answer<think>\n\n</think>\n\n",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, JevComparesEncodedTokenSuffixNotPromptText) {
+  auto factory = make_factory();
+  model_args_.jev_prompt_attention("bidirectional");
+  RequestParams sp;
+  sp.max_tokens = 1;
+  sp.logprob_token_ids = {1};
+  CallbackCapture capture;
+
+  auto request =
+      factory->create(/*prompt=*/"answer<think>\n\n</think>\n\n",
+                      /*prompt_tokens=*/std::vector<int32_t>{1, 2, 3},
+                      sp,
+                      /*call=*/std::nullopt,
+                      make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(
+      capture.status->message(),
+      "Bidirectional Jev prompt does not match the required token suffix");
+  EXPECT_EQ(capture.status->message().find("<think>"), std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, JevAcceptsEncodedCompletionSuffix) {
+  auto factory = make_factory();
+  model_args_.jev_prompt_attention("bidirectional");
+  RequestParams sp;
+  sp.request_id = "jev-completion";
+  sp.max_tokens = 1;
+  sp.logprob_token_ids = {1};
+  CallbackCapture capture;
+
+  auto request = factory->create(/*prompt=*/"answer<think>\n\n</think>\n\n",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+}
+
+TEST_F(LLMRequestFactoryTest, JevRejectsChatBeforeRendering) {
+  auto factory = make_factory();
+  model_args_.jev_prompt_attention("bidirectional");
+  RequestParams sp;
+  sp.max_tokens = 1;
+  sp.logprob_token_ids = {1};
+  CallbackCapture capture;
+
+  auto request = factory->create(/*messages=*/std::vector<Message>{},
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
 
 TEST_F(LLMRequestFactoryTest, RejectsEmptyPromptAndReleasesRateLimitSlot) {
   auto factory = make_factory();

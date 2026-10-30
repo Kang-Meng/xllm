@@ -2081,6 +2081,7 @@ def _run_kda_decode_step(
 
 def _mla_handoff_backend(nope_cache: torch.Tensor, index_cache: torch.Tensor) -> NpuPagedAttentionBackend:
     backend = object.__new__(NpuPagedAttentionBackend)
+    backend._prefix_bidir_enabled = False
     backend._kv_caches = [LayerCache(key=nope_cache, value=None, index=index_cache)]
     backend._metadata = None
     backend._is_mla = True

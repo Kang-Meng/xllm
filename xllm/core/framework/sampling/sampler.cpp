@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <limits>
 
 #include "common/global_flags.h"
 #include "core/framework/config/model_config.h"
@@ -37,7 +38,7 @@ void Sampler::publish_logits(torch::Tensor& logits,
     return;
   }
   logits = logits.to(sample_logits.scalar_type());
-  logits.index_copy_(/*dim=*/0, sample_idxes, sample_logits);
+  logits.index_copy_(/*dim=*/0, sample_idxes.to(torch::kLong), sample_logits);
 }
 
 torch::Tensor Sampler::apply_logits_processors(
@@ -96,6 +97,24 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
                               const torch::Tensor& filter_mask) const {
   const torch::ScalarType prob_dtype = logits.scalar_type();
   SampleOutput output;
+  torch::Tensor queried_logprobs;
+  torch::Tensor query_ids;
+  torch::Tensor query_valid;
+  torch::Tensor query_rows;
+  if (params.logprob_token_ids.defined()) {
+    query_valid = params.logprob_token_ids.ge(0);
+    query_rows = query_valid.any(/*dim=*/1).nonzero().view({-1});
+    if (query_rows.numel() > 0) {
+      query_ids = params.logprob_token_ids.index_select(/*dim=*/0, query_rows);
+      query_valid = query_valid.index_select(/*dim=*/0, query_rows);
+      const torch::Tensor query_sample_idxes =
+          params.sample_idxes.index_select(/*dim=*/0, query_rows);
+      const torch::Tensor original_rows =
+          logits.index_select(/*dim=*/0, query_sample_idxes);
+      queried_logprobs = torch::log_softmax(
+          original_rows, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+    }
+  }
   torch::Tensor sample_logits =
       apply_logits_processors(logits, params, filter_mask);
 
@@ -205,6 +224,27 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       const int64_t k =
           std::min<int64_t>(params.max_top_logprobs, logprobs.size(-1));
       auto [values, indices] = logprobs.topk(k, /*dim=*/-1);
+      if (params.logprob_token_ids.defined()) {
+        CHECK_LE(params.logprob_token_ids.size(1), k);
+      }
+      if (queried_logprobs.defined()) {
+        torch::Tensor requested = queried_logprobs.gather(
+            /*dim=*/1, query_ids.clamp_min(0).to(torch::kLong));
+        torch::Tensor query_values =
+            torch::full({query_rows.numel(), k},
+                        -std::numeric_limits<float>::infinity(),
+                        values.options());
+        torch::Tensor query_tokens =
+            torch::full({query_rows.numel(), k}, -1, indices.options());
+        query_values.slice(/*dim=*/1, /*start=*/0, /*end=*/query_ids.size(1))
+            .copy_(
+                requested.masked_fill(query_valid.logical_not(),
+                                      -std::numeric_limits<float>::infinity()));
+        query_tokens.slice(/*dim=*/1, /*start=*/0, /*end=*/query_ids.size(1))
+            .copy_(query_ids.to(torch::kLong));
+        values.index_copy_(/*dim=*/0, query_rows, query_values);
+        indices.index_copy_(/*dim=*/0, query_rows, query_tokens);
+      }
       output.top_logprobs = values;
       output.top_tokens = indices;
     }

@@ -36,6 +36,7 @@ struct RequestSamplingParam {
   int64_t top_k = -1;
   bool logprobs = false;
   int64_t top_logprobs = 0;
+  std::vector<int32_t> logprob_token_ids;
   bool do_sample = false;
   bool is_embeddings = false;
   bool json_object = false;
@@ -174,6 +175,9 @@ struct SamplingParameters {
 
   // whether to get the embeddings of the tokens. used by embeddings model.
   bool is_embeddings = false;
+
+  // [num_sampled_seqs, max_queried_ids] IntTensor; -1 marks padding.
+  torch::Tensor logprob_token_ids;
 
   // max number of top logprobs in the batch.
   // only used when logprobs is true.

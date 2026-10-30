@@ -26,6 +26,7 @@ limitations under the License.
 #include "chat.pb.h"
 #include "completion.pb.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/sampling/sampling_params.h"
 #include "multimodal.pb.h"
 
 namespace xllm {
@@ -436,6 +437,62 @@ TEST(RequestParamsTest, AnthropicToolSchemaUsesPlainJson) {
   nlohmann::json expected_tool_choice = {
       {"type", "function"}, {"function", {{"name", "list_files"}}}};
   EXPECT_EQ(nlohmann::json::parse(params.tool_choice), expected_tool_choice);
+}
+
+TEST(RequestParamsTest, CompletionTokenLookupProjectsSamplingParams) {
+  proto::CompletionRequest request;
+  request.set_max_tokens(1);
+  request.add_logprob_token_ids(7);
+  request.add_logprob_token_ids(2);
+  RequestParams params(request, "", "");
+
+  EXPECT_FALSE(verify(params).has_value());
+  EXPECT_TRUE(params.logprobs);
+  EXPECT_EQ(params.top_logprobs, 2);
+  EXPECT_EQ(params.logprob_token_ids, (std::vector<int32_t>{7, 2}));
+  const RequestSamplingParam sampling = params.to_sampling_param(/*best_of=*/1);
+  EXPECT_EQ(sampling.logprob_token_ids, params.logprob_token_ids);
+}
+
+TEST(RequestParamsTest, CompletionTokenLookupRejectsInvalidContracts) {
+  const auto check = [](const proto::CompletionRequest& request,
+                        const std::string& parameter) {
+    RequestParams params(request, "", "");
+    const std::optional<Status> error = verify(params);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->param(), parameter);
+  };
+  proto::CompletionRequest request;
+  request.set_max_tokens(1);
+  request.add_logprob_token_ids(4);
+
+  request.set_stream(true);
+  check(request, "stream");
+  request.set_stream(false);
+  request.set_logprobs(2);
+  check(request, "logprobs");
+  request.clear_logprobs();
+  request.set_max_tokens(2);
+  check(request, "max_tokens");
+  request.set_max_tokens(1);
+  request.set_beam_width(2);
+  check(request, "beam_width");
+  request.set_beam_width(1);
+  request.set_n(2);
+  check(request, "n");
+  request.set_n(1);
+  request.set_best_of(2);
+  check(request, "best_of");
+  request.clear_best_of();
+  request.add_logprob_token_ids(4);
+  check(request, "logprob_token_ids");
+  request.set_logprob_token_ids(1, -1);
+  check(request, "logprob_token_ids");
+  request.clear_logprob_token_ids();
+  for (int32_t id = 0; id < 257; ++id) {
+    request.add_logprob_token_ids(id);
+  }
+  check(request, "logprob_token_ids");
 }
 
 }  // namespace

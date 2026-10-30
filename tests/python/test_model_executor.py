@@ -1074,6 +1074,161 @@ class TestCreateAttentionBackend:
 
 
 class TestModelExecutorConstruction:
+    @pytest.mark.parametrize("use_xfia_decode", [False, True])
+    @pytest.mark.parametrize(
+        "model_type,jev_prompt_attention",
+        [
+            ("dflash", None),
+            ("dflash2", "causal"),
+            ("dflash2", "bidirectional"),
+            ("qwen3_5", None),
+            ("qwen3_5", "causal"),
+        ],
+    )
+    def test_non_jev_noncausal_attention_keeps_draft_backend(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model_type: str,
+        jev_prompt_attention: str | None,
+        use_xfia_decode: bool,
+    ) -> None:
+        pytest.importorskip("torch_npu")
+        from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+        backend = NpuPagedAttentionBackend(
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            scale=0.125,
+            sliding_window=0,
+            is_mla=False,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            use_xfia_decode=use_xfia_decode,
+            xfia_query_width=2,
+        )
+        model = _FakeModel(num_layers=1, head_dim=128)
+        model.layers[0].causal = False
+        # Mock only the device boundary; keep real executor initialization and backend state changes.
+        parameter = SimpleNamespace(device=torch.device("privateuseone"), dtype=torch.float32)
+        monkeypatch.setattr(model, "parameters", lambda: iter([parameter]))
+        monkeypatch.setattr(
+            sys.modules[ModelExecutor.__module__], "_create_attention_backend", lambda *args, **kwargs: backend
+        )
+        config = {"model_type": model_type, "python_graph_backend": "off"}
+        if jev_prompt_attention is not None:
+            config["jev_prompt_attention"] = jev_prompt_attention
+        executor = ModelExecutor(model, config, max_seqs_per_batch=1, is_spec_draft=True)
+
+        assert executor.attention_backend is backend
+        assert executor.eager_runner.attention_backend is backend
+        assert not backend._prefix_bidir_enabled
+        assert backend._use_xfia_decode is use_xfia_decode
+        cache = torch.empty(1, 128, 2, 128)
+        backend.bind_kv_caches([LayerCache(key=cache, value=torch.empty_like(cache))])
+        metadata = SimpleNamespace(
+            is_prefill=False,
+            is_chunked_prefill=True,
+            is_mixed=False,
+            is_spec_verify=False,
+            is_dflash_proposal=True,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            kv_seq_lens=torch.tensor([4], dtype=torch.int32),
+            kv_seq_lens_host_values=[4],
+            q_cu_seq_lens=torch.tensor([0, 2], dtype=torch.int32),
+            slot_mapping=torch.tensor([2, 3], dtype=torch.int64),
+        )
+        backend.prepare(metadata)
+        assert backend._metadata is metadata
+        if use_xfia_decode:
+            assert backend._xfia_kv_lengths.tolist() == [4, 4]
+        else:
+            assert backend._actual_seq_lens == [2]
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"])
+    @pytest.mark.parametrize("q_cu_lens", [[2], [0, 2]])
+    def test_jev_config_enables_prefix_bidir_and_rejects_chunked_prefill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model_type: str,
+        q_cu_lens: list[int],
+    ) -> None:
+        pytest.importorskip("torch_npu")
+        from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+        backend = NpuPagedAttentionBackend(8, 2, 64, 0.125, 0, False, torch.device("cpu"), torch.float32)
+        model = _FakeModel(num_layers=1)
+        model.layers[0].causal = False
+        parameter = SimpleNamespace(device=torch.device("privateuseone"), dtype=torch.float32)
+        monkeypatch.setattr(model, "parameters", lambda: iter([parameter]))
+        monkeypatch.setattr(
+            sys.modules[ModelExecutor.__module__], "_create_attention_backend", lambda *args, **kwargs: backend
+        )
+        executor = ModelExecutor(
+            model,
+            {"model_type": model_type, "jev_prompt_attention": "bidirectional", "python_graph_backend": "off"},
+            max_seqs_per_batch=1,
+        )
+
+        assert executor.attention_backend is backend
+        assert backend._prefix_bidir_enabled
+        metadata = SimpleNamespace(
+            is_prefill=True,
+            is_chunked_prefill=False,
+            is_mixed=False,
+            is_spec_verify=False,
+            block_table=None,
+            kv_seq_lens=None,
+            q_cu_seq_lens_host_values=q_cu_lens,
+            kv_seq_lens_host_values=[2],
+        )
+        backend.prepare(metadata)
+        assert backend._metadata is metadata
+        assert backend._actual_seq_lens == [2]
+        metadata.is_chunked_prefill = True
+        with pytest.raises(ValueError, match="pure, non-speculative full prefill"):
+            backend.prepare(metadata)
+
+    def test_jev_prefix_bidir_accepts_dummy_prefill_host_geometry(self) -> None:
+        pytest.importorskip("torch_npu")
+        from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+        backend = NpuPagedAttentionBackend(8, 2, 64, 0.125, 0, False, torch.device("cpu"), torch.float32)
+        backend.enable_prefix_bidir()
+        metadata = SimpleNamespace(
+            is_dummy=True,
+            is_prefill=True,
+            is_chunked_prefill=False,
+            is_mixed=False,
+            is_spec_verify=False,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            kv_seq_lens=torch.tensor([1], dtype=torch.int32),
+            q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+            q_cu_seq_lens_host_values=[0, 1],
+            kv_seq_lens_host_values=[1],
+            logical_block_size=128,
+        )
+        backend.prepare(metadata)
+        assert backend._metadata is metadata
+        assert backend._actual_seq_lens == [1]
+
+    @pytest.mark.parametrize("q_cu_lens", [[], None])
+    def test_jev_prefix_bidir_rejects_empty_query_cumulative_lengths(self, q_cu_lens: list[int] | None) -> None:
+        pytest.importorskip("torch_npu")
+        from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+        metadata = SimpleNamespace(
+            is_prefill=True,
+            is_chunked_prefill=False,
+            is_mixed=False,
+            is_spec_verify=False,
+            q_cu_seq_lens_host_values=q_cu_lens,
+            q_seq_lens_host=torch.tensor([2], dtype=torch.int32),
+            kv_seq_lens_host_values=[2],
+        )
+        with pytest.raises(ValueError, match="non-empty host cumulative query lengths"):
+            NpuPagedAttentionBackend._validate_prefix_bidir(metadata)
+
     @pytest.mark.parametrize("kv_page_size", [64, 128])
     @pytest.mark.parametrize("supported", [False, True])
     @patch(

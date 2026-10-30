@@ -15,8 +15,10 @@ limitations under the License.
 
 #include "attention.h"
 
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,8 +31,10 @@ limitations under the License.
 
 namespace {
 
+using xllm::layer::detail::kFiaSparseModeNone;
 using xllm::layer::detail::make_decode_actual_seq_lengths;
 using xllm::layer::detail::resolve_fia_sparse_mode;
+using xllm::layer::detail::validate_jev_full_prefill;
 
 xllm::npu::FusedInferAttentionWorkspaceSignature
 make_fused_infer_attention_workspace_signature(
@@ -189,13 +193,15 @@ AttentionImpl::AttentionImpl(int64_t num_heads,
                              int64_t num_kv_heads,
                              int64_t sliding_window,
                              bool enable_fia_decode,
-                             ProcessGroup* dcp_group)
+                             ProcessGroup* dcp_group,
+                             bool bidirectional_prompt)
     : num_heads_(num_heads),
       head_size_(head_size),
       num_kv_heads_(num_kv_heads),
       sliding_window_(sliding_window),
       scale_(scale),
       enable_fia_decode_(enable_fia_decode),
+      bidirectional_prompt_(bidirectional_prompt),
       dcp_group_(dcp_group) {
   if (sliding_window_ > -1) {
     sliding_window_ = sliding_window_ - 1;
@@ -213,6 +219,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
 
   if (attn_metadata.is_dummy) {
     return std::make_tuple(output, output_lse);
+  }
+
+  if (bidirectional_prompt_ &&
+      (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill ||
+       attn_metadata.is_mixed)) {
+    const std::optional<std::string> error =
+        validate_jev_full_prefill(attn_metadata, query.size(0));
+    CHECK(!error.has_value()) << error.value_or("");
+    CHECK(dcp_group_ == nullptr)
+        << "JEV native bidirectional prefill does not support DCP";
   }
 
   const bool only_prefill =
@@ -274,13 +290,18 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
     key = key.view({-1, num_kv_heads_, head_size_});
     value = value.view({-1, num_kv_heads_, head_size_});
 
+    const bool bidirectional = bidirectional_prompt_;
+    constexpr int64_t kFullAttentionWindow =
+        std::numeric_limits<int32_t>::max();
+    const std::optional<torch::Tensor> mask =
+        !bidirectional && attn_metadata.fia_attn_mask.defined()
+            ? std::make_optional(attn_metadata.fia_attn_mask)
+            : std::nullopt;
     auto fia_result = xllm::kernel::npu::npu_fused_infer_attention(
         query,
         key,
         value,
-        attn_metadata.fia_attn_mask.defined()
-            ? std::make_optional(attn_metadata.fia_attn_mask)
-            : std::nullopt,
+        mask,
         std::nullopt,
         attn_metadata.q_cu_seq_lens_host_vec,
         attn_metadata.kv_cu_seq_lens_host_vec,
@@ -288,12 +309,16 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
         num_kv_heads_,
         scale_,
         /*block_size=*/0,
-        /*sparse_mode=*/resolve_fia_sparse_mode(attn_metadata),
+        /*sparse_mode=*/
+        bidirectional ? kFiaSparseModeNone
+                      : resolve_fia_sparse_mode(attn_metadata),
         "TND",
         /*softmax_lse_flag=*/false,
-        /*is_causal=*/attn_metadata.is_causal,
-        /*pre_tokens=*/attn_metadata.fia_pre_tokens,
-        /*next_tokens=*/attn_metadata.fia_next_tokens);
+        /*is_causal=*/!bidirectional && attn_metadata.is_causal,
+        /*pre_tokens=*/
+        bidirectional ? kFullAttentionWindow : attn_metadata.fia_pre_tokens,
+        /*next_tokens=*/
+        bidirectional ? kFullAttentionWindow : attn_metadata.fia_next_tokens);
     output.copy_(std::get<0>(fia_result).view_as(output));
   } else if (attn_metadata.is_chunked_prefill) {
     torch::Tensor k = k_cache.view({k_cache.size(0), k_cache.size(1), -1});

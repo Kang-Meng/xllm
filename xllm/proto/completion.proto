@@ -21,7 +21,7 @@ package xllm.proto;
 import "common.proto";
 import "rec.proto";
 
-// Next ID: 41
+// Next ID: 44
 message CompletionRequest {
   // ID of the model to use. (required)
   // You can use the ListModels endpoint to list available models.
@@ -141,6 +141,9 @@ message CompletionRequest {
   // whether to include stop strings or stop tokens in the output text.
   // default = false
   optional bool include_stop_str_in_output = 42;
+
+  // Request full-vocabulary log probabilities for token IDs at one generation step.
+  repeated int32 logprob_token_ids = 43;
 }
 
 message LogProbs {
@@ -151,6 +154,10 @@ message LogProbs {
   repeated int32 token_ids = 3 [json_name="token_ids"];
 
   // rpc doesn't allow: repeated map<string, float> top_logprobs = 4;
+
+  // Return token IDs and their full-vocabulary log probabilities in request order.
+  repeated int32 queried_token_ids = 5 [json_name="queried_token_ids"];
+  repeated float queried_token_logprobs = 6 [json_name="queried_token_logprobs"];
 }
 
 message Choice {

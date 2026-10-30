@@ -24,6 +24,42 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(ForwardInputTest, SamplingBufferPlanIncludesQueriedTokenIds) {
+  ForwardInput source;
+  source.sampling_params.logprob_token_ids =
+      torch::tensor({{7, -1}, {11, 13}}, torch::kInt32);
+  source.decoder_sampling_params.logprob_token_ids =
+      torch::tensor({{17, -1}}, torch::kInt32);
+  ForwardInput target;
+  detail::ForwardInputBufferPlan plan;
+
+  ASSERT_TRUE(detail::add_sampling_to_plan(
+      source.sampling_params, target.sampling_params, plan));
+  ASSERT_TRUE(detail::add_sampling_to_plan(
+      source.decoder_sampling_params, target.decoder_sampling_params, plan));
+  ASSERT_EQ(plan.entries.size(), 2u);
+  EXPECT_EQ(plan.entries[0].target, &target.sampling_params.logprob_token_ids);
+  EXPECT_EQ(plan.entries[1].target,
+            &target.decoder_sampling_params.logprob_token_ids);
+  EXPECT_TRUE(torch::equal(plan.entries[0].host_tensor,
+                           source.sampling_params.logprob_token_ids));
+  EXPECT_TRUE(torch::equal(plan.entries[1].host_tensor,
+                           source.decoder_sampling_params.logprob_token_ids));
+  EXPECT_GT(plan.prepare_layout(), 0u);
+  EXPECT_LT(plan.entries[0].offset, plan.entries[1].offset);
+}
+
+TEST(ForwardInputTest, SamplingBufferPlanSkipsUndefinedQueriedTokenIds) {
+  SamplingParameters source;
+  SamplingParameters target;
+  detail::ForwardInputBufferPlan plan;
+  ASSERT_TRUE(detail::add_sampling_to_plan(source, target, plan));
+  for (const auto& entry : plan.entries) {
+    EXPECT_NE(entry.target, &target.logprob_token_ids);
+  }
+  EXPECT_FALSE(target.logprob_token_ids.defined());
+}
+
 TEST(ForwardOutputTest, NonDriverFailureIsReturnedWhenEplbIsDisabled) {
   std::optional<ForwardOutput> output = make_non_driver_forward_output(
       ForwardOutput{}, {"request-a"}, /*eplb_enabled=*/false);

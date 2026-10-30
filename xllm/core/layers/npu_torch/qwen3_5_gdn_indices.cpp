@@ -19,7 +19,7 @@ limitations under the License.
 
 #include <limits>
 #include <optional>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 
 #include "core/common/constants.h"
@@ -29,21 +29,45 @@ namespace xllm::layer::qwen3_5_gdn_internal {
 
 void check_live_slots(const std::vector<int32_t>& live_slots,
                       int64_t batch_size,
-                      int64_t num_slots) {
+                      int64_t num_slots,
+                      const std::vector<int32_t>* read_slots,
+                      const std::vector<int64_t>* validity_mask) {
   CHECK_EQ(static_cast<int64_t>(live_slots.size()), batch_size)
       << "linear_state_ids must be sequence-scoped.";
   CHECK_GT(num_slots, 0) << "GDN cache must contain at least one slot.";
-  std::unordered_set<int32_t> unique_slots;
-  unique_slots.reserve(live_slots.size());
-  for (const int32_t slot : live_slots) {
+  std::unordered_map<int32_t, size_t> first_row_by_slot;
+  first_row_by_slot.reserve(live_slots.size());
+  for (size_t row = 0; row < live_slots.size(); ++row) {
+    const int32_t slot = live_slots[row];
     CHECK_GE(slot, 0) << "GDN live slot must be non-negative.";
     CHECK_LT(static_cast<int64_t>(slot), num_slots)
         << "GDN live slot exceeds cache capacity.";
-    if (slot != kPaddingLinearStateId) {
-      CHECK(unique_slots.emplace(slot).second)
-          << "GDN write slots must be unique within a batch, duplicate="
-          << slot;
+    if (slot == kPaddingLinearStateId) {
+      continue;
     }
+    const auto [first, inserted] = first_row_by_slot.emplace(slot, row);
+    if (!inserted) {
+      LOG(ERROR) << "GDN duplicate write slot at worker: first_row="
+                 << first->second << " row=" << row << " write=" << slot
+                 << " first_read="
+                 << (read_slots && first->second < read_slots->size()
+                         ? (*read_slots)[first->second]
+                         : live_slots[first->second])
+                 << " read="
+                 << (read_slots && row < read_slots->size() ? (*read_slots)[row]
+                                                            : slot)
+                 << " first_valid="
+                 << (validity_mask && first->second < validity_mask->size()
+                         ? (*validity_mask)[first->second]
+                         : -1)
+                 << " valid="
+                 << (validity_mask && row < validity_mask->size()
+                         ? (*validity_mask)[row]
+                         : -1)
+                 << " batch_size=" << batch_size;
+    }
+    CHECK(inserted)
+        << "GDN write slots must be unique within a batch, duplicate=" << slot;
   }
 }
 
@@ -62,7 +86,8 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
     int64_t num_slots,
     const torch::Device& device) {
   const int64_t batch_size = static_cast<int64_t>(live_slots.size());
-  check_live_slots(live_slots, batch_size, num_slots);
+  check_live_slots(
+      live_slots, batch_size, num_slots, &read_slots, &validity_mask);
   CHECK_EQ(static_cast<int64_t>(validity_mask.size()), batch_size)
       << "linear_state_validity_mask must be sequence-scoped.";
   CHECK(read_slots.empty() ||
