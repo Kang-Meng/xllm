@@ -706,6 +706,7 @@ def test_slice_output_preserves_aux_hidden_tuple() -> None:
 
 def test_linear_state_graph_buffers_are_stable() -> None:
     runner = _runner()
+    runner.layer_caches = [SimpleNamespace(kpool_tail=torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16))]
     input_ids = torch.arange(4, dtype=torch.int32)
     positions = torch.arange(4, dtype=torch.int32)
     metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))

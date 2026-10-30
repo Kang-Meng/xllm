@@ -171,6 +171,22 @@ def _register_builtin_models() -> None:
         execution_metadata_builders=_QWEN3_5_EXECUTION_METADATA_BUILDERS,
     )
     _register_model_path(
+        "xllm.python.models.qwen3_5_mtp",
+        "Qwen3_5MtpForCausalLM",
+        "qwen3_5_mtp",
+        "qwen3_5_moe_mtp",
+        execution_metadata_builders=(
+            (
+                "xllm.python.layers.sequence_parallel",
+                "SpMetadataBuilder",
+            ),
+            (
+                "xllm.python.layers.npu.qwen3_5.moe_metadata_builder",
+                "Qwen3_5MoeMetadataBuilder",
+            ),
+        ),
+    )
+    _register_model_path(
         "xllm.python.models.qwen3_dspark",
         "Qwen3DSparkForCausalLM",
         "DSparkDraftModel",

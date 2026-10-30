@@ -69,10 +69,7 @@ inline bool load_model_args(const JsonReader& json,
   return true;
 }
 
-inline void configure_mtp_args(ModelArgs& args, bool is_python_model) {
-  if (is_python_model) {
-    return;
-  }
+inline void configure_mtp_args(ModelArgs& args, bool /*is_python_model*/) {
   const int32_t mtp_layers =
       std::max<int32_t>(args.num_nextn_predict_layers(), 1);
   args.num_nextn_predict_layers(mtp_layers);

@@ -22,6 +22,7 @@ from .draft_weight_loaders import (
 from .module_loaders import (
     load_causal_lm_weights,
     load_gqa_fused_attention,
+    load_lm_head,
 )
 from .parallel_load_context import ParallelLoadContext
 from .scoped_weight_loader import (
@@ -44,6 +45,7 @@ __all__ = [
     "load_draft_embedding_if_present",
     "load_draft_lm_head_if_present",
     "load_gqa_fused_attention",
+    "load_lm_head",
     "load_missing_draft_vocab_from_quarot_target",
     "shard_tensor",
 ]

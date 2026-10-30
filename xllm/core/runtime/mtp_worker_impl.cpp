@@ -1296,7 +1296,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     std::vector<ForwardOutput> draft_outputs;
     draft_outputs.reserve(options_.num_speculative_tokens());
 
-    ForwardInput new_input = input;
+    // Empty ranks still replay the same draft graph as ranks with target
+    // context.
+    ForwardInput draft_input = input;
+    draft_input.input_params.embedding.input_embedding =
+        embedding_cache_->embedding_placeholder().unsqueeze(0);
+    ForwardInput new_input = draft_input;
     CHECK(draft_context_replay_policy_.has_value())
         << "Draft context replay policy is not initialized.";
     const int32_t extend_width =
@@ -1328,7 +1333,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
       draft_outputs.emplace_back(
-          run_worker_no_sync(*draft_impl_, input, draft_step_prepared[i])
+          run_worker_no_sync(*draft_impl_, draft_input, draft_step_prepared[i])
               .value());
     }
 
@@ -1348,7 +1353,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     finalize_output_on_stream(
         output, *compute_stream_, enable_schedule_overlap());
     if (can_prelaunch_next_first_draft(input)) {
-      ForwardInput next_first_draft_input = input;
+      ForwardInput next_first_draft_input = draft_input;
       for (int32_t& token_num :
            next_first_draft_input.input_params.parallel.dp_global_token_nums) {
         token_num *= 2;
@@ -3371,6 +3376,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     }
   }
 
+  specBuilder::update_execution_batch_metadata(
+      input_params, std::vector<int32_t>(num_sequences, num_val_tokens));
+
   if (impl_->has_request_state_cache()) {
     specBuilder::set_kpool_verify_metadata(
         input_params, std::vector<int32_t>(num_sequences, num_val_tokens));
@@ -3835,6 +3843,9 @@ void MTPWorkerImpl::prepare_validate_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/true);
   }
+
+  specBuilder::update_execution_batch_metadata(input_params,
+                                               per_seq_val_tokens);
 
   update_sampling_params(
       validate_input.sampling_params, per_seq_val_tokens, total_num_val_tokens);

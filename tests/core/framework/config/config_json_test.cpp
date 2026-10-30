@@ -299,20 +299,33 @@ std::filesystem::path config_test_file_path() {
   return std::filesystem::path("tests/core/framework/config/config_test.json");
 }
 
-TEST(ModelConfigValidationTest, RejectsQwen35PythonSpeculativeDecode) {
+TEST(ModelConfigValidationTest,
+     RejectsUnsupportedQwen35PythonSpeculativeDecode) {
   const std::optional<std::string> error =
       ModelConfig::validate_python_speculative_decode(
-          "python", "qwen3_5_moe_text", "MTP", 4);
+          "python", "qwen3_5_moe_text", "Eagle3", 4);
 
   ASSERT_TRUE(error.has_value());
   EXPECT_NE(error->find("does not support speculative decoding"),
             std::string::npos);
   EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                  "py", "qwen3_5_text", "MTP", 1)
+                  "py", "qwen3_5_text", "Eagle3", 1)
                   .has_value());
 }
 
 TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
+#if defined(USE_NPU)
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "python", "qwen3_5_moe_text", "MTP", 3)
+                   .has_value());
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "py", "qwen3_5_text", "MTP", 3)
+                   .has_value());
+#else
+  EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                  "python", "qwen3_5_text", "MTP", 3)
+                  .has_value());
+#endif
   EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
                    "python", "qwen3_5_text", "MTP", 0)
                    .has_value());

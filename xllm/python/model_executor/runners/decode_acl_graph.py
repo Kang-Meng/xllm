@@ -2005,8 +2005,10 @@ class DecodeAclGraphRunner(BaseRunner):
         padded_num_tokens: int,
         verify_width: int,
     ) -> tuple[int, ...]:
-        if self.dp_size > 1 and verify_width > 1 and self._uses_compressed_kpool_tail():
-            return _complete_kpool_groups(padded_num_tokens, verify_width)
+        if self.dp_size > 1 and verify_width > 1:
+            return self._canonical_kpool_query_lens(padded_num_tokens, verify_width)
+        if not self._uses_compressed_kpool_tail():
+            return ()
         return self._padded_kpool_query_lens(
             metadata,
             num_tokens,

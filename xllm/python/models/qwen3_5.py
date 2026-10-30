@@ -224,7 +224,14 @@ class Qwen3_5Config:
         )
 
     @classmethod
-    def prepare_execution_config(cls, config: dict, device: torch.device) -> Qwen3_5Config:
+    def prepare_execution_config(
+        cls,
+        config: dict,
+        device: torch.device,
+        *,
+        allow_speculative_decoding: bool = False,
+        allow_draft_engine: bool = False,
+    ) -> Qwen3_5Config:
         """Resolve the Qwen3.5 parallel execution policy for one host.
 
         Every host that embeds the Qwen3.5 stack (the causal LM itself and
@@ -232,6 +239,9 @@ class Qwen3_5Config:
         sequence-parallel state the same way. The resolved
         ``sequence_parallel_enabled`` is written back into ``config`` because
         the execution metadata builders consume it from that shared dict.
+        Hosts that support speculative decoding opt in explicitly; other
+        hosts retain the default restriction. MTP drafts also opt in to the
+        draft-engine path explicitly.
         """
         cfg = cls.from_dict(config)
         decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
@@ -242,9 +252,11 @@ class Qwen3_5Config:
             and not cfg.enable_mega_moe
         )
         if ordinary_lv2:
-            if int(config.get("cp_size", 1)) != 1 or int(config.get("num_speculative_tokens", 0)) != 0:
-                raise NotImplementedError("Qwen3.5 EPLv2 requires CP=1 and no speculative decoding")
-            if bool(config.get("is_draft_engine", False)):
+            if int(config.get("cp_size", 1)) != 1:
+                raise NotImplementedError("Qwen3.5 EPLv2 requires CP=1")
+            if int(config.get("num_speculative_tokens", 0)) != 0 and not allow_speculative_decoding:
+                raise NotImplementedError("This Qwen3.5 host does not support speculative decoding with EPLv2")
+            if bool(config.get("is_draft_engine", False)) and not allow_draft_engine:
                 raise NotImplementedError("Qwen3.5 EPLv2 does not support draft engines")
             # Python BF16 EP does not use the C++ fused-MC2 mode.
             if bool(config.get("enable_eplb", False)):
@@ -448,7 +460,7 @@ class Qwen3_5ForCausalLM(PyModelBase):
         super().__init__()
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
-        self.cfg = Qwen3_5Config.prepare_execution_config(config, device)
+        self.cfg = Qwen3_5Config.prepare_execution_config(config, device, allow_speculative_decoding=True)
         self.dtype = dtype
         self.device = device
         self.model = Qwen3_5Model(self.cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]

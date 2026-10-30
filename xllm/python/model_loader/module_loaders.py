@@ -201,7 +201,7 @@ def load_gqa_fused_attention(
         state.load_tensor(module.k_norm.weight, "k_norm.weight")
 
 
-def _load_lm_head(
+def load_lm_head(
     lm_head_weight: torch.Tensor,
     backbone: ScopedWeightLoader,
     all_weights: ScopedWeightLoader,
@@ -252,7 +252,7 @@ def load_causal_lm_weights(
         layer.load_weights(backbone.with_prefix(f"layers.{i}."), context)
     backbone.load_tensor(model.norm.weight, "norm.weight")
     if lm_head_weight is not None:
-        _load_lm_head(
+        load_lm_head(
             lm_head_weight,
             backbone,
             all_weights,

@@ -350,3 +350,23 @@ def test_non_capturable_moe_quant_mode_is_never_admitted() -> None:
     # Marker present and False: never admit, regardless of the batch shape.
     backend.moe_graph_capturable = False
     assert not runner.can_execute(input_ids, metadata)
+
+
+@pytest.mark.parametrize("num_sequences", [1, 2])
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_non_kpool_verify_graph_key_matches_empty_dp(num_sequences: int, dp_size: int) -> None:
+    runner = _linear_runner()
+    runner.dp_size = dp_size
+    active = _decode_metadata(False, 4)
+    active.is_spec_verify = True
+    active.kpool_query_lens = (4,) * num_sequences
+    empty = _decode_metadata(True)
+    empty.is_spec_verify = True
+    empty.kpool_query_lens = ()
+
+    active_spans = runner._graph_kpool_query_lens(active, num_sequences * 4, 8, 4)
+    empty_spans = runner._graph_kpool_query_lens(empty, 1, 8, 4)
+    assert active_spans == empty_spans == ()
+    assert runner._graph_key(8, True, None, active_spans, verify_width=4) == runner._graph_key(
+        8, True, None, empty_spans, verify_width=4
+    )
