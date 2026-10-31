@@ -100,6 +100,7 @@ std::shared_ptr<Request> make_request(int32_t max_tokens = 2,
   state.prompt_tokens = {1};
   state.seq_capacity = 8;
   state.n = state.best_of = 1;
+  state.logprobs = false;
   state.stream = stream;
   state.enable_schedule_overlap = overlap;
   state.stopping_checker.set_max_generated_tokens(max_tokens);
