@@ -263,6 +263,12 @@ class APIService : public proto::XllmAPIService {
                   proto::HttpResponse* response,
                   ::google::protobuf::Closure* done) override;
 
+  // Pages the engine KV journal for service recovery. Not a P/D handoff.
+  void GetKVCacheSnapshot(::google::protobuf::RpcController* controller,
+                          const proto::KVCacheSnapshotRequest* request,
+                          proto::KVCacheSnapshotPage* response,
+                          ::google::protobuf::Closure* done) override;
+
  private:
   using ChatHttpHandler = std::function<void(ClosureGuard&,
                                              brpc::Controller*,

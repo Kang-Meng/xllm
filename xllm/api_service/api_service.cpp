@@ -1960,4 +1960,26 @@ void APIService::ResumeHttp(::google::protobuf::RpcController* controller,
   ctrl->response_attachment().append(json_output);
 }
 
+void APIService::GetKVCacheSnapshot(
+    ::google::protobuf::RpcController* controller,
+    const proto::KVCacheSnapshotRequest* request,
+    proto::KVCacheSnapshotPage* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (request == nullptr || response == nullptr) {
+    return;
+  }
+  static_cast<void>(controller);
+  XServiceClient* client = XServiceClient::get_instance();
+  // The journal is process-wide. A missing client means this engine cannot
+  // return its resident hashes, so fail the snapshot instead of an empty
+  // success.
+  if (client == nullptr || !client->initialize_done()) {
+    response->set_status(proto::KV_SNAPSHOT_STATUS_INVALID_REQUEST);
+    response->set_status_message("KV event journal is unavailable");
+    return;
+  }
+  *response = client->get_kv_cache_snapshot(*request);
+}
+
 }  // namespace xllm

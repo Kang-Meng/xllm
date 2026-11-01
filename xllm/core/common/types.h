@@ -271,6 +271,11 @@ struct InstanceInfo {
   uint64_t register_ts_ms = 0;
   // DEFAULT/PREFILL/DECODE/MIX
   std::string type = "";
+  // Physical Ascend super-pod id. Empty is a wildcard (engine opts out of cross
+  // super-node isolation). Mirrors descriptor.topology.super_node_id from the
+  // same DisaggPDConfig source so the top-level etcd/RPC channel and the
+  // provider descriptor agree.
+  std::string super_node_id = "";
   // remote kv cache info
   std::vector<uint64_t> cluster_ids;
   std::vector<std::string> addrs;
@@ -328,6 +333,11 @@ struct InstanceInfo {
     json_val["dp_size"] = dp_size;
     json_val["kv_split_size"] = kv_split_size;
     json_val["cp_index_write_mode"] = cp_index_write_mode;
+    // Emit only when set so instances that opt out (and older readers) see no
+    // key; an empty super_node_id is a wildcard, not a value to round-trip.
+    if (!super_node_id.empty()) {
+      json_val["super_node_id"] = super_node_id;
+    }
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;

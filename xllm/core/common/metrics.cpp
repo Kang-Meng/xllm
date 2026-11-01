@@ -465,3 +465,14 @@ DEFINE_MULTI_HISTOGRAM(
     decode_active_activation_size_in_kilobytes,
     "dp_rank",
     "Active activation size in kilobytes per dp rank during decode phase");
+
+DEFINE_COUNTER(engine_heartbeat_total,
+               "Total Native Engine heartbeat attempts");
+DEFINE_COUNTER(engine_heartbeat_failures_total,
+               "Total failed Native Engine heartbeat attempts");
+DEFINE_COUNTER(kv_event_publish_failures_total,
+               "Total failed Native KV event publish attempts");
+DEFINE_HISTOGRAM(kv_event_publish_batch_size,
+                 "Number of Native KV events in one publish attempt");
+DEFINE_GAUGE(kv_event_queue_length,
+             "Pending Native KV events waiting to be published");

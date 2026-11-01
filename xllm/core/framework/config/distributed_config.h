@@ -46,6 +46,7 @@ class DistributedConfig final {
                                                     "node_rank",
                                                     "etcd_addr",
                                                     "etcd_namespace",
+                                                    "control_plane_shard_id",
                                                     "enable_service_routing",
                                                     "heart_beat_interval",
                                                     "etcd_ttl"}};
@@ -64,11 +65,15 @@ class DistributedConfig final {
 
   PROPERTY(std::string, etcd_namespace);
 
+  PROPERTY(std::string, control_plane_shard_id) = "default";
+
   PROPERTY(bool, enable_service_routing) = false;
 
   PROPERTY(double, heart_beat_interval) = 0.5;
 
-  PROPERTY(int32_t, etcd_ttl) = 3;
+  // 15 seconds expires while a rank is inside a long device step and cannot
+  // service the keepalive RPC. The lease has to outlast that stall.
+  PROPERTY(int32_t, etcd_ttl) = 60;
 };
 
 }  // namespace xllm

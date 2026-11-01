@@ -25,6 +25,7 @@ limitations under the License.
 #include "concurrent_block_manager_impl.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/model/model_input_params.h"
+#include "framework/prefix_cache/prefix_cache_journal.h"
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
@@ -372,6 +373,7 @@ void BlockManagerPool::reset_prefix_cache() {
   for (auto& block_manager : block_managers_) {
     block_manager->reset_prefix_cache();
   }
+  PrefixCacheJournal::instance()->publish_cleared();
 }
 
 std::vector<size_t> BlockManagerPool::num_blocks_in_prefix_cache() const {
@@ -400,6 +402,14 @@ std::vector<size_t> BlockManagerPool::num_available_blocks() const {
     available[dp_rank] = block_managers_[dp_rank]->num_available_blocks();
   }
   return available;
+}
+
+std::vector<size_t> BlockManagerPool::num_total_blocks() const {
+  std::vector<size_t> total(block_managers_.size());
+  for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
+    total[dp_rank] = block_managers_[dp_rank]->num_total_blocks();
+  }
+  return total;
 }
 
 std::vector<size_t> BlockManagerPool::num_used_blocks() const {

@@ -15,13 +15,18 @@ limitations under the License.
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <etcd/KeepAlive.hpp>
 #include <etcd/SyncClient.hpp>
 #include <etcd/Watcher.hpp>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "core/common/registration_lifecycle.h"
 
 namespace xllm {
 
@@ -48,7 +53,10 @@ class EtcdClient {
   bool register_instance(const std::string& key,
                          const std::string& value,
                          const int ttl);
-  bool get(const std::string& key, std::string* value);
+  bool get(const std::string& key,
+           std::string* value,
+           bool quiet_missing = false);
+  RegistrationLookupState lookup_registration(const std::string& key);
 
   bool get_master_service(const std::string& key_prefix, std::string* values);
 
@@ -57,6 +65,12 @@ class EtcdClient {
 
  private:
   std::string namespaced_key(const std::string& logical_key) const;
+  void monitor_registration_ownership();
+  std::shared_ptr<etcd::KeepAlive> make_keep_alive(
+      const std::string& key,
+      int32_t ttl,
+      int64_t lease_id,
+      const std::shared_ptr<std::atomic<bool>>& failed);
 
   struct WatcherInfo {
     std::unique_ptr<etcd::Watcher> watcher;
@@ -69,8 +83,19 @@ class EtcdClient {
   std::mutex watchers_mutex_;
   std::unordered_map<std::string, WatcherInfo> watchers_;
   std::mutex keep_alives_mutex_;
-  std::unordered_map<std::string, std::shared_ptr<etcd::KeepAlive>>
-      keep_alives_;
+  struct Registration {
+    std::shared_ptr<etcd::KeepAlive> keep_alive;
+    std::shared_ptr<std::atomic<bool>> keep_alive_failed;
+    int32_t ttl;
+    std::string value;
+    RegistrationLeaseDeadline ownership;
+  };
+  // The monitor does no RPC and holds only this mutex. No network operation
+  // may run under it, so an unavailable registry cannot stall self-fencing.
+  std::unordered_map<std::string, Registration> keep_alives_;
+  std::condition_variable ownership_cv_;
+  std::thread ownership_thread_;
+  bool stopping_ = false;
 };
 
 }  // namespace xllm

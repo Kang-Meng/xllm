@@ -1,5 +1,17 @@
 #include "prefix_cache.h"
 
+namespace {
+
+xllm::PrefixCache::Options prefix_cache_options(
+    int32_t block_size,
+    xllm::BlockHasherType hasher_type = xllm::BlockHasherType::TEXT) {
+  xllm::PrefixCache::Options options;
+  options.block_size(block_size).hasher_type(hasher_type);
+  return options;
+}
+
+}  // namespace
+
 #include <absl/random/random.h>
 #include <gtest/gtest.h>
 #include <string.h>
@@ -18,7 +30,8 @@ TEST(PrefixCacheMtpTest, DifferentNextTokenCannotReuseFirstBlock) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(16);
   BlockManagerImpl allocator(options);
-  auto cache = std::make_unique<PrefixCache>(16, BlockHasherType::MTP_TEXT);
+  auto cache = std::make_unique<PrefixCache>(
+      prefix_cache_options(16, BlockHasherType::MTP_TEXT));
   std::vector<int32_t> tokens(33, 7);
   auto blocks = allocator.allocate(/*num_blocks=*/2);
   ASSERT_EQ(cache->insert(tokens, blocks), 32u);
@@ -39,7 +52,7 @@ TEST(PrefixCacheMtpTest, RequiresNextTokenEvenWithPrecomputedHashes) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(16);
   BlockManagerImpl allocator(options);
-  PrefixCache cache(/*block_size=*/16, BlockHasherType::MTP_TEXT);
+  PrefixCache cache(prefix_cache_options(16, BlockHasherType::MTP_TEXT));
   const std::vector<int32_t> tokens(33, 7);
   std::vector<XXH3Key> hashes;
   extend_prefix_hashes(BlockHasherType::MTP_TEXT,
@@ -65,7 +78,7 @@ TEST(PrefixCacheMtpTest, ForkedRequestsNeverMixIncompatibleBlocks) {
   BlockManager::Options options;
   options.num_blocks(16).block_size(16);
   BlockManagerImpl allocator(options);
-  PrefixCache cache(/*block_size=*/16, BlockHasherType::MTP_TEXT);
+  PrefixCache cache(prefix_cache_options(16, BlockHasherType::MTP_TEXT));
   std::vector<int32_t> tokens_a(33, 7);
   tokens_a[16] = 11;
   auto blocks_a = allocator.allocate(/*num_blocks=*/2);
@@ -90,7 +103,7 @@ TEST(PrefixCacheMtpTest, IncludesLookaheadAndMatchesPrecomputedChain) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(16);
   BlockManagerImpl allocator(options);
-  PrefixCache cache(/*block_size=*/16, BlockHasherType::MTP_TEXT);
+  PrefixCache cache(prefix_cache_options(16, BlockHasherType::MTP_TEXT));
   const std::vector<int32_t> tokens(33, 7);
   std::vector<XXH3Key> hashes;
   extend_prefix_hashes(BlockHasherType::MTP_TEXT,
@@ -125,7 +138,7 @@ TEST(PrefixCacheMtpTest, ResumedMultimodalMatchKeepsOverlappingContent) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(16);
   BlockManagerImpl allocator(options);
-  PrefixCache cache(/*block_size=*/16, BlockHasherType::MTP_MM);
+  PrefixCache cache(prefix_cache_options(16, BlockHasherType::MTP_MM));
   const std::vector<int32_t> tokens(33, 7);
   auto blocks = allocator.allocate(/*num_blocks=*/2);
   ASSERT_EQ(cache.insert(tokens, blocks, /*existed=*/0, mm_data), 32u);
@@ -224,7 +237,7 @@ TEST(PrefixCacheTest, BasicOperation) {
   options.num_blocks(total_blocks).block_size(block_size);
   BlockManagerImpl block_manager(options);
 
-  PrefixCache prefix_cache(block_size);
+  PrefixCache prefix_cache(prefix_cache_options(block_size));
 
   test_basic_operation(&block_manager, &prefix_cache, block_size);
 }
@@ -346,7 +359,7 @@ TEST(PrefixCacheTest, InsertOperation) {
   options.num_blocks(total_blocks).block_size(block_size);
   BlockManagerImpl block_manager(options);
 
-  PrefixCache prefix_cache(block_size);
+  PrefixCache prefix_cache(prefix_cache_options(block_size));
 
   test_insert_operation(&block_manager, &prefix_cache, block_size);
 }
@@ -419,7 +432,7 @@ TEST(PrefixCacheTest, EvictOperation) {
   options.num_blocks(total_blocks).block_size(block_size);
   BlockManagerImpl block_manager(options);
 
-  PrefixCache prefix_cache(block_size);
+  PrefixCache prefix_cache(prefix_cache_options(block_size));
 
   test_evict_operation(&block_manager, &prefix_cache, block_size);
 }
@@ -554,7 +567,7 @@ TEST(PrefixCacheTest, PrecomputedHashMatchesComputedMatch) {
   BlockManager::Options options;
   options.num_blocks(n_blocks + 1).block_size(block_size);
   BlockManagerImpl block_manager(options);
-  PrefixCache prefix_cache(block_size);
+  PrefixCache prefix_cache(prefix_cache_options(block_size));
 
   std::vector<int32_t> token_ids =
       make_random_tokens(n_blocks * block_size, /*seed=*/2025);
@@ -617,12 +630,12 @@ TEST(PrefixCacheTest, PrecomputedHashInsertMatchesComputedInsert) {
   const Slice<XXH3Key> hash_slice(hashes);
 
   // Cache A: insert via the on-the-fly compute path.
-  PrefixCache cache_compute(block_size);
+  PrefixCache cache_compute(prefix_cache_options(block_size));
   std::vector<Block> blocks_a = block_manager.allocate(n_blocks);
   cache_compute.insert(tokens, blocks_a);
 
   // Cache B: insert via the precomputed path.
-  PrefixCache cache_precomputed(block_size);
+  PrefixCache cache_precomputed(prefix_cache_options(block_size));
   std::vector<Block> blocks_b = block_manager.allocate(n_blocks);
   cache_precomputed.insert(
       tokens, blocks_b, /*existed=*/0, MMData(), hash_slice);

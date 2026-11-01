@@ -83,6 +83,8 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   void prefetch_from_storage(std::shared_ptr<Request> request,
                              PrefetchDoneCallback done) override;
 
+  void reset_prefix_cache() override;
+
  private:
   friend class HierarchyPoolTestPeer;
   void collect_load_block_transfer_infos(Sequence* sequence);

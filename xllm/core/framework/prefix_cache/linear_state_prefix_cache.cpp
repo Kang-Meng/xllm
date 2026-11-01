@@ -27,8 +27,8 @@ std::vector<Block> LinearStatePrefixCache::match(
     const Slice<Block>& existed_shared_blocks,
     const MMData& mm_data,
     const Slice<XXH3Key>& block_hashes) {
-  const size_t n_blocks =
-      num_hash_blocks(hasher_type_, token_ids.size(), block_size_);
+  const size_t n_blocks = num_hash_blocks(
+      options_.hasher_type(), token_ids.size(), options_.block_size());
   if (n_blocks == 0) {
     return {};
   }
@@ -72,13 +72,16 @@ std::vector<Block> LinearStatePrefixCache::match(
         existed_shared_blocks.empty()
             ? XXH3Key{}
             : XXH3Key{existed_shared_blocks.back().get_immutable_hash_value()};
-    auto hasher =
-        BlockHasher::create(hasher_type_, mm_data, start_block * block_size_);
+    auto hasher = BlockHasher::create(
+        options_.hasher_type(), mm_data, start_block * options_.block_size());
     for (size_t b = start_block; b < n_blocks; ++b) {
-      const size_t i = b * block_size_;
+      const size_t i = b * options_.block_size();
       const uint8_t* pre_hash_value = (b == 0) ? nullptr : token_hash_key.data;
-      hasher->compute(
-          token_ids, i, i + block_size_, pre_hash_value, token_hash_key);
+      hasher->compute(token_ids,
+                      i,
+                      i + options_.block_size(),
+                      pre_hash_value,
+                      token_hash_key);
       if (probe(token_hash_key)) {
         last_hit_idx = b;
         has_any_hit = true;
@@ -114,13 +117,14 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
   check_cached_block_count();
   const int64_t now = absl::ToUnixMicros(absl::Now());
   // align tokens to block boundary
-  const size_t n_blocks =
-      std::min(num_hash_blocks(hasher_type_, token_ids.size(), block_size_),
-               blocks.size());
+  const size_t n_blocks = std::min(
+      num_hash_blocks(
+          options_.hasher_type(), token_ids.size(), options_.block_size()),
+      blocks.size());
 
   if (n_blocks <= existed_shared_blocks_num) {
     check_cached_block_count();
-    return n_blocks * block_size_;
+    return n_blocks * options_.block_size();
   }
 
   DNodeList node_list;
@@ -136,11 +140,12 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
   XXH3Key token_hash_key{};
   std::unique_ptr<BlockHasher> hasher;
   if (!use_precomputed) {
-    hasher = BlockHasher::create(hasher_type_, mm_data, /*start=*/0);
+    hasher = BlockHasher::create(options_.hasher_type(), mm_data, /*start=*/0);
     const uint8_t* prev_hash = nullptr;
     for (size_t b = 0; b < existed_shared_blocks_num; ++b) {
-      const size_t i = b * block_size_;
-      hasher->compute(token_ids, i, i + block_size_, prev_hash, token_hash_key);
+      const size_t i = b * options_.block_size();
+      hasher->compute(
+          token_ids, i, i + options_.block_size(), prev_hash, token_hash_key);
       prev_hash = token_hash_key.data;
     }
   }
@@ -149,11 +154,14 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
       token_hash_key = block_hashes[block_idx];
       return;
     }
-    const size_t i = block_idx * block_size_;
+    const size_t i = block_idx * options_.block_size();
     const uint8_t* pre_hash_value =
         (block_idx == 0) ? nullptr : token_hash_key.data;
-    hasher->compute(
-        token_ids, i, i + block_size_, pre_hash_value, token_hash_key);
+    hasher->compute(token_ids,
+                    i,
+                    i + options_.block_size(),
+                    pre_hash_value,
+                    token_hash_key);
   };
 
   for (size_t block_idx = existed_shared_blocks_num; block_idx < n_blocks;
@@ -192,7 +200,7 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
     }
   }
 
-  const size_t n_tokens = n_blocks * block_size_;
+  const size_t n_tokens = n_blocks * options_.block_size();
   while (!node_list.is_empty()) {
     Node* node = node_list.pop_front();
     lru_lst_.push_back(node);

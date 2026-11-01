@@ -544,6 +544,18 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
   offload_block_pair_queues_.resize(host_block_managers_.size());
 }
 
+void HierarchyBlockManagerPool::reset_prefix_cache() {
+  BlockManagerPool::reset_prefix_cache();
+  if (!options_.enable_prefix_cache()) {
+    return;
+  }
+  for (auto& host_manager : host_block_managers_) {
+    if (host_manager != nullptr) {
+      host_manager->reset_prefix_cache();
+    }
+  }
+}
+
 void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);

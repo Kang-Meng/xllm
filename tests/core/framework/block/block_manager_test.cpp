@@ -895,9 +895,10 @@ TEST_F(BlockManagerPoolTest, CapacityReportsKvPoolWhenLinearStateEnabled) {
   // KV blocks are coarse (block_size=8) while the LINEAR leaf's slot pool has
   // block_size=1 and many more slots. The scheduler-facing capacity must follow
   // the KV admission leaf; the LINEAR leaf is a per-sequence resource slot and
-  // must never win capacity_leaf() (it would otherwise report the linear slot
-  // pool and hand the scheduler a wrong block budget). num_linear_state_slots
-  // is set well above num_blocks so the two pools are unambiguous.
+  // must never define num_total_blocks() (it would otherwise report the linear
+  // slot pool and hand the scheduler a wrong block budget).
+  // num_linear_state_slots is set well above num_blocks so the two pools are
+  // unambiguous.
   constexpr size_t kKvBlocks = 32;
   constexpr int32_t kLinearStateSlots = 256;
   BlockManagerPool::Options options;

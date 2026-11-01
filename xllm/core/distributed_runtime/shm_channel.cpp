@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/common/health_check_manager.h"
+#include "core/framework/config/distributed_config.h"
 #include "core/framework/config/execution_config.h"
 #include "util/net.h"
 
@@ -29,8 +30,11 @@ ShmChannel::ShmChannel(int dp_group,
     : enable_shm_(options.enable_shm()), is_driver_(is_driver) {
   bool is_creator;
 
-  std::string name_prefix =
-      "xllm_" + net::extract_port(options.master_node_addr().value_or(""));
+  // Options carries the address for this channel. The process-wide config is
+  // only the fallback because several static libraries each contain a copy.
+  const std::string configured_addr = options.master_node_addr().value_or(
+      DistributedConfig::get_instance().master_node_addr());
+  std::string name_prefix = "xllm_" + net::extract_port(configured_addr);
   if (enable_shm_) {
     auto name = ForwardSharedMemoryManager::create_unique_name(
         name_prefix, dp_group, ForwardType::RAW_INPUT, rank);

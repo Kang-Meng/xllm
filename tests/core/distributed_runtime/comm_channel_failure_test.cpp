@@ -114,15 +114,19 @@ TEST(CommChannelFailureTest, RpcCapacityIsZeroWhenEnvelopeCannotFit) {
 TEST(CommChannelFailureTest, ShmWriteFailureCancelsGroupWithoutRpcFallback) {
   runtime::Options options;
   options.enable_shm(true).input_shm_size(4096).output_shm_size(4096);
-  options.master_node_addr("127.0.0.1:" + std::to_string(getpid()));
-  ShmChannel channel(/*dp_group=*/0, /*rank=*/0, /*is_driver=*/true, options);
-  const std::string name = ForwardSharedMemoryManager::create_unique_name(
-      "xllm_" + std::to_string(getpid()),
-      /*dp_group=*/0,
-      ForwardType::RAW_INPUT,
-      /*rank=*/0);
+  // Give this channel a unique SHM namespace and attach before it is created.
+  // The creator unlinks the name when it releases its exclusive lock. The
+  // port must fit in 16 bits because the channel parses host:port.
+  const std::string port = std::to_string(20000 + (getpid() % 20000));
+  options.master_node_addr("127.0.0.1:" + port);
+  const std::string name =
+      ForwardSharedMemoryManager::create_unique_name("xllm_" + port,
+                                                     /*dp_group=*/0,
+                                                     ForwardType::RAW_INPUT,
+                                                     /*rank=*/0);
   bool creator = false;
   ForwardSharedMemoryManager peer(name, 4096, creator, ForwardType::RAW_INPUT);
+  ShmChannel channel(/*dp_group=*/0, /*rank=*/0, /*is_driver=*/true, options);
   ForwardInput input;
   input.token_ids = torch::zeros({8192}, torch::kInt32);
   folly::Promise<std::optional<RawForwardOutput>> promise;

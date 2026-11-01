@@ -161,8 +161,8 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `etcd_addr` | `string` | `""` | 保存实例元信息的 etcd 地址。 |
 | `etcd_namespace` | `string` | `""` | xLLM etcd key 使用的可选 namespace 前缀，例如 `prod-a`。 |
 | `enable_service_routing` | `bool` | `false` | 是否启用 xLLM service routing。 |
-| `heart_beat_interval` | `double` | `0.5` | 心跳间隔。 |
-| `etcd_ttl` | `int32` | `3` | etcd key 的 TTL。 |
+| `heart_beat_interval` | `double` | `0.5` | 心跳和成员性对账周期（秒）；Service routing 要求处于 `(0, etcd_ttl / 3]`。 |
+| `etcd_ttl` | `int32` | `15` | Engine 成员租约 TTL（秒）。权威成员性丢失会触发 fail-stop，因此 Service routing 要求至少 15 秒。 |
 
 ## DisaggPDConfig
 
