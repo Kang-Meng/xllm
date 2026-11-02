@@ -57,6 +57,14 @@ class DenseMLPImpl : public torch::nn::Module {
   // Get FP8 input scale from gate_up_proj for fused RMSNorm+FP8 quantization
   std::optional<torch::Tensor> get_fp8_input_scale() const;
 
+  // Returns true if fc1 (gate_up_proj) may perform a sequence-dimension
+  // gather inside forward().  Callers that rely on the MLP being purely
+  // token-wise (e.g. computing on a local sequence shard) must CHECK that
+  // this is false.
+  bool apply_fc1_sequence_parallel() const {
+    return apply_fc1_sequence_parallel_;
+  }
+
  private:
   bool is_gated_;
   int64_t intermediate_size_;

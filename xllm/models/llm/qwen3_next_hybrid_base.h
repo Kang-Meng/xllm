@@ -72,8 +72,18 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
                      context.get_tensor_options(),
                      SchedulerConfig::get_instance().max_tokens_per_batch()) {
     if (model_args_.n_routed_experts() > 0) {
-      flash_comm1_options_.enable_flashcomm1 = false;
+      // FlashComm1 sequence sharding is now allowed for MoE models: the
+      // delayed AllGather bridge (forward_delayed_allgather) reconstructs
+      // the full token layout for expert dispatch. MMRS fusion remains
+      // disabled for MoE models as it is untested in this combination.
       flash_comm1_options_.enable_mmrs_fusion = false;
+      if (flash_comm1_options_.enable_flashcomm1) {
+        LOG(INFO) << "FlashComm1 enabled for MoE model with "
+                  << model_args_.n_routed_experts()
+                  << " routed experts; delayed AllGather will be "
+                     "auto-selected when the topology supports it "
+                     "(dp=1, ep=attention_tp, moe_tp=1, w8a8_dynamic)";
+      }
     }
 
     auto options = context.get_tensor_options();

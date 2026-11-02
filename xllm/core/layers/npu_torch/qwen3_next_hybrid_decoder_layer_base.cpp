@@ -27,7 +27,8 @@ namespace layer {
 Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
     const ModelContext& context,
     int32_t layer_id,
-    std::shared_ptr<Qwen3GatedDeltaNetBaseImpl> linear_attention_module) {
+    std::shared_ptr<Qwen3GatedDeltaNetBaseImpl> linear_attention_module)
+    : tp_group_(context.get_parallel_args().tp_group_) {
   const auto& model_args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
@@ -156,7 +157,57 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
 
   // MLP forward
   if (moe_mlp_) {
-    x = moe_mlp_(x, input_params);
+    const bool sequence_sharded =
+        fc1_ctx != nullptr && is_sequence_sharded(*fc1_ctx);
+    if (sequence_sharded) {
+      // One-time fail-fast: the FlashComm context must share the same TP
+      // group instance as this decoder layer. Other invariants (EP
+      // divisibility, group sizes) are already enforced at construction
+      // and process-group building time, so they are not re-checked here.
+      // Atomic check-and-set: exactly one thread can enter the validation
+      // block.  The validation itself is idempotent (comparing immutable
+      // ProcessGroup pointers), so even without this a duplicate check
+      // would be harmless; compare_exchange_strong simply makes the
+      // one-shot intent explicit and race-free.
+      bool expected = false;
+      if (flashcomm_moe_validated_.compare_exchange_strong(
+              expected, true, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        CHECK(tp_group_ != nullptr)
+            << "FlashComm MoE bridge requires a TP process group";
+        // Both are raw ProcessGroup* and guaranteed to be the same instance:
+        // FlashComm1Context::tp_group is assigned directly from
+        // parallel_args.tp_group_ (flash_comm1_context.cpp:189,211), so
+        // pointer equality is the correct identity check here.
+        CHECK_EQ(tp_group_, fc1_ctx->tp_group)
+            << "FlashComm and decoder TP groups must be identical";
+      }
+      // Auto-select: delayed AllGather is used whenever the current
+      // topology supports it (dp=1, EP==attention-TP, moe-TP=1, W8A8
+      // dynamic quant). No manual switch needed.
+      const bool use_delayed_allgather =
+          moe_mlp_->delayed_allgather_supported();
+      if (use_delayed_allgather) {
+        // forward_delayed_allgather returns the local sequence shard
+        // directly: it shards internally so the shared-expert addition
+        // can be fused without an extra AllGather. No gather/shard is
+        // needed on this path.
+        x = moe_mlp_->forward_delayed_allgather(x, *fc1_ctx, input_params);
+      } else {
+        // Expert dispatch/reduction consumes the full DP-local token
+        // layout. Attention and the residual path remain on the outer
+        // FlashComm shard.
+        x = gather_sequence(x, *fc1_ctx);
+        CHECK_EQ(x.size(0), fc1_ctx->original_num_tokens)
+            << "MoE must receive the complete DP-local token layout";
+        x = moe_mlp_(x, input_params);
+        CHECK_EQ(x.size(0), fc1_ctx->original_num_tokens)
+            << "MoE output must preserve the complete DP-local token layout";
+        x = shard_sequence(x, *fc1_ctx);
+      }
+    } else {
+      x = moe_mlp_(x, input_params);
+    }
   } else {
     x = mlp_(x);
   }

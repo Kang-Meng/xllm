@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "fused_moe.h"
+#include "common/flash_comm1_context.h"
 
 #include <glog/logging.h>
 
@@ -51,6 +52,26 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+// RAII guard that resets `preselected_experts_` on destruction.  This
+// guarantees the member is cleared even if forward_expert throws, so a
+// subsequent regular forward cannot accidentally reuse stale pre-selected
+// experts.
+class PreselectedExpertsGuard {
+ public:
+  using MemberType = std::optional<std::pair<torch::Tensor, torch::Tensor>>;
+  explicit PreselectedExpertsGuard(MemberType& member) : member_(member) {}
+  ~PreselectedExpertsGuard() { member_ = std::nullopt; }
+  PreselectedExpertsGuard(const PreselectedExpertsGuard&) = delete;
+  PreselectedExpertsGuard& operator=(const PreselectedExpertsGuard&) = delete;
+
+ private:
+  MemberType& member_;
+};
+
+}  // namespace
 
 namespace dsv4_eplb {
 
@@ -916,6 +937,15 @@ void FusedMoEImpl::resolve_quant_method_from_state_dict(
     const StateDict& state_dict) {
   resolved_moe_quant_method_ =
       resolve_moe_quant_method(quant_args_, state_dict);
+  // Compute delayed AllGather support once: requires dp=1, EP covering the
+  // same ranks as attention TP, MoE-TP=1, and W8A8 dynamic quantization.
+  delayed_allgather_supported_ =
+      parallel_args_.dp_size() == 1 &&
+      parallel_args_.ep_size() == parallel_args_.tp_size() &&
+      parallel_args_.ep_size() > 1 &&
+      parallel_args_.moe_ep_group_ != nullptr &&
+      tp_pg_->world_size() == 1 &&
+      is_w8a8_dynamic_quant_method(resolved_moe_quant_method_);
   if (w4a8_dynamic_preprocessed_ &&
       is_w4a8_dynamic_quant_method(resolved_moe_quant_method_)) {
     // Preprocessed W4A8 routed weights are already in runtime-packed layout.
@@ -1735,7 +1765,14 @@ std::pair<torch::Tensor, torch::Tensor> FusedMoEImpl::select_global_experts(
     CHECK_EQ(topk_ids.size(0), hidden_states_2d.size(0))
         << "preselected topk_ids token count mismatch, expected "
         << hidden_states_2d.size(0) << ", got " << topk_ids.size(0);
-    topk_weights = topk_weights.to(hidden_states_2d.dtype());
+    // Routing weights are probabilities and must stay floating-point.
+    // When the activation is pre-quantized (kInt8), use fp32 rather than
+    // router_logits_2d.dtype() — a placeholder created with int8 options
+    // would otherwise quantize the weights to int8.
+    const auto routing_dtype = hidden_states_2d.scalar_type() == torch::kInt8
+                                   ? torch::kFloat32
+                                   : hidden_states_2d.scalar_type();
+    topk_weights = topk_weights.to(routing_dtype);
   } else {
     // Use NPU fused kernel for simple softmax routing without bias.
     if (scoring_func_ == "softmax" && !e_score_correction_bias_.defined()) {
@@ -1785,7 +1822,8 @@ torch::Tensor FusedMoEImpl::select_experts(
     const torch::Tensor& hidden_states_2d,
     const torch::Tensor& router_logits_2d,
     SelectedExpertInfo& selected_expert_info,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    const std::optional<torch::Tensor>& input_scale) {
   auto [topk_weights, topk_ids] =
       select_global_experts(hidden_states_2d, router_logits_2d);
 
@@ -1811,7 +1849,7 @@ torch::Tensor FusedMoEImpl::select_experts(
   xllm::kernel::MoeInitRoutingV2Params moe_init_routing_params;
   moe_init_routing_params.x = hidden_states_2d;
   moe_init_routing_params.expert_idx = topk_ids;
-  moe_init_routing_params.scale = std::nullopt;
+  moe_init_routing_params.scale = input_scale;
   moe_init_routing_params.offset = std::nullopt;
   moe_init_routing_params.active_num = hidden_states_2d.size(0) * topk_;
   moe_init_routing_params.expert_capacity = 0;
@@ -1822,12 +1860,30 @@ torch::Tensor FusedMoEImpl::select_experts(
   moe_init_routing_params.row_idx_type = 0;
   std::vector<int64_t> expert_range = {local_expert_start, local_expert_end};
   moe_init_routing_params.active_expert_range = expert_range;
-  moe_init_routing_params.quant_mode = -1;
+  // quant_mode=-1 with a pre-supplied scale means "input is already
+  // quantized to int8; expand the per-token scale alongside the activation
+  // rows".  quant_mode=1 lets the operator quantize a bf16 input
+  // internally (matching the Python reference).  The -1+scale contract
+  // has been validated on NPU hardware against the reference path
+  // (bit-exact MoE outputs on Qwen3.5-35B-A3B w8a8).
+  moe_init_routing_params.quant_mode = input_scale.has_value() ? -1 : 1;
   // TODO: NPU moe_init_routing_v2 is equivalent to moe_gen_idx +
   // moe_expand_input (and the token_count/cusum outputs) on other backends.
   auto [expand_hidden_states, expand_row_ids, group_list, dynamic_scale] =
       xllm::kernel::moe_init_routing_v2(moe_init_routing_params);
-  (void)dynamic_scale;
+  if (input_scale.has_value()) {
+    CHECK_EQ(hidden_states_2d.scalar_type(), torch::kInt8)
+        << "Prequantized MoE routing requires int8 activation.";
+    CHECK(dynamic_scale.defined() && dynamic_scale.numel() > 0)
+        << "Prequantized MoE routing must expand per-token scales.";
+    CHECK_EQ(dynamic_scale.numel(), hidden_states_2d.size(0) * topk_)
+        << "Expanded per-token scale count must equal active_num "
+        << "(num_tokens * topk).";
+    // Flatten to 1-D to match the shape contract of dynamic_quant output
+    // (the other source of pertoken_scale in forward_expert), ensuring
+    // dequant_swiglu_quant sees a consistent layout from both paths.
+    selected_expert_info.input_scale = dynamic_scale.reshape({-1});
+  }
   CHECK_EQ(group_list.size(0), local_physical_experts_num())
       << "npu_moe_init_routing_v2 returned " << group_list.size(0)
       << " groups, expected local experts " << local_physical_experts_num()
@@ -2039,7 +2095,9 @@ torch::Tensor FusedMoEImpl::forward_expert(
     const torch::Tensor& router_logits,
     const std::optional<torch::Tensor>& shared_output,
     const ModelInputParams& input_params,
-    bool use_mega_moe) {
+    bool use_mega_moe,
+    const std::optional<torch::Tensor>& prequantized_scale,
+    std::optional<torch::ScalarType> output_dtype) {
   if (use_mega_moe) {
     auto output = forward_mega_moe(hidden_states, router_logits, input_params);
     if (shared_output.has_value()) {
@@ -2053,7 +2111,16 @@ torch::Tensor FusedMoEImpl::forward_expert(
   }
   // prepare the parameters for MoE computation
   torch::IntArrayRef hidden_states_shape = hidden_states.sizes();
-  torch::ScalarType hidden_states_dtype = hidden_states.dtype().toScalarType();
+  // When an explicit output_dtype is provided (e.g. by the delayed
+  // AllGather path where router_logits is a dtype-only placeholder), use it
+  // directly.  Otherwise fall back to the historical heuristic: prequantized
+  // path derives from router_logits dtype, normal path from hidden_states.
+  torch::ScalarType hidden_states_dtype =
+      output_dtype.has_value()
+          ? output_dtype.value()
+          : (prequantized_scale.has_value()
+                 ? router_logits.dtype().toScalarType()
+                 : hidden_states.dtype().toScalarType());
   torch::Tensor hidden_states_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)});
   torch::Tensor router_logits_2d =
@@ -2061,8 +2128,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
 
   // Step 1-3: select experts
   SelectedExpertInfo selected_expert_info;
-  torch::Tensor expand_hidden_states = select_experts(
-      hidden_states_2d, router_logits_2d, selected_expert_info, input_params);
+  torch::Tensor expand_hidden_states = select_experts(hidden_states_2d,
+                                                      router_logits_2d,
+                                                      selected_expert_info,
+                                                      input_params,
+                                                      prequantized_scale);
 
   torch::Tensor gemm1_out;
   torch::Tensor gemm2_out;
@@ -2073,12 +2143,17 @@ torch::Tensor FusedMoEImpl::forward_expert(
         << "w2_scale is required for W8A8 fused MoE.";
 
     // Step 4: dynamic quant on expanded inputs.
-    xllm::kernel::NpuQuantizeParams quant_params;
-    quant_params.input = expand_hidden_states;
     torch::Tensor quantized_expand_hidden_states;
     std::optional<torch::Tensor> pertoken_scale;
-    std::tie(quantized_expand_hidden_states, pertoken_scale) =
-        xllm::kernel::dynamic_quant(quant_params);
+    if (selected_expert_info.input_scale.has_value()) {
+      quantized_expand_hidden_states = expand_hidden_states;
+      pertoken_scale = selected_expert_info.input_scale;
+    } else {
+      xllm::kernel::NpuQuantizeParams quant_params;
+      quant_params.input = expand_hidden_states;
+      std::tie(quantized_expand_hidden_states, pertoken_scale) =
+          xllm::kernel::dynamic_quant(quant_params);
+    }
     CHECK(pertoken_scale.has_value() && pertoken_scale->defined())
         << "dynamic_quant must return per-token scale for W8A8 fused MoE.";
 
@@ -2356,6 +2431,161 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
     output = output.slice(0, start, end);
   }
   return output;
+}
+
+torch::Tensor FusedMoEImpl::forward_delayed_allgather(
+    const torch::Tensor& hidden_states,
+    const FlashComm1Context& fc1_ctx,
+    const ModelInputParams& input_params) {
+  CHECK(is_sequence_sharded(fc1_ctx));
+  CHECK_EQ(parallel_args_.dp_size(), 1)
+      << "Delayed MoE AllGather currently requires dp_size=1.";
+  CHECK(tp_pg_ != nullptr && fc1_ctx.tp_group != nullptr);
+  CHECK(parallel_args_.tp_group_ != nullptr)
+      << "Delayed MoE AllGather requires the attention TP process group.";
+  CHECK_EQ(fc1_ctx.tp_group, parallel_args_.tp_group_)
+      << "Delayed MoE AllGather must gather over the attention TP group.";
+  CHECK_EQ(fc1_ctx.tp_world_size, parallel_args_.tp_size())
+      << "FlashComm TP size does not match the configured attention TP size.";
+  CHECK_EQ(parallel_args_.ep_size(), fc1_ctx.tp_world_size)
+      << "Delayed AllGather with EP requires EP and attention TP to cover the "
+         "same ranks.";
+  CHECK(parallel_args_.moe_ep_group_ != nullptr)
+      << "Delayed AllGather with EP requires the MoE EP process group.";
+  CHECK_EQ(parallel_args_.moe_ep_group_->world_size(), parallel_args_.ep_size())
+      << "MoE EP group size does not match the configured EP size.";
+  CHECK_EQ(parallel_args_.moe_ep_group_->world_size(), fc1_ctx.tp_world_size)
+      << "Delayed AllGather requires each EP rank to receive the same full "
+         "token layout.";
+  CHECK_EQ(parallel_args_.moe_ep_group_->rank(), fc1_ctx.tp_rank)
+      << "Attention TP and MoE EP rank ordering must match for delayed "
+         "AllGather.";
+  CHECK_EQ(tp_pg_->world_size(), 1)
+      << "Delayed AllGather currently requires MoE-TP=1; attention TP and "
+         "MoE-TP are independent groups.";
+  CHECK(is_w8a8_dynamic_quant_method(resolved_moe_quant_method_))
+      << "Delayed MoE AllGather currently requires W8A8_DYNAMIC weights.";
+  CHECK_EQ(hidden_states.dim(), 2)
+      << "Delayed MoE AllGather currently requires a 2D token layout.";
+
+  auto local_router_logits = gate_(hidden_states);
+  // Both reshapes are guaranteed no-ops: the CHECK_EQ(hidden_states.dim(), 2)
+  // above and Linear's dim-preserving semantics ensure both operands are
+  // already 2D, so reshape returns a view with no copy or allocation.
+  auto [local_topk_weights, local_topk_ids] = select_global_experts(
+      hidden_states.reshape({-1, hidden_states.size(-1)}),
+      local_router_logits.reshape({-1, local_router_logits.size(-1)}));
+
+  xllm::kernel::NpuQuantizeParams quant_params;
+  quant_params.input = hidden_states;
+  torch::Tensor quantized_hidden;
+  std::optional<torch::Tensor> local_scale;
+  std::tie(quantized_hidden, local_scale) =
+      xllm::kernel::dynamic_quant(quant_params);
+  CHECK(local_scale.has_value() && local_scale->defined())
+      << "Delayed MoE AllGather requires per-token dynamic scales.";
+  CHECK_EQ(local_scale->dim(), 1)
+      << "dynamic_quant must return a 1-D per-token scale tensor.";
+
+  auto gathered_hidden = gather_sequence(quantized_hidden, fc1_ctx);
+  CHECK_EQ(gathered_hidden.size(0), fc1_ctx.original_num_tokens)
+      << "gather_sequence produced " << gathered_hidden.size(0)
+      << " tokens but fc1_ctx.original_num_tokens is "
+      << fc1_ctx.original_num_tokens
+      << "; the delayed AllGather bridge requires an exact match.";
+  auto gathered_scale =
+      gather_sequence(local_scale->reshape({-1, 1}), fc1_ctx).reshape({-1});
+  auto gathered_topk_weights = gather_sequence(local_topk_weights, fc1_ctx);
+  auto gathered_topk_ids = gather_sequence(local_topk_ids, fc1_ctx);
+  // All gathered tensors must cover the same full token layout.
+  CHECK_EQ(gathered_topk_ids.size(0), gathered_hidden.size(0))
+      << "gathered_topk_ids token count mismatch";
+  CHECK_EQ(gathered_topk_weights.size(0), gathered_hidden.size(0))
+      << "gathered_topk_weights token count mismatch";
+  CHECK_EQ(gathered_scale.size(0), gathered_hidden.size(0))
+      << "gathered_scale token count mismatch";
+
+  std::optional<torch::Tensor> local_shared_output = std::nullopt;
+  if (n_shared_experts_ > 0) {
+    // INVARIANT: shared_experts_ is a DenseMLP (compile-time type guarantee)
+    // constructed with apply_fc1_sequence_parallel=false (runtime CHECK
+    // below) and MoE-TP=1 (zero collective ops).  Its forward is therefore
+    // purely token-wise — matmul, element-wise activation, matmul, with no
+    // cross-token or cross-rank dependency.  Consequently
+    //   shared_experts_(local_shard) == shard(shared_experts_(full))
+    // and adding the local shared output after shard_sequence(routed) is
+    // mathematically equivalent to the gather-then-add path.
+    // The same token-wise requirement applies to shared_expert_gate_
+    // below: its forward is a per-token Linear followed by sigmoid,
+    // both element-wise, so
+    //   gate_(local_shard) == shard(gate_(full))
+    // and the local gate*shared product equals the gathered version.
+    // If shared_expert_gate_ ever gains cross-token or cross-rank ops,
+    // both it and shared_experts_ must move to the full layout.
+    CHECK(!shared_experts_->apply_fc1_sequence_parallel())
+        << "forward_delayed_allgather computes shared experts on the local "
+           "sequence shard; this requires apply_fc1_sequence_parallel=false "
+           "so DenseMLP does not gather the full sequence internally.  If "
+           "shared experts ever need cross-token ops, move this computation "
+           "to the full (gathered) layout instead.";
+    local_shared_output = shared_experts_(hidden_states);
+    if (should_apply_shared_expert_gate(shared_expert_gate_,
+                                        is_deepseek_v4_,
+                                        shared_expert_gate_is_loaded_)) {
+      auto gate = torch::sigmoid(shared_expert_gate_->forward(hidden_states));
+      local_shared_output = gate * local_shared_output.value();
+    }
+  }
+
+  torch::Tensor routed_output;
+  {
+    // RAII guard: resets preselected_experts_ even if forward_expert
+    // throws, so a later regular forward cannot reuse stale experts.
+    // Store routing weights as fp32 for the same reason as
+    // forward_with_selected_experts: weights are probabilities and must
+    // never be quantized to int8 regardless of the routing kernel's output
+    // dtype.  select_global_experts re-casts to routing_dtype at read time.
+    preselected_experts_ =
+        std::make_pair(gathered_topk_weights.to(torch::kFloat32),
+                       gathered_topk_ids.to(torch::kInt32));
+    PreselectedExpertsGuard guard(preselected_experts_);
+    // The placeholder is never read for values: select_global_experts
+    // short-circuits on preselected_experts_ (guaranteed set by the RAII
+    // scope above) and only reads the placeholder's shape/dtype metadata.
+    // Use num_total_experts_ columns to match the real router logits layout,
+    // and pass the original hidden_states dtype explicitly so the MoE output
+    // dtype does not depend on the routing weight dtype (which may be fp32
+    // for sigmoid/noaux_tc).
+    // torch::empty (not zeros): since values are provably unread, the
+    // zero-fill would be pure waste — matching the identical placeholder
+    // pattern in forward_with_selected_experts.  If a future change ever
+    // reads router values before the short-circuit, it MUST switch this to
+    // zeros or supply real logits.
+    auto router_placeholder = torch::empty(
+        {fc1_ctx.original_num_tokens, num_total_experts_},
+        gathered_topk_weights.options());
+    routed_output = forward_expert(gathered_hidden,
+                                   router_placeholder,
+                                   std::nullopt,
+                                   input_params,
+                                   false,
+                                   gathered_scale,
+                                   hidden_states.dtype().toScalarType());
+  }
+  // Shard the routed output back to the local sequence layout, then add the
+  // shared expert output that was computed on the same local shard.  This
+  // avoids a fifth AllGather for the shared expert output because
+  //   shard(routed_full + shared_full) == shard(routed_full) + shared_local
+  routed_output = shard_sequence(routed_output, fc1_ctx);
+  if (local_shared_output.has_value()) {
+    routed_output = routed_output + local_shared_output.value();
+  }
+  LOG_FIRST_N(INFO, 1)
+      << "FlashComm MoE delayed AllGather active: local gate/top-k, int8 "
+         "activation gather, per-token scale gather, ep_size="
+      << parallel_args_.ep_size() << ", moe_tp_size=" << tp_pg_->world_size()
+      << ", tp_size=" << fc1_ctx.tp_world_size;
+  return routed_output;
 }
 
 bool FusedMoEImpl::should_gather_dp_inputs_for_moe() const {
@@ -2900,8 +3130,6 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       << "topk_ids token count mismatch, expected " << hidden_rows << ", got "
       << ids_2d.size(0);
 
-  preselected_experts_ =
-      std::make_pair(weights_2d.to(input.dtype()), ids_2d.to(torch::kInt32));
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
   if (n_shared_experts_ > 0) {
@@ -2920,9 +3148,29 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   std::vector<int64_t> router_shape = input.sizes().vec();
   router_shape.back() = num_total_experts_;
   torch::Tensor router_logits = torch::empty(router_shape, input.options());
-  torch::Tensor output =
-      forward_expert(input, router_logits, shared_output, input_params, false);
-  preselected_experts_ = std::nullopt;
+  torch::Tensor output;
+  {
+    // RAII guard: resets preselected_experts_ even if forward_expert
+    // throws, so a later regular forward cannot reuse stale experts.
+    //
+    // Store routing weights as fp32 regardless of the hidden_states dtype:
+    // weights are probabilities and must never be quantized to int8 even
+    // if a future caller passes a pre-quantized input.  select_global_experts
+    // re-casts to routing_dtype at read time.
+    //
+    // Numerical impact for non-quantized (bf16/fp16) inputs is zero: the
+    // bf16->fp32 upcast is exact (zero-padded mantissa), and the subsequent
+    // fp32->bf16 downcast at read time recovers the original bf16 value
+    // bit-exactly (same holds for fp16).  The only conversion that involves
+    // rounding is fp32->routing_dtype, which happened at write time before
+    // this change and happens at read time now — identical rounding, just
+    // relocated.
+    preselected_experts_ =
+        std::make_pair(weights_2d.to(torch::kFloat32), ids_2d.to(torch::kInt32));
+    PreselectedExpertsGuard guard(preselected_experts_);
+    output =
+        forward_expert(input, router_logits, shared_output, input_params, false);
+  }
 
   if (need_slice) {
     const std::vector<int32_t>& dp_tokens =

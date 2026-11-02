@@ -1373,19 +1373,30 @@ struct FusedIndexerKParams {
 struct MoeInitRoutingV2Params {
   // TODO: NPU moe_init_routing_v2 is equivalent to moe_gen_idx +
   // moe_expand_input (and token_count/cusum outputs) on other backends.
+  //
+  // Initialization contract: all scalar fields have safe in-class defaults
+  // matching the historical hardcoded values, so a default-constructed
+  // instance reproduces the pre-parameterization behavior.  Callers that
+  // deviate from the defaults MUST set every field they change explicitly;
+  // moe_init_routing_v2() CHECKs drop_pad_mode to catch partial init.
   torch::Tensor x;
   torch::Tensor expert_idx;
-  std::optional<torch::Tensor> scale;
-  std::optional<torch::Tensor> offset;
-  int active_num;
-  int expert_capacity;
-  int expert_num;
-  int drop_pad_mode;
-  int expert_tokens_num_type;
-  bool expert_tokens_num_flag;
-  int quant_mode;
-  torch::IntArrayRef active_expert_range;
-  int row_idx_type;
+  std::optional<torch::Tensor> scale = std::nullopt;
+  std::optional<torch::Tensor> offset = std::nullopt;
+  int active_num = 0;
+  int expert_capacity = 0;
+  int expert_num = 0;
+  // 0 = pad-only (no token dropping), 1 = drop-and-pad.
+  // Validated by CHECK in moe_init_routing_v2().
+  int drop_pad_mode = 0;
+  int expert_tokens_num_type = 1;
+  bool expert_tokens_num_flag = true;
+  int quant_mode = 0;
+  // Owned storage (not IntArrayRef) so the struct never holds a
+  // dangling pointer to a caller-local vector.  Implicitly converts
+  // to torch::IntArrayRef at the NPU op call site.
+  std::vector<int64_t> active_expert_range = {};
+  int row_idx_type = 0;
 };
 
 struct MoeDistributeDispatchV2Params {

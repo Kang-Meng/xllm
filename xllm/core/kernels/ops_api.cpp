@@ -1072,6 +1072,27 @@ torch::Tensor l2_norm(torch::Tensor& x, double eps) {
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moe_init_routing_v2(MoeInitRoutingV2Params& params) {
+  // Guard against partially initialized params: drop_pad_mode must be a
+  // known value (0 = pad-only, 1 = drop-and-pad).  The struct defaults to
+  // 0, but an explicit CHECK catches accidental misuse early with a clear
+  // message instead of a silent behavior change inside the NPU op.
+  CHECK(params.drop_pad_mode == 0 || params.drop_pad_mode == 1)
+      << "MoeInitRoutingV2Params.drop_pad_mode must be 0 (pad-only) or 1 "
+         "(drop-and-pad), got "
+      << params.drop_pad_mode;
+  CHECK(params.active_num > 0)
+      << "MoeInitRoutingV2Params.active_num must be positive, got "
+      << params.active_num;
+  CHECK(params.expert_num > 0)
+      << "MoeInitRoutingV2Params.expert_num must be positive, got "
+      << params.expert_num;
+  if (params.drop_pad_mode == 1) {
+    // drop-and-pad mode quantizes/drops via scale+offset; both required.
+    CHECK(params.scale.has_value())
+        << "drop_pad_mode=1 (drop-and-pad) requires params.scale";
+    CHECK(params.offset.has_value())
+        << "drop_pad_mode=1 (drop-and-pad) requires params.offset";
+  }
 #if defined(USE_NPU)
   return npu::apply_npu_moe_init_routing_v2(params.x,
                                             params.expert_idx,

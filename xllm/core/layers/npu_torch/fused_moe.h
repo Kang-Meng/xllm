@@ -38,6 +38,7 @@ limitations under the License.
 #include "layers/common/fused_moe_base.h"
 #include "layers/common/linear.h"
 #include "layers/npu_torch/deepseek_v4_eplb_utils.h"
+#include "common/flash_comm1_context.h"
 
 namespace xllm {
 namespace layer {
@@ -75,7 +76,9 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& router_logits,
       const std::optional<torch::Tensor>& shared_output,
       const ModelInputParams& input_params,
-      bool use_mega_moe);
+      bool use_mega_moe,
+      const std::optional<torch::Tensor>& prequantized_scale = std::nullopt,
+      std::optional<torch::ScalarType> output_dtype = std::nullopt);
   torch::Tensor forward_with_selected_experts(
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
@@ -83,6 +86,17 @@ class FusedMoEImpl : public torch::nn::Module {
       const ModelInputParams& input_params);
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const ModelInputParams& input_params);
+  // Experimental FC1 path: quantize the local token shard, gather the
+  // quantized activation and per-token scale, then execute the existing MoE
+  // routing/expert/combine path on the reconstructed full layout.
+  torch::Tensor forward_delayed_allgather(const torch::Tensor& hidden_states,
+                                          const FlashComm1Context& fc1_ctx,
+                                          const ModelInputParams& input_params);
+  // Whether the current topology + quant method supports the delayed
+  // AllGather MoE path (dp=1, ep=attention_tp, moe_tp=1, w8a8_dynamic).
+  bool delayed_allgather_supported() const {
+    return delayed_allgather_supported_;
+  }
   void load_state_dict(const StateDict& state_dict);
   void set_eplb_layer_id(int32_t layer_id);
   void prepare_expert_weight(const std::vector<int32_t>& expert_ids);
@@ -108,13 +122,24 @@ class FusedMoEImpl : public torch::nn::Module {
   };
 
   // initial steps for MoE computation, select the experts for each token
-  torch::Tensor select_experts(const torch::Tensor& hidden_states_2d,
-                               const torch::Tensor& router_logits_2d,
-                               SelectedExpertInfo& selected_expert_info,
-                               const ModelInputParams& input_params);
+  torch::Tensor select_experts(
+      const torch::Tensor& hidden_states_2d,
+      const torch::Tensor& router_logits_2d,
+      SelectedExpertInfo& selected_expert_info,
+      const ModelInputParams& input_params,
+      const std::optional<torch::Tensor>& input_scale = std::nullopt);
 
   // Computes router choices in the global expert-id space. MegaMoe consumes
   // these values before the EPLB physical-expert remap is applied.
+  //
+  // Placeholder contract: when preselected_experts_ has a value, this
+  // method short-circuits and returns the pre-selected weights/ids
+  // directly; router_logits is then used ONLY for its shape/dtype
+  // metadata and its values are never read.  Callers on that path may
+  // therefore pass a torch::empty tensor as router_logits.  If this
+  // short-circuit behaviour ever changes, every caller that relies on
+  // the placeholder pattern (forward_delayed_allgather,
+  // forward_with_selected_experts) must switch to real logits or zeros.
   std::pair<torch::Tensor, torch::Tensor> select_global_experts(
       const torch::Tensor& hidden_states_2d,
       const torch::Tensor& router_logits_2d);
@@ -153,6 +178,9 @@ class FusedMoEImpl : public torch::nn::Module {
   std::string scoring_func_;
   bool is_smoothquant_;
   std::optional<std::string> resolved_moe_quant_method_;
+  // Computed once after quant method resolution; gates the delayed
+  // AllGather path so unsupported topologies fall back gracefully.
+  bool delayed_allgather_supported_ = false;
   std::optional<std::pair<torch::Tensor, torch::Tensor>> preselected_experts_;
 
   int64_t num_experts_per_rank_;

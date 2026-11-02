@@ -17,12 +17,14 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
+#include "framework/parallel_state/parallel_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/common/dense_mlp.h"
 #include "layers/common/qwen3_next_rms_norm.h"
@@ -84,6 +86,12 @@ class Qwen3HybridDecoderLayerImplBase : public Qwen3HybridDecoderLayerModule {
 
   Qwen3NextRMSNorm input_norm_{nullptr};
   Qwen3NextRMSNorm post_norm_{nullptr};
+
+  // Raw TP process-group pointer kept solely for the one-time FlashComm
+  // MoE identity check (must equal fc1_ctx->tp_group). Storing the whole
+  // ParallelArgs copy here would be redundant state.
+  ProcessGroup* tp_group_ = nullptr;
+  std::atomic<bool> flashcomm_moe_validated_ = false;
 };
 
 }  // namespace layer
